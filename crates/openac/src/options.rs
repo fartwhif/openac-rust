@@ -17,11 +17,14 @@ Options:
   --headless              Run without any window support (no display needed).
                           Without it, the console commands /window and /close open
                           and close a game window on the running session.
-  --ui <console|ratatui>   Rendering front end for the session's output: console
-                          (default) prints lines to standard output; ratatui
-                          draws a terminal UI (status, the event and chat feed,
-                          nearby objects, a command line) with ratatui and opens
-                          no GPU window. Env OPENAC_UI.
+  --ui <console|ratatui|terminal>
+                          Rendering front end: console (default) prints lines to
+                          standard output; ratatui draws a text terminal UI (status,
+                          the event and chat feed, nearby objects, a command line)
+                          with no world rendering; terminal renders the full 3-D
+                          world and the game's 2-D GUI, software-drawn as braille
+                          dots with 24-bit colour, to a plain terminal (no GPU or
+                          image protocol needed). Env OPENAC_UI.
   --server <host:port>    Login server address (env OPENAC_SERVER, default 127.0.0.1:9000).
   --account <name>        Account name (env OPENAC_ACCOUNT).
   --character <name>      Character to enter the world with (default: none; the session
@@ -103,8 +106,12 @@ pub enum RenderMode {
     #[default]
     Console,
     /// A terminal UI drawn with ratatui: status, the event and chat feed,
-    /// nearby objects, and a command line.
+    /// nearby objects, and a command line. No world rendering.
     Ratatui,
+    /// The full 3-D world and the game's 2-D GUI, software-rendered to the
+    /// terminal as braille dots with 24-bit colour (no GPU or graphics
+    /// protocol needed). Runs over a plain SSH terminal.
+    Terminal,
 }
 
 /// Everything the program needs to start.
@@ -229,8 +236,15 @@ impl Command {
         let landblock_radius = radius.as_deref().map(parse_radius).transpose()?;
         let render_mode = match ui {
             Some(mode) if mode.eq_ignore_ascii_case("ratatui") => RenderMode::Ratatui,
+            Some(mode) if mode.eq_ignore_ascii_case("terminal") => RenderMode::Terminal,
             Some(mode) if mode.eq_ignore_ascii_case("console") => RenderMode::Console,
-            Some(mode) => return Err(invalid("--ui", &mode, "expected console or ratatui")),
+            Some(mode) => {
+                return Err(invalid(
+                    "--ui",
+                    &mode,
+                    "expected console, ratatui or terminal",
+                ));
+            }
             None => RenderMode::Console,
         };
 
@@ -476,5 +490,23 @@ mod tests {
     #[test]
     fn help_wins() {
         assert_eq!(parse(&["--help"], &[]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn ui_flag_selects_the_render_mode() {
+        assert_eq!(
+            run(&["--ui", "ratatui"], &CREDS).render_mode,
+            RenderMode::Ratatui
+        );
+        assert_eq!(
+            run(&["--ui", "terminal"], &CREDS).render_mode,
+            RenderMode::Terminal
+        );
+        assert_eq!(
+            run(&["--ui", "console"], &CREDS).render_mode,
+            RenderMode::Console
+        );
+        assert_eq!(run(&[], &CREDS).render_mode, RenderMode::Console);
+        assert!(parse(&["--ui", "nope"], &CREDS).is_err());
     }
 }

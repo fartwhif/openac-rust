@@ -122,6 +122,11 @@ Type `/window` in its console to open a game window on the session and
 `--ui ratatui` draws the session as a terminal UI (a status line, the event and
 chat feed, nearby objects, and a command line) with ratatui instead of a GPU
 window; it needs a terminal on standard output.
+`--ui terminal` goes further: it software-renders the actual game — the 3-D
+world under the chase camera, the in-game HUD, and a top-down height-shaded
+minimap with the player at its centre — straight into the terminal as Braille
+dots in 24-bit colour, with no GPU, sixel or image protocol, so it runs over a
+plain SSH terminal (a Nerd Font is best for the Braille and box-drawing glyphs).
 `openac run --config <file>` runs several sessions from one configuration
 document. [docs/building-and-running.md](docs/building-and-running.md) walks
 through it, and [docs/launch-options.md](docs/launch-options.md) lists every

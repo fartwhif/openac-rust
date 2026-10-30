@@ -16,9 +16,14 @@ ctrlc.workspace = true
 ac-render.workspace = true
 ac-host.workspace = true
 ac-core.workspace = true
+ac-dat.workspace = true
+ac-proto.workspace = true
 ac-ui.workspace = true
 ac-plugin.workspace = true
-# Terminal rendering mode (`--ui ratatui`).
+# The software-rendered terminal front end (`--ui terminal`) projects the
+# world with the same glam math the renderer uses.
+glam.workspace = true
+# Terminal rendering modes (`--ui ratatui`, `--ui terminal`).
 ratatui.workspace = true
 crossterm.workspace = true
 

@@ -9,6 +9,7 @@ mod options;
 mod plugins;
 mod session_config;
 mod stdio;
+mod swrender;
 mod tui;
 mod window_state;
 
@@ -77,6 +78,9 @@ fn main() -> ExitCode {
         }
         Ok(Command::Run(options)) if options.render_mode == RenderMode::Ratatui => {
             run_session_tui(options)
+        }
+        Ok(Command::Run(options)) if options.render_mode == RenderMode::Terminal => {
+            run_session_terminal(options)
         }
         Ok(Command::Run(options)) if options.headless => {
             run_session(&options, None, graphics::DisplayPrefs::load(None))
@@ -428,6 +432,28 @@ fn run_session_tui(options: Options) -> ExitCode {
     let _install_session = spawned.install_lease;
     let commands = spawned.handle.commands();
     tui::run(model, spawned.handle, commands, options)
+}
+
+/// Run one session to its end through the software-rendered terminal front
+/// end: the 3-D world and the game's 2-D GUI, drawn to braille with 24-bit
+/// colour (no GPU or graphics protocol needed).
+fn run_session_terminal(options: Options) -> ExitCode {
+    if !tui::is_terminal() {
+        errln!(
+            "openac: --ui terminal needs a terminal on standard output; run \
+             without it when standard output is not a terminal"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let logger = swrender::RenderLog::new(options.log_level);
+    let spawned = match start_session(&options, &logger) {
+        Ok(spawned) => spawned,
+        Err(code) => return code,
+    };
+    // Held for the whole run, so a client update or a move of the install
+    // folder waits for this client.
+    let _install_session = spawned.install_lease;
+    swrender::run(spawned.handle, options)
 }
 
 /// Prints progress with the time since start; stdout for progress, stderr
