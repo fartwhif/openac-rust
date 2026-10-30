@@ -9,6 +9,7 @@ mod options;
 mod plugins;
 mod session_config;
 mod stdio;
+mod tui;
 mod window_state;
 
 use crate::stdio::{errln, outln};
@@ -21,7 +22,7 @@ use ac_runtime::session::{
     SessionConfig, SessionEvent, SessionSummary,
 };
 use console::ConsoleInput;
-use options::{Command, DropDirection, LogLevel, Options, USAGE};
+use options::{Command, DropDirection, LogLevel, Options, RenderMode, USAGE};
 
 /// Exit code for a session that ended with an error.
 const EXIT_SESSION_FAILED: u8 = 1;
@@ -73,6 +74,9 @@ fn main() -> ExitCode {
         Ok(Command::Help) => {
             outln!("{USAGE}");
             ExitCode::SUCCESS
+        }
+        Ok(Command::Run(options)) if options.render_mode == RenderMode::Ratatui => {
+            run_session_tui(options)
         }
         Ok(Command::Run(options)) if options.headless => {
             run_session(&options, None, graphics::DisplayPrefs::load(None))
@@ -147,26 +151,69 @@ fn run_with_window_support(
         .unwrap_or_else(|_| ExitCode::from(EXIT_SESSION_FAILED))
 }
 
-/// Run one session to its end; with window support, the console can open
-/// and close a window on it.
-fn run_session(
-    options: &Options,
-    window: Option<ac_render::HostHandle>,
-    prefs: graphics::DisplayPrefs,
-) -> ExitCode {
-    let started = Instant::now();
-    let log = Logger {
-        level: options.log_level,
-        started,
-    };
-    let paths = resolve_paths(options, &log);
+/// Where the session's progress and feed lines go: the line console
+/// (standard output and standard error) or the ratatui model. Both front
+/// ends report the session through this.
+trait SessionLog {
+    fn info(&self, text: &str);
+    fn warn(&self, text: &str);
+    fn error(&self, text: &str);
+    fn session_event(&self, event: &SessionEvent);
+    fn objects(&self, objects: &[ObjectSummary]);
+    /// A plain feed line (chat, interface text, a notice, event detail).
+    fn feed(&self, text: &str);
+    fn summary(&self, summary: &SessionSummary);
+}
+
+impl SessionLog for Logger {
+    fn info(&self, text: &str) {
+        Logger::info(self, text)
+    }
+
+    fn warn(&self, text: &str) {
+        Logger::warn(self, text)
+    }
+
+    fn error(&self, text: &str) {
+        Logger::error(self, text)
+    }
+
+    fn session_event(&self, event: &SessionEvent) {
+        Logger::session_event(self, event)
+    }
+
+    fn objects(&self, objects: &[ObjectSummary]) {
+        Logger::objects(self, objects)
+    }
+
+    fn feed(&self, text: &str) {
+        outln!("{text}")
+    }
+
+    fn summary(&self, summary: &SessionSummary) {
+        Logger::summary(self, summary)
+    }
+}
+
+/// A started session: the handle (events and commands) and the install
+/// lease held for the whole run.
+struct SpawnedSession {
+    handle: session::SessionHandle,
+    install_lease: Option<ac_host::InstallSessionLease>,
+}
+
+/// Build the session's configuration, start it, and install the Ctrl+C /
+/// SIGINT / SIGTERM / SIGHUP handler that logs the character off. The
+/// console and the ratatui front ends start the session this way.
+fn start_session(options: &Options, log: &dyn SessionLog) -> Result<SpawnedSession, ExitCode> {
+    let paths = resolve_paths(options, log);
     // Held for the whole run, so a client update or a move of the install
     // folder waits for this client.
-    let _install_session = match paths.as_ref().map(multi::hold_install).transpose() {
+    let install_lease = match paths.as_ref().map(multi::hold_install).transpose() {
         Ok(lease) => lease,
         Err(message) => {
             log.error(&message);
-            return ExitCode::from(EXIT_SESSION_FAILED);
+            return Err(ExitCode::from(EXIT_SESSION_FAILED));
         }
     };
     let data_directory = paths.as_ref().map(|p| p.data_directory.clone());
@@ -176,7 +223,7 @@ fn run_session(
         Ok(settings) => settings,
         Err(error) => {
             log.error(&error);
-            return ExitCode::from(EXIT_USAGE);
+            return Err(ExitCode::from(EXIT_USAGE));
         }
     };
     let plugins = plugins::setup(
@@ -235,7 +282,7 @@ fn run_session(
         Ok(handle) => handle,
         Err(error) => {
             log.error(&format!("could not start the session thread: {error}"));
-            return ExitCode::from(EXIT_SESSION_FAILED);
+            return Err(ExitCode::from(EXIT_SESSION_FAILED));
         }
     };
 
@@ -248,8 +295,19 @@ fn run_session(
     }) {
         log.warn(&format!("Ctrl+C will not log off gracefully: {error}"));
     }
-    spawn_console(handle.commands(), window, prefs);
+    Ok(SpawnedSession {
+        handle,
+        install_lease,
+    })
+}
 
+/// Consume the session's events until it ends, reporting them to `log`.
+/// Returns the process exit code.
+fn run_session_loop(
+    handle: session::SessionHandle,
+    log: &dyn SessionLog,
+    options: &Options,
+) -> ExitCode {
     let mut in_world_since: Option<Instant> = None;
     let mut shutdown_sent = false;
     let summary = loop {
@@ -279,15 +337,15 @@ fn run_session(
             Some(HostEvent::GameTime(None)) => log.info("game time: not synced yet"),
             Some(HostEvent::Chat(line)) => {
                 if let Some(text) = console::console_chat_line(&line, None, false) {
-                    outln!("{text}");
+                    log.feed(&text);
                 }
             }
             Some(HostEvent::InterfaceText(text)) => {
-                outln!("{}", console::interface_text(&text, None));
+                log.feed(&console::interface_text(&text, None));
             }
             Some(HostEvent::Contracts(contracts)) => {
                 for line in console::contract_lines(&contracts, None) {
-                    outln!("{line}");
+                    log.feed(&line);
                 }
             }
             Some(HostEvent::Journal {
@@ -295,7 +353,7 @@ fn run_session(
                 current_page,
             }) => {
                 for line in console::journal_lines(&pages, current_page, None) {
-                    outln!("{line}");
+                    log.feed(&line);
                 }
             }
             Some(HostEvent::Ended(summary)) => break summary,
@@ -308,7 +366,7 @@ fn run_session(
             }
             Some(other) => {
                 for line in console::event_lines(&other, None) {
-                    outln!("{line}");
+                    log.feed(&line);
                 }
             }
             None => {}
@@ -321,6 +379,55 @@ fn run_session(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Run one session to its end through the line console; with window
+/// support, the console can open and close a window on it.
+fn run_session(
+    options: &Options,
+    window: Option<ac_render::HostHandle>,
+    prefs: graphics::DisplayPrefs,
+) -> ExitCode {
+    let started = Instant::now();
+    let log = Logger {
+        level: options.log_level,
+        started,
+    };
+    let spawned = match start_session(options, &log) {
+        Ok(spawned) => spawned,
+        Err(code) => return code,
+    };
+    // Held for the whole run, so a client update or a move of the install
+    // folder waits for this client.
+    let _install_session = spawned.install_lease;
+    spawn_console(spawned.handle.commands(), window, prefs);
+    run_session_loop(spawned.handle, &log, options)
+}
+
+/// Run one session to its end through the ratatui terminal front end.
+fn run_session_tui(options: Options) -> ExitCode {
+    if !tui::is_terminal() {
+        errln!(
+            "openac: --ui ratatui needs a terminal on standard output; run \
+             without it when standard output is not a terminal"
+        );
+        return ExitCode::from(EXIT_USAGE);
+    }
+    let model = tui::TuiModel::new(options.log_level, options.server);
+    let started = Instant::now();
+    let logger = tui::ModelLogger {
+        model: model.clone(),
+        started,
+    };
+    let spawned = match start_session(&options, &logger) {
+        Ok(spawned) => spawned,
+        Err(code) => return code,
+    };
+    // Held for the whole run, so a client update or a move of the install
+    // folder waits for this client.
+    let _install_session = spawned.install_lease;
+    let commands = spawned.handle.commands();
+    tui::run(model, spawned.handle, commands, options)
 }
 
 /// Prints progress with the time since start; stdout for progress, stderr
@@ -440,7 +547,7 @@ impl Logger {
 /// the data directory, plugin storage under it and the configuration
 /// directory. Without them the journal stays in memory, `@log` reports it
 /// cannot open a file and plugins have no storage.
-fn resolve_paths(options: &Options, log: &Logger) -> Option<ac_host::PathSet> {
+fn resolve_paths(options: &Options, log: &dyn SessionLog) -> Option<ac_host::PathSet> {
     let overrides = ac_host::PathOverrides {
         data_directory: options.data_dir.clone(),
         ..ac_host::PathOverrides::default()
@@ -456,10 +563,113 @@ fn resolve_paths(options: &Options, log: &Logger) -> Option<ac_host::PathSet> {
     }
 }
 
-/// Read console lines from standard input on their own thread. The
-/// console's own verbs (`/objects`, `/time`, `/contracts`, `/journal`,
-/// `/quit`, and with window support `/window`, `/close`, `/screenshot`) are
-/// answered here; every other line is typed into the session's chat box.
+/// What one typed console line results in: a notice to show the player and
+/// a command to send to the session (either may be absent).
+struct Routed {
+    notice: Option<String>,
+    command: Option<SessionCommand>,
+}
+
+/// Route one typed console line the way the console does: the console's own
+/// verbs become a notice and/or a session command; every other line is typed
+/// into the session's chat box. With a window, the window-only commands and
+/// `/window`, `/close` and `/screenshot` are answered against it.
+fn route_console_line(
+    line: &str,
+    window: Option<&ac_render::HostHandle>,
+    prefs: &mut graphics::DisplayPrefs,
+    commands: &std::sync::mpsc::Sender<SessionCommand>,
+) -> Routed {
+    // Window-only commands (/fly, /vsync) go to the window host first.
+    if let Some(host) = window
+        && graphics::window_command(host, line, prefs)
+    {
+        return Routed {
+            notice: None,
+            command: None,
+        };
+    }
+    match (console::parse(line, &[]), window) {
+        (ConsoleInput::Window { .. }, Some(host)) => {
+            let (to_window, from_session) = std::sync::mpsc::channel();
+            let spec = prefs.window_spec("openAC".to_owned());
+            match host.attach_to_session(spec, from_session, commands.clone()) {
+                Ok(()) => Routed {
+                    notice: None,
+                    command: Some(SessionCommand::Attach(to_window)),
+                },
+                Err(_) => Routed {
+                    notice: Some(console::notice("the window host has stopped", None)),
+                    command: None,
+                },
+            }
+        }
+        (ConsoleInput::Close, Some(host)) => {
+            let _ = host.detach();
+            Routed {
+                notice: None,
+                command: Some(SessionCommand::Detach),
+            }
+        }
+        (ConsoleInput::Screenshot(file), Some(host)) => {
+            let _ = host.screenshot(ac_render::screenshot_path(file));
+            Routed {
+                notice: None,
+                command: None,
+            }
+        }
+        (ConsoleInput::Window { .. } | ConsoleInput::Close | ConsoleInput::Screenshot(_), None) => {
+            Routed {
+                notice: Some(console::notice("no window support (--headless)", None)),
+                command: None,
+            }
+        }
+        (ConsoleInput::Objects { .. }, _) => Routed {
+            notice: None,
+            command: Some(SessionCommand::ListObjects),
+        },
+        (ConsoleInput::Time { .. }, _) => Routed {
+            notice: None,
+            command: Some(SessionCommand::GameTime),
+        },
+        (ConsoleInput::Contracts { .. }, _) => Routed {
+            notice: None,
+            command: Some(SessionCommand::ListContracts),
+        },
+        (ConsoleInput::Journal { .. }, _) => Routed {
+            notice: None,
+            command: Some(SessionCommand::ShowJournal),
+        },
+        (ConsoleInput::Quit { .. }, _) => Routed {
+            notice: Some(console::notice("quitting (graceful logout)", None)),
+            command: Some(SessionCommand::Shutdown),
+        },
+        (ConsoleInput::Chat { line, .. }, _) => Routed {
+            notice: None,
+            command: Some(console::typed_line(Some(line))),
+        },
+        (ConsoleInput::Command { command, .. }, _) => Routed {
+            notice: None,
+            command: Some(command.into_session_command()),
+        },
+        (ConsoleInput::Usage(usage), _) => Routed {
+            notice: Some(console::notice(usage, None)),
+            command: None,
+        },
+        (ConsoleInput::Sessions | ConsoleInput::Session(_), _) => Routed {
+            notice: Some(console::notice(console::HELP, None)),
+            command: None,
+        },
+        (ConsoleInput::Empty, _) => Routed {
+            notice: None,
+            command: Some(console::typed_line(None)),
+        },
+    }
+}
+
+/// Read console lines from standard input on their own thread. Each line is
+/// routed by [`route_console_line`]; a notice is printed and the command (if
+/// any) is sent to the session.
 fn spawn_console(
     commands: std::sync::mpsc::Sender<SessionCommand>,
     window: Option<ac_render::HostHandle>,
@@ -470,66 +680,13 @@ fn spawn_console(
         .spawn(move || {
             for line in std::io::stdin().lines() {
                 let Ok(line) = line else { break };
-                // Window-only commands (/fly, /vsync) go to the window host first.
-                if let Some(host) = &window
-                    && graphics::window_command(host, &line, &mut prefs)
-                {
-                    continue;
+                let routed = route_console_line(&line, window.as_ref(), &mut prefs, &commands);
+                if let Some(notice) = routed.notice {
+                    outln!("{notice}");
                 }
-                let command = match (console::parse(&line, &[]), &window) {
-                    (ConsoleInput::Window { .. }, Some(host)) => {
-                        let (to_window, from_session) = std::sync::mpsc::channel();
-                        let spec = prefs.window_spec("openAC".to_owned());
-                        if host
-                            .attach_to_session(spec, from_session, commands.clone())
-                            .is_err()
-                        {
-                            errln!("the window host has stopped");
-                            continue;
-                        }
-                        SessionCommand::Attach(to_window)
-                    }
-                    (ConsoleInput::Close, Some(host)) => {
-                        let _ = host.detach();
-                        SessionCommand::Detach
-                    }
-                    (ConsoleInput::Screenshot(file), Some(host)) => {
-                        let _ = host.screenshot(ac_render::screenshot_path(file));
-                        continue;
-                    }
-                    (
-                        ConsoleInput::Window { .. }
-                        | ConsoleInput::Close
-                        | ConsoleInput::Screenshot(_),
-                        None,
-                    ) => {
-                        outln!(
-                            "{}",
-                            console::notice("no window support (--headless)", None)
-                        );
-                        continue;
-                    }
-                    (ConsoleInput::Objects { .. }, _) => SessionCommand::ListObjects,
-                    (ConsoleInput::Time { .. }, _) => SessionCommand::GameTime,
-                    (ConsoleInput::Contracts { .. }, _) => SessionCommand::ListContracts,
-                    (ConsoleInput::Journal { .. }, _) => SessionCommand::ShowJournal,
-                    (ConsoleInput::Quit { .. }, _) => {
-                        outln!("{}", console::notice("quitting (graceful logout)", None));
-                        SessionCommand::Shutdown
-                    }
-                    (ConsoleInput::Chat { line, .. }, _) => console::typed_line(Some(line)),
-                    (ConsoleInput::Command { command, .. }, _) => command.into_session_command(),
-                    (ConsoleInput::Usage(usage), _) => {
-                        outln!("{}", console::notice(usage, None));
-                        continue;
-                    }
-                    (ConsoleInput::Sessions | ConsoleInput::Session(_), _) => {
-                        outln!("{}", console::notice(console::HELP, None));
-                        continue;
-                    }
-                    (ConsoleInput::Empty, _) => console::typed_line(None),
-                };
-                if commands.send(command).is_err() {
+                if let Some(command) = routed.command
+                    && commands.send(command).is_err()
+                {
                     break;
                 }
             }

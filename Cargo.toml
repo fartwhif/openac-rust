@@ -129,6 +129,12 @@ fancy-regex = { version = "0.19.2", default-features = false, features = ["std",
 # stb_truetype does (the glyf header boxes, hhea).
 fontdue = { version = "0.9.4", default-features = false }
 ttf-parser = { version = "0.25.1", default-features = false }
+# The client's terminal rendering mode (`openac --ui ratatui`): ratatui draws the session's
+# feed, status and objects as terminal widgets, and crossterm is its keyboard and terminal
+# backend (raw mode, alternate screen). Both are pure Rust, no build script compiles C or C++;
+# default features stay off so no optional backend or serde is pulled.
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
+crossterm = "0.29.0"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

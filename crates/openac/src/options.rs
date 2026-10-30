@@ -17,6 +17,11 @@ Options:
   --headless              Run without any window support (no display needed).
                           Without it, the console commands /window and /close open
                           and close a game window on the running session.
+  --ui <console|ratatui>   Rendering front end for the session's output: console
+                          (default) prints lines to standard output; ratatui
+                          draws a terminal UI (status, the event and chat feed,
+                          nearby objects, a command line) with ratatui and opens
+                          no GPU window. Env OPENAC_UI.
   --server <host:port>    Login server address (env OPENAC_SERVER, default 127.0.0.1:9000).
   --account <name>        Account name (env OPENAC_ACCOUNT).
   --character <name>      Character to enter the world with (default: none; the session
@@ -91,6 +96,17 @@ pub enum LogLevel {
     Trace,
 }
 
+/// How the session's output is rendered to the player.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderMode {
+    /// Lines to standard output (the default, and the `--headless` console).
+    #[default]
+    Console,
+    /// A terminal UI drawn with ratatui: status, the event and chat feed,
+    /// nearby objects, and a command line.
+    Ratatui,
+}
+
 /// Everything the program needs to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -117,6 +133,8 @@ pub struct Options {
     /// Data directory for chat logs and journals (`OPENAC_DATA_DIR`);
     /// `None` uses the platform default.
     pub data_dir: Option<String>,
+    /// How the session's output is rendered (`--ui`; default console).
+    pub render_mode: RenderMode,
 }
 
 /// The data-directory variable, shared with `openac run`.
@@ -174,6 +192,7 @@ impl Command {
         let mut log = env("OPENAC_LOG");
         let mut dat_dir = env("OPENAC_DAT_DIR").filter(|d| !d.is_empty());
         let mut radius = env("OPENAC_LANDBLOCK_RADIUS").filter(|r| !r.is_empty());
+        let mut ui = env("OPENAC_UI");
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -189,6 +208,7 @@ impl Command {
                 "--log" => log = Some(value("--log")?),
                 "--dat-dir" => dat_dir = Some(value("--dat-dir")?),
                 "--landblock-radius" => radius = Some(value("--landblock-radius")?),
+                "--ui" => ui = Some(value("--ui")?),
                 _ => return Err(OptionsError::UnknownArgument(arg)),
             }
         }
@@ -207,6 +227,12 @@ impl Command {
         };
         let net_loss = parse_net_loss(&env)?;
         let landblock_radius = radius.as_deref().map(parse_radius).transpose()?;
+        let render_mode = match ui {
+            Some(mode) if mode.eq_ignore_ascii_case("ratatui") => RenderMode::Ratatui,
+            Some(mode) if mode.eq_ignore_ascii_case("console") => RenderMode::Console,
+            Some(mode) => return Err(invalid("--ui", &mode, "expected console or ratatui")),
+            None => RenderMode::Console,
+        };
 
         Ok(Self::Run(Options {
             headless,
@@ -217,6 +243,7 @@ impl Command {
             duration,
             net_loss,
             log_level,
+            render_mode,
             dat_dir: dat_dir.map(PathBuf::from),
             landblock_radius,
             data_dir: env(DATA_DIR_VAR).filter(|d| !d.trim().is_empty()),

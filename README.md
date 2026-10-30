@@ -119,6 +119,9 @@ export OPENAC_PASSWORD='...'
 
 Type `/window` in its console to open a game window on the session and
 `/close` to close it again; `--headless` runs without any window support.
+`--ui ratatui` draws the session as a terminal UI (a status line, the event and
+chat feed, nearby objects, and a command line) with ratatui instead of a GPU
+window; it needs a terminal on standard output.
 `openac run --config <file>` runs several sessions from one configuration
 document. [docs/building-and-running.md](docs/building-and-running.md) walks
 through it, and [docs/launch-options.md](docs/launch-options.md) lists every
