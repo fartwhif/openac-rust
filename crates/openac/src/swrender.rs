@@ -26,6 +26,7 @@ use ac_render::gameplay_input::{DeviceState, GameplayInput, GameplayOutput};
 use ac_render::scene::{Scene, SceneSource};
 use ac_render::streaming::StreamingRegion;
 use ac_render::texture_detail::WorldTextureDetail;
+use ac_render::world_click::{ClickFacts, WorldClick, WorldClicks};
 use ac_render::world_frame::{self, LandblockCoord};
 use ac_runtime::session::{
     LifecycleCommand, ObjectSummary, PresentationEvent, SessionCommand, SessionEvent,
@@ -131,6 +132,9 @@ struct Frame {
     height: usize,
     color: Vec<Color>,
     depth: Vec<f32>,
+    /// The server object (id) drawn at each sub-pixel, 0 for sky/terrain;
+    /// the pick reads it under the cursor.
+    gid: Vec<u32>,
 }
 
 impl Frame {
@@ -140,6 +144,7 @@ impl Frame {
             height,
             color: vec![[0.0; 3]; width * height],
             depth: vec![1.0; width * height],
+            gid: vec![0; width * height],
         }
     }
 }
@@ -255,6 +260,8 @@ struct Tri {
     b: Vec3,
     c: Vec3,
     color: Color,
+    /// The server object this triangle draws, 0 for terrain.
+    gid: u32,
 }
 
 struct Raster<'a> {
@@ -330,10 +337,13 @@ impl<'a> Raster<'a> {
         for d in self.frame.depth.iter_mut() {
             *d = 1.0;
         }
+        for g in self.frame.gid.iter_mut() {
+            *g = 0;
+        }
     }
 
     /// Draw one world-space triangle with flat lighting and per-vertex fog.
-    fn draw_tri(&mut self, a: Vec3, b: Vec3, c: Vec3, albedo: Color) {
+    fn draw_tri(&mut self, a: Vec3, b: Vec3, c: Vec3, albedo: Color, gid: u32) {
         let face = (b - a).cross(c - a);
         let area2 = face.length_squared();
         if area2 <= 1e-12 {
@@ -411,6 +421,7 @@ impl<'a> Raster<'a> {
                 }
                 let f = u0 * fa + u1 * fb + u2 * fc;
                 self.frame.depth[i] = z;
+                self.frame.gid[i] = gid;
                 self.frame.color[i] = [
                     col[0] * (1.0 - f) + self.light.fog_color[0] * f,
                     col[1] * (1.0 - f) + self.light.fog_color[1] * f,
@@ -451,6 +462,9 @@ struct Renderer {
     gfx: HashMap<u32, GfxObjData>,
     gameplay: GameplayInput,
     frame: Frame,
+    /// The click memory a target-mode claim needs (the last offered object
+    /// and when); terminal clicks feed it through `pick_cell`.
+    world_clicks: WorldClicks,
 }
 
 impl Renderer {
@@ -498,6 +512,7 @@ impl Renderer {
             gfx: HashMap::new(),
             gameplay,
             frame: Frame::new(2 * cols, 4 * rows),
+            world_clicks: WorldClicks::default(),
         })
     }
 
@@ -589,6 +604,7 @@ impl Renderer {
                     b: offset + v3(t[1].position),
                     c: offset + v3(t[2].position),
                     color: [0.30, 0.42, 0.19], // grass; atlas texturing is a later pass
+                    gid: 0,
                 });
             }
         }
@@ -623,10 +639,39 @@ impl Renderer {
             let mut raster = Raster::new(&mut self.frame, view_mat, proj, &light);
             raster.clear_sky();
             for t in &tris {
-                raster.draw_tri(t.a, t.b, t.c, t.color);
+                raster.draw_tri(t.a, t.b, t.c, t.color, t.gid);
             }
         }
         encode(&self.frame, cols, rows)
+    }
+
+    /// The server object (id) the last frame drew under the terminal cell
+    /// (`col`, `row`): the gid covering the most of the cell's 2 x 4
+    /// sub-pixels, `None` over sky or terrain.
+    fn pick_cell(&self, col: usize, row: usize) -> Option<u32> {
+        if col * 2 + 1 >= self.frame.width || row * 4 + 3 >= self.frame.height {
+            return None;
+        }
+        let mut gids = [0u32; 8];
+        for dy in 0..4 {
+            for dx in 0..2 {
+                let i = (row * 4 + dy) * self.frame.width + col * 2 + dx;
+                gids[dy * 2 + dx] = self.frame.gid[i];
+            }
+        }
+        let mut best: Option<u32> = None;
+        let mut best_count = 0usize;
+        for g in gids {
+            if g == 0 {
+                continue;
+            }
+            let count = gids.iter().filter(|&&x| x == g).count();
+            if count > best_count || (count == best_count && best.is_some_and(|b| g < b)) {
+                best = Some(g);
+                best_count = count;
+            }
+        }
+        best
     }
 
     /// Append an object's model triangles, transformed into the drawing frame.
@@ -666,6 +711,7 @@ impl Renderer {
                         b: vec3v(&w(tri[1])),
                         c: vec3v(&w(tri[2])),
                         color: albedo,
+                        gid: obj.guid,
                     });
                 }
             }
@@ -1146,6 +1192,11 @@ fn handle_event(
                     input.buttons |= 1u32 << i;
                     input.last_mouse = Some((m.column, m.row));
                     let outs = renderer.mouse_button(i, true, now_ms, gameplay_now, &state);
+                    for out in &outs {
+                        if let GameplayOutput::WorldClick(click) = out {
+                            route_world_click(renderer, input.last_mouse, *click, now_ms, commands);
+                        }
+                    }
                     route_outputs(outs, commands);
                 }
                 MouseEventKind::Up(b) => {
@@ -1347,6 +1398,29 @@ fn route_outputs(outputs: Vec<GameplayOutput>, commands: &mpsc::Sender<SessionCo
     }
 }
 
+/// A click on the 3-D view: pick the object under the cursor and select,
+/// examine or use it. The terminal has no UI, so the click facts default
+/// (no waiting target mode, nothing wielded) and a click on nothing does
+/// nothing.
+fn route_world_click(
+    renderer: &mut Renderer,
+    last_mouse: Option<(u16, u16)>,
+    click: WorldClick,
+    now_ms: u64,
+    commands: &mpsc::Sender<SessionCommand>,
+) {
+    let Some((col, row)) = last_mouse else {
+        return;
+    };
+    let picked = renderer.pick_cell(col as usize, row as usize);
+    let outcome = renderer
+        .world_clicks
+        .click(click, picked, ClickFacts::default(), now_ms);
+    for command in outcome.commands {
+        let _ = commands.send(command);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Terminal control.
 // ---------------------------------------------------------------------------
@@ -1473,7 +1547,7 @@ mod tests {
             Vec3::new(-20.0, 20.0, 0.0),
         ];
         for (a, b, c) in [(0, 1, 2), (0, 2, 3)] {
-            r.draw_tri(quad[a], quad[b], quad[c], [0.3, 0.45, 0.2]);
+            r.draw_tri(quad[a], quad[b], quad[c], [0.3, 0.45, 0.2], 0);
         }
         let grid = encode(&frame, cols, rows);
         // The lower part of the screen (ground) should have some lit dots; the
