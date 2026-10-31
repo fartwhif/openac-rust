@@ -1073,10 +1073,12 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
         Some(code) => code,
         None => {
             // The session is still running (Esc, or the terminal broke):
-            // ask it to end, then wait for its code.
+            // ask it to end, then wait for its code. A clean log off takes a
+            // few seconds — the session asks the server and waits for the
+            // confirmation — so give it room before reporting a failure.
             let _ = commands.send(SessionCommand::Shutdown);
             rx_code
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(Duration::from_secs(10))
                 .unwrap_or_else(|_| ExitCode::from(super::EXIT_SESSION_FAILED))
         }
     };
