@@ -146,7 +146,7 @@ impl Frame {
 
 /// A terminal cell after encoding: the braille character and its colours.
 /// Shared with the 2-D primitive interface, which paints the HUD and panels.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Cell {
     pub(crate) ch: char,
     pub(crate) fg: [u8; 3],
@@ -993,12 +993,15 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
     let mut last = Instant::now();
     let input_start = Instant::now();
     let mut stdout = io::stdout();
-    let mut modifiers = Modifiers::NONE;
-    let mut buttons: u32 = 0;
-    let mut last_mouse: Option<(u16, u16)> = None;
+    let mut input = TerminalInput {
+        buttons: 0,
+        modifiers: Modifiers::NONE,
+        last_mouse: None,
+    };
     let mut quit = false;
     let mut session_code: Option<ExitCode> = None;
     let mut model = termui::Model::new();
+    let mut last_drawn: Option<Vec<Vec<Cell>>> = None;
     loop {
         let now = Instant::now();
         let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
@@ -1006,81 +1009,20 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
         let gameplay_now = input_start.elapsed().as_secs_f32();
         let now_ms = u64::try_from(input_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        // Drain pending input (non-blocking); Esc quits.
-        while !quit && event::poll(Duration::ZERO).unwrap_or(false) {
-            let Ok(evt) = event::read() else {
-                break;
-            };
-            match evt {
-                Event::Key(k) => {
-                    if k.code == KeyCode::Esc {
-                        quit = true;
-                        break;
-                    }
-                    modifiers = modifiers_from_crossterm(k.modifiers);
-                    let Some(key) = key_from_crossterm(k.code) else {
-                        continue;
-                    };
-                    let pressed = match k.kind {
-                        KeyEventKind::Press => true,
-                        KeyEventKind::Release => false,
-                        _ => continue,
-                    };
-                    let state = input_state(buttons, modifiers);
-                    let outs = renderer.press_key(key, pressed, gameplay_now, &state);
-                    route_outputs(outs, &commands);
-                }
-                Event::Mouse(m) => {
-                    let state = input_state(buttons, modifiers);
-                    match m.kind {
-                        MouseEventKind::Down(b) => {
-                            let i = mouse_button_index(b);
-                            buttons |= 1u32 << i;
-                            last_mouse = Some((m.column, m.row));
-                            let outs = renderer.mouse_button(i, true, now_ms, gameplay_now, &state);
-                            route_outputs(outs, &commands);
-                        }
-                        MouseEventKind::Up(b) => {
-                            let i = mouse_button_index(b);
-                            buttons &= !(1u32 << i);
-                            let outs =
-                                renderer.mouse_button(i, false, now_ms, gameplay_now, &state);
-                            route_outputs(outs, &commands);
-                        }
-                        MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-                            let (col, row) = (m.column, m.row);
-                            if let Some((px, py)) = last_mouse {
-                                let dx = col as i32 - px as i32;
-                                let dy = row as i32 - py as i32;
-                                if dx != 0 || dy != 0 {
-                                    // A cell is 2x4 sub-pixels; feed the motion in sub-pixels.
-                                    renderer.mouse_moved(
-                                        dx as f32 * 2.0,
-                                        dy as f32 * 4.0,
-                                        gameplay_now,
-                                        &state,
-                                    );
-                                }
-                            }
-                            last_mouse = Some((col, row));
-                        }
-                        MouseEventKind::ScrollDown => {
-                            let outs = renderer.mouse_wheel(1.0, gameplay_now, &state);
-                            route_outputs(outs, &commands);
-                        }
-                        MouseEventKind::ScrollUp => {
-                            let outs = renderer.mouse_wheel(-1.0, gameplay_now, &state);
-                            route_outputs(outs, &commands);
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
+        // Drain input that arrived since the last frame (non-blocking); Esc quits.
+        if drain_input(
+            Duration::ZERO,
+            &mut renderer,
+            &commands,
+            gameplay_now,
+            now_ms,
+            &mut input,
+        ) {
+            quit = true;
         }
 
         // Held movement and held camera keys, polled each frame.
-        let state = input_state(buttons, modifiers);
+        let state = input_state(input.buttons, input.modifiers);
         let outs = renderer.tick_gameplay(dt, gameplay_now, &state);
         route_outputs(outs, &commands);
 
@@ -1093,10 +1035,11 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
         let mut grid = termui::Grid::new(cols, rows);
         grid.blit(layout.viewport.x, layout.viewport.y, &view_grid);
         termui::draw(&mut grid, &model, &layout, now, minimap.as_ref());
-        if let Err(e) = draw_grid(&mut stdout, grid.rows()) {
+        if let Err(e) = draw_grid(&mut stdout, grid.rows(), last_drawn.as_deref()) {
             errln!("openac: terminal write failed: {e}");
             break;
         }
+        last_drawn = Some(grid.rows().to_vec());
 
         if quit {
             break;
@@ -1108,7 +1051,22 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
         if source.session_gone() {
             break;
         }
-        std::thread::sleep(FRAME_PERIOD.saturating_sub(now.elapsed()));
+        // Wait out the frame, handling input as it arrives so the camera and
+        // movement stay responsive instead of waiting a full frame to be seen.
+        let remaining = FRAME_PERIOD.saturating_sub(now.elapsed());
+        if !quit
+            && remaining > Duration::ZERO
+            && drain_input(
+                remaining,
+                &mut renderer,
+                &commands,
+                gameplay_now,
+                now_ms,
+                &mut input,
+            )
+        {
+            quit = true;
+        }
     }
 
     let code = match session_code {
@@ -1140,6 +1098,126 @@ fn input_state(buttons: u32, modifiers: Modifiers) -> DeviceState<'static> {
         want_mouse: false,
         want_keyboard: false,
     }
+}
+
+/// The mutable input state the terminal feeds to the gameplay dispatcher:
+/// the held buttons, the held modifiers, and the last cursor cell.
+struct TerminalInput {
+    buttons: u32,
+    modifiers: Modifiers,
+    last_mouse: Option<(u16, u16)>,
+}
+
+/// Handle one terminal event, routing it to the gameplay input. Returns `true`
+/// when the user asks to quit (Esc).
+fn handle_event(
+    evt: Event,
+    renderer: &mut Renderer,
+    commands: &mpsc::Sender<SessionCommand>,
+    gameplay_now: f32,
+    now_ms: u64,
+    input: &mut TerminalInput,
+) -> bool {
+    match evt {
+        Event::Key(k) => {
+            if k.code == KeyCode::Esc {
+                return true;
+            }
+            input.modifiers = modifiers_from_crossterm(k.modifiers);
+            let Some(key) = key_from_crossterm(k.code) else {
+                return false;
+            };
+            let pressed = match k.kind {
+                KeyEventKind::Press => true,
+                KeyEventKind::Release => false,
+                _ => return false,
+            };
+            let state = input_state(input.buttons, input.modifiers);
+            let outs = renderer.press_key(key, pressed, gameplay_now, &state);
+            route_outputs(outs, commands);
+        }
+        Event::Mouse(m) => {
+            let state = input_state(input.buttons, input.modifiers);
+            match m.kind {
+                MouseEventKind::Down(b) => {
+                    let i = mouse_button_index(b);
+                    input.buttons |= 1u32 << i;
+                    input.last_mouse = Some((m.column, m.row));
+                    let outs = renderer.mouse_button(i, true, now_ms, gameplay_now, &state);
+                    route_outputs(outs, commands);
+                }
+                MouseEventKind::Up(b) => {
+                    let i = mouse_button_index(b);
+                    input.buttons &= !(1u32 << i);
+                    let outs = renderer.mouse_button(i, false, now_ms, gameplay_now, &state);
+                    route_outputs(outs, commands);
+                }
+                MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                    let (col, row) = (m.column, m.row);
+                    if let Some((px, py)) = input.last_mouse {
+                        let dx = col as i32 - px as i32;
+                        let dy = row as i32 - py as i32;
+                        if dx != 0 || dy != 0 {
+                            // A cell is 2x4 sub-pixels; feed the motion in sub-pixels.
+                            renderer.mouse_moved(
+                                dx as f32 * 2.0,
+                                dy as f32 * 4.0,
+                                gameplay_now,
+                                &state,
+                            );
+                        }
+                    }
+                    input.last_mouse = Some((col, row));
+                }
+                MouseEventKind::ScrollDown => {
+                    let outs = renderer.mouse_wheel(1.0, gameplay_now, &state);
+                    route_outputs(outs, commands);
+                }
+                MouseEventKind::ScrollUp => {
+                    let outs = renderer.mouse_wheel(-1.0, gameplay_now, &state);
+                    route_outputs(outs, commands);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Wait up to `timeout` for input, then drain everything that has arrived, so
+/// input is handled as it comes rather than once per rendered frame. With a
+/// zero timeout it drains whatever is already pending; otherwise it blocks
+/// until the deadline (keeping the render on its own cadence). Returns `true`
+/// when the user asks to quit.
+fn drain_input(
+    timeout: Duration,
+    renderer: &mut Renderer,
+    commands: &mpsc::Sender<SessionCommand>,
+    gameplay_now: f32,
+    now_ms: u64,
+    input: &mut TerminalInput,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    let mut quit = false;
+    loop {
+        let wait = if timeout == Duration::ZERO {
+            Duration::ZERO
+        } else {
+            deadline.saturating_duration_since(Instant::now())
+        };
+        if !event::poll(wait).unwrap_or(false) {
+            break;
+        }
+        let Ok(evt) = event::read() else {
+            break;
+        };
+        quit = handle_event(evt, renderer, commands, gameplay_now, now_ms, input);
+        if quit {
+            break;
+        }
+    }
+    quit
 }
 
 /// A crossterm key as the UI names it (`None` for keys the UI has no name for).
@@ -1296,36 +1374,56 @@ fn leave_terminal() {
     let _ = crossterm::terminal::disable_raw_mode();
 }
 
-/// Write a grid of cells to the terminal with 24-bit colour, emitting a SGR
-/// sequence only when a colour changes.
-fn draw_grid(out: &mut impl Write, grid: &[Vec<Cell>]) -> io::Result<()> {
+/// Write the cells that differ from the previous frame to the terminal, with
+/// 24-bit colour. Only changed cells are emitted — the cursor is positioned
+/// with CUP at the start of each changed run and an SGR sequence is emitted
+/// only when a colour changes — so an idle scene writes almost nothing. That
+/// is what keeps the terminal from flooding and flickering over SSH.
+fn draw_grid(
+    out: &mut impl Write,
+    grid: &[Vec<Cell>],
+    prev: Option<&[Vec<Cell>]>,
+) -> io::Result<()> {
     use std::fmt::Write as _;
-    let mut buf = String::with_capacity(grid.len() * grid[0].len() * 8);
-    let _ = write!(buf, "\x1b[H");
+    let rows = grid.len();
+    let cols = grid.first().map_or(0, |row| row.len());
+    // A different shape (a terminal resize) is a full repaint.
+    let aligned =
+        prev.is_some_and(|p| p.len() == rows && p.first().is_some_and(|row| row.len() == cols));
+    let changed =
+        |r: usize, c: usize| -> bool { !prev.is_some_and(|p| aligned && p[r][c] == grid[r][c]) };
+    let mut buf = String::with_capacity(rows * cols / 2);
     let mut last_fg: Option<[u8; 3]> = None;
     let mut last_bg: Option<[u8; 3]> = None;
     for (r, row) in grid.iter().enumerate() {
-        for cell in row {
-            if last_fg != Some(cell.fg) {
-                let _ = write!(
-                    buf,
-                    "\x1b[38;2;{};{};{}m",
-                    cell.fg[0], cell.fg[1], cell.fg[2]
-                );
-                last_fg = Some(cell.fg);
+        let mut c = 0;
+        while c < cols {
+            if !changed(r, c) {
+                c += 1;
+                continue;
             }
-            if last_bg != Some(cell.bg) {
-                let _ = write!(
-                    buf,
-                    "\x1b[48;2;{};{};{}m",
-                    cell.bg[0], cell.bg[1], cell.bg[2]
-                );
-                last_bg = Some(cell.bg);
+            let _ = write!(buf, "\x1b[{};{}H", r + 1, c + 1);
+            while c < cols && changed(r, c) {
+                let cell = row[c];
+                if last_fg != Some(cell.fg) {
+                    let _ = write!(
+                        buf,
+                        "\x1b[38;2;{};{};{}m",
+                        cell.fg[0], cell.fg[1], cell.fg[2]
+                    );
+                    last_fg = Some(cell.fg);
+                }
+                if last_bg != Some(cell.bg) {
+                    let _ = write!(
+                        buf,
+                        "\x1b[48;2;{};{};{}m",
+                        cell.bg[0], cell.bg[1], cell.bg[2]
+                    );
+                    last_bg = Some(cell.bg);
+                }
+                let _ = write!(buf, "{}", cell.ch);
+                c += 1;
             }
-            let _ = write!(buf, "{}", cell.ch);
-        }
-        if r + 1 < grid.len() {
-            let _ = write!(buf, "\x1b[0m\r\n");
         }
     }
     let _ = write!(buf, "\x1b[0m");
@@ -1401,6 +1499,65 @@ mod tests {
         let grid = encode(&frame, 1, 1);
         assert_eq!(grid[0][0].ch, char::from_u32(0x2800 | 0xFF).unwrap());
         assert_eq!(grid[0][0].fg, grid[0][0].bg);
+    }
+
+    #[test]
+    fn draw_grid_only_writes_changed_cells() {
+        fn solid(n: usize, ch: char, color: [u8; 3]) -> Vec<Vec<Cell>> {
+            let row = vec![
+                Cell {
+                    ch,
+                    fg: color,
+                    bg: color
+                };
+                n
+            ];
+            (0..n).map(|_| row.clone()).collect()
+        }
+
+        // First frame: no previous grid, so every cell is painted.
+        let base = solid(10, ' ', [10, 20, 30]);
+        let mut out = Vec::new();
+        draw_grid(&mut out, &base, None).unwrap();
+        let full = out.len();
+        assert!(
+            full > 100,
+            "a full repaint should be non-trivial, got {full} bytes"
+        );
+
+        // Second frame: identical, so nothing changed -> only the trailing reset.
+        let mut out = Vec::new();
+        draw_grid(&mut out, &base, Some(&base)).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[0m",
+            "an unchanged frame must not redraw any cell"
+        );
+
+        // Third frame: one cell changes -> a CUP to that cell and just its char.
+        let mut changed = base.clone();
+        changed[1][1] = Cell {
+            ch: 'X',
+            fg: [1, 2, 3],
+            bg: [4, 5, 6],
+        };
+        let mut out = Vec::new();
+        draw_grid(&mut out, &changed, Some(&base)).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.contains("\x1b[2;2H"),
+            "must position to the changed cell: {s:?}"
+        );
+        assert_eq!(
+            s.matches('X').count(),
+            1,
+            "only the changed char is written: {s:?}"
+        );
+        assert!(
+            s.len() < full / 2,
+            "a single-cell change must be far smaller than a full repaint: {} vs {full}",
+            s.len()
+        );
     }
 
     /// With real dats (`OPENAC_DAT_DIR`), a Holtburg player must produce visible
