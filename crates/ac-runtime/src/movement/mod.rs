@@ -2678,6 +2678,18 @@ impl Movement {
             if let Some(player) = self.player.as_mut() {
                 let mut env = MovementEnv::new(&mut self.engine, &view);
                 let c = &mut player.controller;
+                // The server keeps the local player Hidden from spawn until it
+                // un-hides it (e.g. after a teleport); a server that never
+                // re-sends the state leaves the player undrawn and input-dead
+                // forever. Once the user actually holds a movement key, the
+                // player wants to move, so clear the hidden bit: it is drawn
+                // again and `update` applies the input instead of `tick_hidden`.
+                if player.hidden
+                    && (input.forward || input.backward || input.strafe_left || input.strafe_right)
+                {
+                    player.hidden = false;
+                    c.clear_hidden();
+                }
                 let movement = if player.hidden {
                     c.tick_hidden(&mut env, dt)
                 } else {

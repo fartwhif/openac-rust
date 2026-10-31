@@ -698,6 +698,13 @@ impl PlayerMovementController {
         self.obj.body.calc_acceleration();
     }
 
+    /// Clear the HIDDEN bit so the local player is drawn again and user input
+    /// moves it, once the server's spawn/teleport transition is over.
+    pub fn clear_hidden(&mut self) {
+        self.obj.body.state.remove(PhysicsState::HIDDEN);
+        self.obj.body.calc_acceleration();
+    }
+
     /// Replace the run and jump skills.
     pub fn set_character_skills(&mut self, run_skill: i32, jump_skill: i32) {
         self.obj.weenie.set_skills(run_skill, jump_skill);
