@@ -10,6 +10,7 @@ mod plugins;
 mod session_config;
 mod stdio;
 mod swrender;
+mod termui;
 mod tui;
 mod window_state;
 

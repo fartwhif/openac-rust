@@ -1,17 +1,19 @@
-//! The `--ui terminal` front end: the 3-D world and the game's 2-D GUI,
-//! software-rendered to a plain terminal as braille dots with 24-bit colour.
+//! The `--ui terminal` front end: the 3-D world, software-rendered to a plain
+//! terminal as braille dots with 24-bit colour, plus a 2-D interface drawn from
+//! the scene's facts in a primitive cell layer (box-drawing, Nerd Font glyphs,
+//! UTF-8 text) — never the game's widget tree.
 //!
 //! There is no GPU and no image protocol on the target, so the frame is a grid
 //! of sub-pixels: each terminal cell holds a 2-wide by 4-tall braille dot
 //! matrix (square in a typical 1:2 cell) and a foreground/background colour.
 //! The world is projected with the game's own chase camera and light with the
-//! game's sun, ambient and fog; the 2-D GUI is the real ImGui `DrawList`.
+//! game's sun, ambient and fog.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use ac_core::terrain::{SurfaceInfo, TerrainBlendingContext};
@@ -24,13 +26,11 @@ use ac_render::gameplay_input::{DeviceState, GameplayInput, GameplayOutput};
 use ac_render::scene::{Scene, SceneSource};
 use ac_render::streaming::StreamingRegion;
 use ac_render::texture_detail::WorldTextureDetail;
-use ac_render::ui::{UiPixels, UiTextureSource, WindowUi};
 use ac_render::world_frame::{self, LandblockCoord};
 use ac_runtime::session::{
     LifecycleCommand, ObjectSummary, PresentationEvent, SessionCommand, SessionEvent,
     SessionHandle, SessionSummary,
 };
-use ac_ui::draw::{Color as UiColor, DrawCmd, DrawList, Quad, TextureRef};
 use ac_ui::input::bindings::KeyBindings;
 use ac_ui::{Key, Modifiers};
 use crossterm::event::{
@@ -41,6 +41,7 @@ use glam::{Mat4, Quat, Vec3, Vec4};
 
 use crate::options::{LogLevel, Options};
 use crate::stdio::errln;
+use crate::termui;
 
 const REGION_ID: u32 = 0x1300_0000;
 /// How many landblocks the drawing frame keeps centered on the player.
@@ -49,11 +50,6 @@ const ORIGIN_KEEP_RADIUS: u32 = 2;
 const FRAME_PERIOD: Duration = Duration::from_millis(66); // ~15 fps
 /// How many server objects are drawn (nearest first) each frame.
 const MAX_DRAWN_OBJECTS: usize = 64;
-/// The height (px) the game's GUI is authored for; the width is derived from
-/// the terminal's aspect so the whole canvas scales uniformly.
-const UI_DESIGN_HEIGHT: u32 = 720;
-/// The top-down minimap's side, in sub-pixels (8x8 terminal cells).
-const MINIMAP_SIDE: usize = 16;
 /// The world span the minimap shows, in meters (player centered).
 const MINIMAP_SPAN: f32 = 120.0;
 
@@ -149,10 +145,12 @@ impl Frame {
 }
 
 /// A terminal cell after encoding: the braille character and its colours.
-struct Cell {
-    ch: char,
-    fg: [u8; 3],
-    bg: [u8; 3],
+/// Shared with the 2-D primitive interface, which paints the HUD and panels.
+#[derive(Clone, Copy)]
+pub(crate) struct Cell {
+    pub(crate) ch: char,
+    pub(crate) fg: [u8; 3],
+    pub(crate) bg: [u8; 3],
 }
 
 const BRIT_BITS: [[u8; 2]; 4] = [[0, 3], [1, 4], [2, 5], [6, 7]];
@@ -452,8 +450,6 @@ struct Renderer {
     landblocks: HashMap<LandblockCoord, LandblockData>,
     gfx: HashMap<u32, GfxObjData>,
     gameplay: GameplayInput,
-    ui: Option<WindowUi>,
-    ui_size: (u32, u32),
     frame: Frame,
 }
 
@@ -488,18 +484,6 @@ impl Renderer {
             )
         });
         let gameplay = GameplayInput::new(KeyBindings::retail_defaults());
-        // The 2-D game GUI, laid out at a size whose aspect matches the
-        // terminal so the canvas scales uniformly. Best-effort: if the UI dats
-        // are unavailable, the 3-D world still renders.
-        let ui_h = UI_DESIGN_HEIGHT;
-        let ui_w = (ui_h as f32 * (2 * cols) as f32 / (4 * rows).max(1) as f32)
-            .round()
-            .max(64.0) as u32;
-        let ui_size = (ui_w, ui_h);
-        let ui = ac_dat::DatCollection::open(&dir)
-            .ok()
-            .map(Arc::new)
-            .and_then(|dats| WindowUi::build(dats, ui_size).ok());
         Ok(Self {
             content,
             height_table,
@@ -513,8 +497,6 @@ impl Renderer {
             landblocks: HashMap::new(),
             gfx: HashMap::new(),
             gameplay,
-            ui,
-            ui_size,
             frame: Frame::new(2 * cols, 4 * rows),
         })
     }
@@ -551,9 +533,6 @@ impl Renderer {
             .set_aspect((2 * cols) as f32 / (4 * rows).max(1) as f32);
 
         let player_pos = scene.player().and_then(|p| p.position);
-        let player_world: Option<Vec3> = player_pos
-            .as_ref()
-            .map(|p| world_frame::to_frame(&self.origin, p.cell_id, vec3(&p.origin)));
 
         // Keep the drawing frame and the streamed landblocks centered on the player.
         if let Some(pos) = &player_pos {
@@ -647,12 +626,6 @@ impl Renderer {
                 raster.draw_tri(t.a, t.b, t.c, t.color);
             }
         }
-        // The 2-D GUI, then the top-down minimap, painted over the world.
-        let ui_list = self.ui.as_mut().map(|ui| ui.frame(now, self.ui_size));
-        if let Some(list) = ui_list {
-            self.draw_ui_list(&list);
-        }
-        self.draw_minimap(player_world);
         encode(&self.frame, cols, rows)
     }
 
@@ -699,80 +672,20 @@ impl Renderer {
         }
     }
 
-    /// Feed the game's 2-D GUI with the scene (vitals, chat, player facts).
-    fn feed_ui(&mut self, scene: &mut Scene) {
-        if let Some(ui) = self.ui.as_mut() {
-            ui.feed(scene);
-        }
-    }
-
-    /// The session commands the GUI requested since the last call (a control
-    /// clicked with the mouse), routed back to the session.
-    fn drain_ui(&mut self) -> Vec<SessionCommand> {
-        self.ui.as_mut().map_or_else(Vec::new, WindowUi::drain)
-    }
-
-    /// Rasterize the GUI's [`DrawList`] into the frame's sub-pixel buffer, over
-    /// the 3-D world.
-    fn draw_ui_list(&mut self, list: &DrawList) {
-        let width = self.frame.width;
-        let height = self.frame.height;
-        let (cx, cy) = list.canvas_scale;
-        let sx = (width as f32 / self.ui_size.0 as f32) * cx;
-        let sy = (height as f32 / self.ui_size.1 as f32) * cy;
-        let Some(ui) = self.ui.as_ref() else {
-            return;
-        };
-        let mut surfaces = ui.surfaces();
-        // Decode every texture the list uses, once per frame.
-        let mut tex: HashMap<TextureRef, UiPixels> = HashMap::new();
-        for cmd in list.commands() {
-            for t in cmd_textures(cmd).into_iter().flatten() {
-                if matches!(t, TextureRef::Surface(0)) || tex.contains_key(&t) {
-                    continue;
-                }
-                if let Some(pixels) = surfaces.decode(t) {
-                    tex.insert(t, pixels);
-                }
-            }
-        }
-        let color = &mut self.frame.color;
-        for cmd in list.commands() {
-            rasterize_cmd(&tex, cmd, color, width, height, sx, sy);
-        }
-    }
-
-    /// A top-down, height-shaded map of the terrain around the player, in the
-    /// top-right corner of the frame, with the player marked at the centre.
-    fn draw_minimap(&mut self, player: Option<Vec3>) {
-        let width = self.frame.width;
-        let height = self.frame.height;
-        let player = match player {
-            Some(p) => p,
-            None => return,
-        };
-        let side = MINIMAP_SIDE.min(width / 3).min(height / 3);
-        if side < 4 {
-            return;
-        }
-        let x0 = width - side - 2;
-        let y0 = 2;
-        // A dark backing so the map reads as a panel.
-        fill_rect(
-            &mut self.frame.color,
-            width,
-            height,
-            x0 as f32,
-            y0 as f32,
-            (x0 + side) as f32,
-            (y0 + side) as f32,
-            [0.03, 0.05, 0.03],
-            1.0,
-        );
+    /// A top-down height grid of the terrain around the player: an `n`×`n`
+    /// array of heights relative to the player (`f32::MIN` where no terrain
+    /// covers the cell), for the 2-D interface's shade-character minimap.
+    fn minimap_heights(&self, scene: &Scene, n: usize) -> Option<Vec<Vec<f32>>> {
+        let n = n.max(2);
+        let player = scene
+            .player()
+            .and_then(|p| p.position)
+            .map(|pos| world_frame::to_frame(&self.origin, pos.cell_id, vec3(&pos.origin)))?;
         let span = MINIMAP_SPAN;
-        let scale = span / side as f32;
-        let clip = (x0, y0, x0 + side, y0 + side);
-        let color = &mut self.frame.color;
+        let scale = span / n as f32;
+        const NO_TERRAIN: f32 = f32::MIN;
+        let mut buf: Vec<Color> = vec![[NO_TERRAIN, 0.0, 0.0]; n * n];
+        let clip = (0, 0, n, n);
         for (coord, lb) in self.landblocks.iter() {
             let offset = world_frame::landblock_offset(&self.origin, *coord);
             for t in lb.vertices.chunks_exact(3) {
@@ -787,28 +700,38 @@ impl Renderer {
                 {
                     continue;
                 }
-                // Height-shade relative to the player so local relief reads:
-                // 25 m below the player is darkest, 25 m above is lightest.
-                let t = (((a.z + b.z + c.z) / 3.0 - player.z + 25.0) / 50.0).clamp(0.0, 1.0);
-                let shade = [0.10 + 0.55 * t, 0.16 + 0.5 * t, 0.08 + 0.2 * t];
+                let rel = ((a.z + b.z + c.z) / 3.0) - player.z;
                 let to_map = |p: Vec3| {
                     (
-                        x0 as f32 + (p.x - player.x + span / 2.0) / scale,
-                        y0 as f32 + (p.y - player.y + span / 2.0) / scale,
+                        (p.x - player.x + span / 2.0) / scale,
+                        (p.y - player.y + span / 2.0) / scale,
                     )
                 };
                 let (ax, ay) = to_map(a);
                 let (bx, by) = to_map(b);
-                let (cxi, cyi) = to_map(c);
-                fill_triangle(color, width, ax, ay, bx, by, cxi, cyi, shade, 1.0, clip);
+                let (cx, cy) = to_map(c);
+                fill_triangle(
+                    &mut buf,
+                    n,
+                    ax,
+                    ay,
+                    bx,
+                    by,
+                    cx,
+                    cy,
+                    [rel, 0.0, 0.0],
+                    1.0,
+                    clip,
+                );
             }
         }
-        // The player: a bright marker at the map's centre.
-        let mx = x0 + side / 2;
-        let my = y0 + side / 2;
-        blend_subpix(color, width, mx, my, [1.0, 0.85, 0.2], 1.0);
-        blend_subpix(color, width, mx + 1, my, [1.0, 0.85, 0.2], 1.0);
-        blend_subpix(color, width, mx, my + 1, [1.0, 0.85, 0.2], 1.0);
+        let mut out = vec![vec![NO_TERRAIN; n]; n];
+        for y in 0..n {
+            for x in 0..n {
+                out[y][x] = buf[y * n + x][0];
+            }
+        }
+        Some(out)
     }
 
     fn gfx_entry(&mut self, id: u32) -> Option<&GfxObjData> {
@@ -929,185 +852,8 @@ impl Renderer {
 }
 
 // ---------------------------------------------------------------------------
-// 2-D GUI and minimap rasterization, painted over the sub-pixel buffer.
+// Sub-pixel fill primitives: the minimap's height buffer is painted with them.
 // ---------------------------------------------------------------------------
-
-/// The texture named by a draw command, if any.
-fn cmd_textures(cmd: &DrawCmd) -> [Option<TextureRef>; 1] {
-    match cmd {
-        DrawCmd::Fill { .. } => [None],
-        DrawCmd::Sprite { texture, .. } => [Some(*texture)],
-        DrawCmd::Glyphs { texture, .. } => [Some(*texture)],
-        DrawCmd::Polygon { texture, .. } => [*texture],
-    }
-}
-
-/// Rasterize one GUI draw command into the sub-pixel buffer.
-fn rasterize_cmd(
-    tex: &HashMap<TextureRef, UiPixels>,
-    cmd: &DrawCmd,
-    buf: &mut [Color],
-    width: usize,
-    height: usize,
-    sx: f32,
-    sy: f32,
-) {
-    match cmd {
-        DrawCmd::Fill { x, y, w, h, color } => {
-            fill_rect(
-                buf,
-                width,
-                height,
-                x * sx,
-                y * sy,
-                (x + w) * sx,
-                (y + h) * sy,
-                [color.r, color.g, color.b],
-                color.a,
-            );
-        }
-        DrawCmd::Sprite {
-            texture,
-            quad,
-            tint,
-            ..
-        } => {
-            if let Some(pixels) = tex.get(texture) {
-                blit_quad(buf, width, height, pixels, quad, tint, sx, sy);
-            }
-        }
-        DrawCmd::Glyphs {
-            texture,
-            tint,
-            quads,
-        } => {
-            if let Some(pixels) = tex.get(texture) {
-                for quad in quads {
-                    blit_quad(buf, width, height, pixels, quad, tint, sx, sy);
-                }
-            }
-        }
-        DrawCmd::Polygon {
-            vertices, color, ..
-        } => {
-            // A fan from the first corner. Textured polygons are approximated
-            // as flat (they are rare in the in-game HUD).
-            if vertices.len() >= 3 {
-                let (x0, y0) = (vertices[0].x * sx, vertices[0].y * sy);
-                for i in 1..vertices.len() - 1 {
-                    let (ax, ay) = (vertices[i].x * sx, vertices[i].y * sy);
-                    let (bx, by) = (vertices[i + 1].x * sx, vertices[i + 1].y * sy);
-                    fill_triangle(
-                        buf,
-                        width,
-                        x0,
-                        y0,
-                        ax,
-                        ay,
-                        bx,
-                        by,
-                        [color.r, color.g, color.b],
-                        color.a,
-                        (0, 0, width, height),
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Blit one textured quad (a sprite or a glyph), tinted, over the buffer.
-fn blit_quad(
-    buf: &mut [Color],
-    width: usize,
-    height: usize,
-    pixels: &UiPixels,
-    quad: &Quad,
-    tint: &UiColor,
-    sx: f32,
-    sy: f32,
-) {
-    let px0 = quad.x * sx;
-    let py0 = quad.y * sy;
-    let px1 = (quad.x + quad.w) * sx;
-    let py1 = (quad.y + quad.h) * sy;
-    let (lo_x, hi_x) = (px0.floor() as i32, px1.ceil() as i32);
-    let (lo_y, hi_y) = (py0.floor() as i32, py1.ceil() as i32);
-    let span_x = (px1 - px0).max(1e-3);
-    let span_y = (py1 - py0).max(1e-3);
-    for py in lo_y.max(0)..hi_y.min(height as i32) {
-        for px in lo_x.max(0)..hi_x.min(width as i32) {
-            let u = quad.u0 + ((px as f32 + 0.5) - px0) / span_x * (quad.u1 - quad.u0);
-            let v = quad.v0 + ((py as f32 + 0.5) - py0) / span_y * (quad.v1 - quad.v0);
-            let [r, g, b, a] = sample_texel(pixels, u, v);
-            blend_subpix(
-                buf,
-                width,
-                px as usize,
-                py as usize,
-                [r * tint.r, g * tint.g, b * tint.b],
-                a * tint.a,
-            );
-        }
-    }
-}
-
-/// Sample a decoded texture at (u, v) in 0..1 (tiled), returning straight RGBA
-/// in 0..1.
-fn sample_texel(pixels: &UiPixels, u: f32, v: f32) -> [f32; 4] {
-    let u = (u - u.floor()).clamp(0.0, 1.0 - 1e-4);
-    let v = (v - v.floor()).clamp(0.0, 1.0 - 1e-4);
-    match pixels {
-        UiPixels::Rgba(t) => rgba_at(t.width, t.height, &t.rgba, u, v),
-        UiPixels::Plugin(levels) => match levels.first() {
-            Some(t) => rgba_at(t.width, t.height, &t.rgba, u, v),
-            None => [0.0, 0.0, 0.0, 0.0],
-        },
-        UiPixels::Coverage {
-            width,
-            height,
-            alpha,
-        } => {
-            let x = (u * *width as f32) as usize;
-            let y = (v * *height as f32) as usize;
-            [1.0, 1.0, 1.0, alpha[y * *width as usize + x] as f32 / 255.0]
-        }
-    }
-}
-
-/// Nearest-sampled RGBA texel of a decoded image at (u, v) in 0..1.
-fn rgba_at(width: u32, height: u32, rgba: &[u8], u: f32, v: f32) -> [f32; 4] {
-    let x = (u * width as f32) as usize;
-    let y = (v * height as f32) as usize;
-    let i = (y * width as usize + x) * 4;
-    [
-        rgba[i] as f32 / 255.0,
-        rgba[i + 1] as f32 / 255.0,
-        rgba[i + 2] as f32 / 255.0,
-        rgba[i + 3] as f32 / 255.0,
-    ]
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Blend an opaque-or-translucent rectangle (in sub-pixels) over the buffer.
-fn fill_rect(
-    buf: &mut [Color],
-    width: usize,
-    height: usize,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    color: Color,
-    alpha: f32,
-) {
-    for py in (y0.floor() as i32).max(0)..(y1.ceil() as i32).min(height as i32) {
-        for px in (x0.floor() as i32).max(0)..(x1.ceil() as i32).min(width as i32) {
-            blend_subpix(buf, width, px as usize, py as usize, color, alpha);
-        }
-    }
-}
 
 #[allow(clippy::too_many_arguments)]
 /// Scanline-fill a triangle (in sub-pixels) over the buffer, clipped to `clip`
@@ -1252,6 +998,7 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
     let mut last_mouse: Option<(u16, u16)> = None;
     let mut quit = false;
     let mut session_code: Option<ExitCode> = None;
+    let mut model = termui::Model::new();
     loop {
         let now = Instant::now();
         let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
@@ -1339,12 +1086,14 @@ fn run_render_loop(handle: SessionHandle, options: Options) -> ExitCode {
 
         source.pump();
         let scene = source.scene_mut();
-        renderer.feed_ui(scene);
-        let grid = renderer.render_frame(scene, dt, now, cols, rows);
-        for c in renderer.drain_ui() {
-            let _ = commands.send(c);
-        }
-        if let Err(e) = draw_grid(&mut stdout, &grid) {
+        model.update(scene, now);
+        let layout = termui::layout(cols, rows, model.panel_open(now));
+        let view_grid = renderer.render_frame(scene, dt, now, layout.viewport.w, layout.viewport.h);
+        let minimap = renderer.minimap_heights(scene, termui::MINIMAP_N);
+        let mut grid = termui::Grid::new(cols, rows);
+        grid.blit(layout.viewport.x, layout.viewport.y, &view_grid);
+        termui::draw(&mut grid, &model, &layout, now, minimap.as_ref());
+        if let Err(e) = draw_grid(&mut stdout, grid.rows()) {
             errln!("openac: terminal write failed: {e}");
             break;
         }
@@ -1720,7 +1469,6 @@ mod tests {
         assert_eq!(scene.player_guid(), Some(0x5000_0001));
         // A couple of frames so the chase camera settles and the landblocks build.
         let now = Instant::now();
-        renderer.feed_ui(scene);
         let grid = renderer.render_frame(scene, 0.033, now, cols, rows);
         let _ = renderer.render_frame(scene, 0.033, now, cols, rows);
         // Pure sky is a flat solid block per cell; terrain produces relief (lit dots
@@ -1736,34 +1484,33 @@ mod tests {
             ratio > 0.05,
             "expected visible terrain relief, but only {relief}/{total} ({ratio:.1}%) of cells were non-solid"
         );
-        // The game's GUI is built from the dats and, fed with the scene, emits
-        // drawing commands (vitals, name and the other windows).
-        let list = renderer
-            .ui
-            .as_mut()
-            .expect("the game GUI should build from the dats")
-            .frame(now, renderer.ui_size);
+        // The top-down height grid is populated around the Holtburg player.
+        let heights = renderer
+            .minimap_heights(scene, termui::MINIMAP_N)
+            .expect("a player gives a height grid");
+        let painted = heights.iter().flatten().filter(|h| **h > f32::MIN).count();
         assert!(
-            list.commands().count() > 0,
-            "the GUI should emit drawing commands for this scene"
+            painted > termui::MINIMAP_N * termui::MINIMAP_N / 4,
+            "the map should cover terrain, but only {painted} cells were painted"
         );
-        // The top-down minimap paints the top-right corner, distinct from the sky.
-        let sky = grid[0][0].fg;
-        let differs = |r: usize, c: usize| {
-            let cell = &grid[r][c];
-            [cell.fg, cell.bg].iter().any(|col| {
-                (i32::abs(col[0] as i32 - sky[0] as i32)) > 40
-                    || (i32::abs(col[1] as i32 - sky[1] as i32)) > 40
-                    || (i32::abs(col[2] as i32 - sky[2] as i32)) > 40
-            })
-        };
-        let marked = (0..5)
-            .flat_map(|r| (cols - 9..cols).map(move |c| (r, c)))
-            .filter(|(r, c)| differs(*r, *c))
-            .count();
+        // The composed terminal frame paints the HUD (the shade-char minimap) over
+        // the viewport.
+        let mut model = termui::Model::new();
+        model.update(scene, now);
+        let layout = termui::layout(cols, rows, false);
+        let view = renderer.render_frame(scene, 0.033, now, layout.viewport.w, layout.viewport.h);
+        let mut full = termui::Grid::new(cols, rows);
+        full.blit(layout.viewport.x, layout.viewport.y, &view);
+        let mm = renderer.minimap_heights(scene, termui::MINIMAP_N);
+        termui::draw(&mut full, &model, &layout, now, mm.as_ref());
+        let has_shade = full
+            .rows()
+            .iter()
+            .flatten()
+            .any(|c| (c.ch as u32) >= 0x2581 && (c.ch as u32) <= 0x2588);
         assert!(
-            marked >= 5,
-            "the minimap should paint the top-right corner, but only {marked} of 45 cells differ from the sky"
+            has_shade,
+            "the HUD should paint the minimap's shade characters"
         );
     }
 
@@ -1794,21 +1541,12 @@ mod tests {
             "releasing W should clear the forward movement, got {out:?}"
         );
     }
-    /// The 2-D HUD primitives, straight onto a sub-pixel buffer: solid fills,
-    /// triangle fills, coverage (font) sampling with tiling, a full textured
-    /// sprite blit, and alpha blending.
+    /// The sub-pixel triangle fill and alpha blending are the building blocks
+    /// the minimap's height buffer is painted with.
     #[test]
-    fn hud_primitives_rasterize() {
-        use ac_ui::draw::Filter;
+    fn fill_primitives_rasterize() {
         let (w, h) = (16, 8);
         let mut buf = vec![[0.0, 0.0, 0.0]; w * h];
-
-        // A solid fill over the whole left half.
-        fill_rect(&mut buf, w, h, 0.0, 0.0, 8.0, 8.0, [1.0, 0.0, 0.0], 1.0);
-        assert_eq!(buf[0], [1.0, 0.0, 0.0]); // (0,0)
-        assert_eq!(buf[7], [1.0, 0.0, 0.0]); // (7,0), last of the left half
-        assert_eq!(buf[8], [0.0, 0.0, 0.0]); // (8,0), right half untouched
-        assert_eq!(buf[w * 7], [1.0, 0.0, 0.0]); // (0,7), bottom-left
 
         // A triangle, apex up, base down, over the right half.
         fill_triangle(
@@ -1826,45 +1564,6 @@ mod tests {
         );
         assert_eq!(buf[w * 6 + 12], [0.0, 1.0, 0.0]); // (12,6), inside the base
         assert_eq!(buf[12], [0.0, 0.0, 0.0]); // (12,0), above the apex
-
-        // A coverage (font-style) texture, sampled and tiled.
-        let coverage = UiPixels::Coverage {
-            width: 2,
-            height: 2,
-            alpha: vec![255, 0, 0, 255],
-        };
-        assert_eq!(sample_texel(&coverage, 0.25, 0.25), [1.0, 1.0, 1.0, 1.0]);
-        assert_eq!(sample_texel(&coverage, 0.75, 0.25), [1.0, 1.0, 1.0, 0.0]);
-        assert_eq!(sample_texel(&coverage, 1.25, 1.25), [1.0, 1.0, 1.0, 1.0]); // tiled
-        assert_eq!(sample_texel(&coverage, 1.75, 1.25), [1.0, 1.0, 1.0, 0.0]); // tiled
-
-        // A full sprite blit: a 4x4 sub-pixel quad over the coverage texture,
-        // tinted green, through the shared command path.
-        let mut buf2 = vec![[0.0, 0.0, 0.0]; w * h];
-        let tex = {
-            let mut m = HashMap::new();
-            m.insert(TextureRef::Surface(0x0600_0001), coverage);
-            m
-        };
-        let cmd = DrawCmd::Sprite {
-            texture: TextureRef::Surface(0x0600_0001),
-            filter: Filter::Nearest,
-            quad: Quad {
-                x: 0.0,
-                y: 0.0,
-                w: 4.0,
-                h: 4.0,
-                u0: 0.0,
-                v0: 0.0,
-                u1: 1.0,
-                v1: 1.0,
-            },
-            tint: UiColor::rgba(0.0, 1.0, 0.0, 1.0),
-        };
-        rasterize_cmd(&tex, &cmd, &mut buf2, w, h, 1.0, 1.0);
-        assert_eq!(buf2[0], [0.0, 1.0, 0.0]); // samples a fully-coverage texel
-        assert_eq!(buf2[3], [0.0, 0.0, 0.0]); // samples a transparent texel
-        assert_eq!(buf2[w + 6], [0.0, 0.0, 0.0]); // outside the quad
 
         // Alpha blending: a half-opacity blue over red gives a mid tone.
         let mut buf3 = vec![[1.0, 0.0, 0.0]; w * h];
