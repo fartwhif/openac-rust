@@ -1011,8 +1011,11 @@ impl FrameWalk {
         }
         if viewer_cell & 0xFFFF < 0x0100 || !self.cells.contains_key(&viewer_cell) {
             let mut root = PortalView::default();
-            copy_full_view(&mut root, camera);
-            self.draw_landscape(camera, blocks, buildings, &root, true, sink);
+            // A degenerate camera (a 0-pixel viewport, an unset position)
+            // leaves the full quad under three points; draw the landscape
+            // unclipped instead of indexing a view that was never added.
+            let full = copy_full_view(&mut root, camera);
+            self.draw_landscape(camera, blocks, buildings, &root, full, sink);
         } else {
             self.draw_inside(viewer_cell, camera, blocks, buildings, sink);
         }
@@ -2002,6 +2005,21 @@ mod tests {
         let mut rec = Recorder::default();
         walk.walk_frame(0x0101_0001, &cam, &[], &[], &mut rec);
         assert_eq!(rec.landscape_views, vec![1]);
+        assert!(rec.cells.is_empty());
+    }
+
+    /// A 0-pixel viewport collapses the full quad to a line, so no view is
+    /// added; the landscape is still drawn, unclipped, without touching a
+    /// view that does not exist.
+    #[test]
+    fn a_degenerate_full_view_draws_the_landscape_unclipped() {
+        let mut walk = two_rooms();
+        let mut cam = camera(Vec3::new(0.0, -10.0, 1.0), Vec3::new(0.0, 10.0, 1.0));
+        cam.width = 0.0;
+        assert!(!copy_full_view(&mut PortalView::default(), &cam));
+        let mut rec = Recorder::default();
+        walk.walk_frame(0x0101_0001, &cam, &[], &[], &mut rec);
+        assert_eq!(rec.landscape_views, vec![0]);
         assert!(rec.cells.is_empty());
     }
 
