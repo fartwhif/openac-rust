@@ -383,7 +383,7 @@ impl AttachedWindow {
         screen_saver.follow(&window, &mut display_lines);
         let surface = instance.create_surface(Arc::clone(&window))?;
 
-        let (adapter, mut summary) = choose_adapter(instance, &surface, options)?;
+        let (adapter, mut summary) = choose_adapter(instance, Some(&surface), options)?;
         let mut features = wgpu::Features::empty();
         if summary.timestamps && (options.frame_profiler || options.frame_history.is_some()) {
             features |= wgpu::Features::TIMESTAMP_QUERY;
@@ -2934,7 +2934,7 @@ fn monitor_refresh_hz(window: &Window) -> Option<u32> {
 /// adapter supports for both the frame's colour format and the depth
 /// format. Without the adapter-specific format features only WebGPU's
 /// guaranteed 4 is usable.
-fn supported_sample_counts(
+pub(crate) fn supported_sample_counts(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
     color: wgpu::TextureFormat,
@@ -2955,18 +2955,19 @@ fn supported_sample_counts(
         .collect()
 }
 
-/// Pick the adapter: every adapter that can present to `surface`, ranked
-/// (or the override), then checked against what the renderer needs. The
+/// Pick the adapter: every adapter that can present to `surface` (every
+/// one when there is no surface: the offscreen target), ranked (or the
+/// override), then checked against what the renderer needs. The
 /// capability report is written to the diagnostics directory; an adapter
 /// that falls short is refused with a message naming what is missing.
-fn choose_adapter(
+pub(crate) fn choose_adapter(
     instance: &wgpu::Instance,
-    surface: &wgpu::Surface<'_>,
+    surface: Option<&wgpu::Surface<'_>>,
     options: &GraphicsOptions,
 ) -> Result<(wgpu::Adapter, AdapterSummary), RenderError> {
     let adapters: Vec<wgpu::Adapter> = block_on(instance.enumerate_adapters(wgpu::Backends::all()))
         .into_iter()
-        .filter(|a| a.is_surface_supported(surface))
+        .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
         .collect();
     let candidates: Vec<AdapterCandidate> = adapters
         .iter()
@@ -2991,17 +2992,25 @@ fn choose_adapter(
         })
         .collect();
     let Some(choice) = gpu::choose_adapter(&candidates, options.gpu_adapter.as_deref()) else {
-        return Err(RenderError::GpuUnsupported(format!(
-            "no GPU adapter can present to the window (platform {}); update the graphics driver",
-            gpu::platform_name()
-        )));
+        return Err(RenderError::GpuUnsupported(if surface.is_some() {
+            format!(
+                "no GPU adapter can present to the window (platform {}); update the graphics driver",
+                gpu::platform_name()
+            )
+        } else {
+            format!(
+                "no GPU adapter is available (platform {}); install a graphics driver or a \
+                 software Vulkan implementation such as llvmpipe (mesa-vulkan-drivers)",
+                gpu::platform_name()
+            )
+        }));
     };
     let adapter = adapters
         .into_iter()
         .nth(choice.index)
         .ok_or(RenderError::SurfaceUnsupported)?;
     let info = adapter.get_info();
-    let presents = !surface.get_capabilities(&adapter).formats.is_empty();
+    let presents = surface.is_none_or(|s| !s.get_capabilities(&adapter).formats.is_empty());
     let record = gpu::check_capabilities(
         &info,
         &adapter.limits(),

@@ -9,7 +9,7 @@ mod options;
 mod plugins;
 mod session_config;
 mod stdio;
-mod swrender;
+mod terminal;
 mod termui;
 mod tui;
 mod window_state;
@@ -81,7 +81,7 @@ fn main() -> ExitCode {
             run_session_tui(options)
         }
         Ok(Command::Run(options)) if options.render_mode == RenderMode::Terminal => {
-            run_session_terminal(options)
+            run_session_terminal(options, paths.as_ref())
         }
         Ok(Command::Run(options)) if options.headless => {
             run_session(&options, None, graphics::DisplayPrefs::load(None))
@@ -435,10 +435,12 @@ fn run_session_tui(options: Options) -> ExitCode {
     tui::run(model, spawned.handle, commands, options)
 }
 
-/// Run one session to its end through the software-rendered terminal front
-/// end: the 3-D world and the game's 2-D GUI, drawn to braille with 24-bit
-/// colour (no GPU or graphics protocol needed).
-fn run_session_terminal(options: Options) -> ExitCode {
+/// Run one session to its end through the terminal front end: the 3-D
+/// world, rendered by the normal world renderer into an offscreen target
+/// (a GPU or a software Vulkan adapter; no window or display server), and
+/// read back to the terminal as braille dots or flat full blocks
+/// (`--render`) with the vitals and the chat.
+fn run_session_terminal(options: Options, paths: Option<&ac_host::PathSet>) -> ExitCode {
     if !tui::is_terminal() {
         errln!(
             "openac: --ui terminal needs a terminal on standard output; run \
@@ -446,7 +448,7 @@ fn run_session_terminal(options: Options) -> ExitCode {
         );
         return ExitCode::from(EXIT_USAGE);
     }
-    let logger = swrender::RenderLog::new(options.log_level);
+    let logger = terminal::RenderLog::new(options.log_level);
     let spawned = match start_session(&options, &logger) {
         Ok(spawned) => spawned,
         Err(code) => return code,
@@ -454,7 +456,7 @@ fn run_session_terminal(options: Options) -> ExitCode {
     // Held for the whole run, so a client update or a move of the install
     // folder waits for this client.
     let _install_session = spawned.install_lease;
-    swrender::run(spawned.handle, options)
+    terminal::run(spawned.handle, options, paths)
 }
 
 /// Prints progress with the time since start; stdout for progress, stderr

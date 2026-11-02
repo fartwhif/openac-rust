@@ -44,6 +44,7 @@ pub mod membership;
 pub mod meshing;
 mod model_requests;
 pub mod nearby_dump;
+mod offscreen;
 pub mod pacing;
 pub mod platform;
 pub mod portal_space;
@@ -83,7 +84,8 @@ pub use attach::DetachReason;
 pub use host::{
     HostClosed, HostEvent, HostHandle, HostOptions, WindowHost, WindowSpec, screenshot_path,
 };
-pub use renderer::WorldStats;
+pub use offscreen::Offscreen;
+pub use renderer::{WorldSettings, WorldStats};
 pub use surface::{AdapterSummary, GraphicsOptions};
 /// The clear color type of [`WindowSpec`], re-exported so callers need no direct `wgpu` dependency.
 pub use wgpu::Color;

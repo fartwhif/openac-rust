@@ -122,16 +122,17 @@ Type `/window` in its console to open a game window on the session and
 `--ui ratatui` draws the session as a terminal UI (a status line, the event and
 chat feed, nearby objects, and a command line) with ratatui instead of a GPU
 window; it needs a terminal on standard output.
-`--ui terminal` goes further: it software-renders the actual game straight into
-the terminal as Braille dots in 24-bit colour, with no GPU, sixel or image
-protocol, so it runs over a plain SSH terminal. The 3-D world fills the left of
-the screen under the chase camera; over it are the character's vitals, the
-targeted creature, a top-down height-shaded minimap (the player at its centre)
-and the chat feed. Opening a content panel — an inventory or a vendor, a trade,
-an appraisal, a book, the journal, a house, the chess board, and the like —
-draws it in a bordered column on the right (roughly a third of the width) and
-shrinks the world to make room, with items shown as glyph icons. A Nerd Font is
-best for the Braille, box-drawing and item glyphs.
+`--ui terminal` goes further: it renders the actual 3-D world with the
+game's normal world renderer into the terminal as Braille dots (or flat
+blocks, `--render flat`) in 24-bit colour. The frame is drawn into an
+offscreen target, so any Vulkan adapter works — a GPU or a software
+implementation such as llvmpipe (`mesa-vulkan-drivers` on a headless box) —
+with no window, display server, sixel or image protocol: it runs over a
+plain SSH terminal. The 3-D world fills the whole screen under the game's
+chase camera (streamed terrain, objects and the player); over it, top-left,
+are the character's vitals and the targeted creature, and the chat feed sits
+at the bottom. The game's keyboard drives it as in a window. A Nerd Font is
+best for the Braille and block glyphs.
 `openac run --config <file>` runs several sessions from one configuration
 document. [docs/building-and-running.md](docs/building-and-running.md) walks
 through it, and [docs/launch-options.md](docs/launch-options.md) lists every

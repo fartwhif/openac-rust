@@ -21,10 +21,17 @@ Options:
                           Rendering front end: console (default) prints lines to
                           standard output; ratatui draws a text terminal UI (status,
                           the event and chat feed, nearby objects, a command line)
-                          with no world rendering; terminal renders the full 3-D
-                          world and the game's 2-D GUI, software-drawn as braille
-                          dots with 24-bit colour, to a plain terminal (no GPU or
-                          image protocol needed). Env OPENAC_UI.
+                          with no world rendering; terminal renders the 3-D world
+                          with the normal world renderer (a GPU adapter or a
+                          software Vulkan implementation; no window or display
+                          server needed) as braille dots or flat blocks in 24-bit
+                          colour, plus the vitals and the chat, to a plain
+                          terminal. Env OPENAC_UI.
+  --render <braille|flat>
+                          How --ui terminal encodes the world: braille (default)
+                          lights 2 x 4 braille sub-pixels per cell; flat draws each
+                          cell as a full block in the average of its colours.
+                          Env OPENAC_RENDER.
   --server <host:port>    Login server address (env OPENAC_SERVER, default 127.0.0.1:9000).
   --account <name>        Account name (env OPENAC_ACCOUNT).
   --character <name>      Character to enter the world with (default: none; the session
@@ -108,10 +115,24 @@ pub enum RenderMode {
     /// A terminal UI drawn with ratatui: status, the event and chat feed,
     /// nearby objects, and a command line. No world rendering.
     Ratatui,
-    /// The full 3-D world and the game's 2-D GUI, software-rendered to the
-    /// terminal as braille dots with 24-bit colour (no GPU or graphics
-    /// protocol needed). Runs over a plain SSH terminal.
+    /// The 3-D world, rendered by the normal world renderer into an
+    /// offscreen target (a GPU adapter or a software Vulkan implementation
+    /// such as llvmpipe; no window or display server needed) and read back
+    /// to the terminal as braille dots or flat blocks in 24-bit colour,
+    /// plus the vitals and the chat. Runs over a plain SSH terminal.
     Terminal,
+}
+
+/// How `--ui terminal` encodes the 3-D world into terminal cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RenderStyle {
+    /// Braille U+2800 glyphs: a 2 x 4 sub-pixel dot matrix per cell, two
+    /// colours per cell (the lit dots over the darkest sub-pixel's colour).
+    #[default]
+    Braille,
+    /// A full block `█` per cell in the average colour of its sub-pixels:
+    /// one sample per cell, smooth image-like shading.
+    Flat,
 }
 
 /// Everything the program needs to start.
@@ -142,6 +163,8 @@ pub struct Options {
     pub data_dir: Option<String>,
     /// How the session's output is rendered (`--ui`; default console).
     pub render_mode: RenderMode,
+    /// How `--ui terminal` encodes the world (`--render`; default braille).
+    pub render_style: RenderStyle,
 }
 
 /// The data-directory variable, shared with `openac run`.
@@ -200,6 +223,7 @@ impl Command {
         let mut dat_dir = env("OPENAC_DAT_DIR").filter(|d| !d.is_empty());
         let mut radius = env("OPENAC_LANDBLOCK_RADIUS").filter(|r| !r.is_empty());
         let mut ui = env("OPENAC_UI");
+        let mut render = env("OPENAC_RENDER");
 
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
@@ -216,6 +240,7 @@ impl Command {
                 "--dat-dir" => dat_dir = Some(value("--dat-dir")?),
                 "--landblock-radius" => radius = Some(value("--landblock-radius")?),
                 "--ui" => ui = Some(value("--ui")?),
+                "--render" => render = Some(value("--render")?),
                 _ => return Err(OptionsError::UnknownArgument(arg)),
             }
         }
@@ -247,6 +272,14 @@ impl Command {
             }
             None => RenderMode::Console,
         };
+        let render_style = match render {
+            Some(style) if style.eq_ignore_ascii_case("braille") => RenderStyle::Braille,
+            Some(style) if style.eq_ignore_ascii_case("flat") => RenderStyle::Flat,
+            Some(style) => {
+                return Err(invalid("--render", &style, "expected braille or flat"));
+            }
+            None => RenderStyle::Braille,
+        };
 
         Ok(Self::Run(Options {
             headless,
@@ -258,6 +291,7 @@ impl Command {
             net_loss,
             log_level,
             render_mode,
+            render_style,
             dat_dir: dat_dir.map(PathBuf::from),
             landblock_radius,
             data_dir: env(DATA_DIR_VAR).filter(|d| !d.trim().is_empty()),
@@ -508,5 +542,26 @@ mod tests {
         );
         assert_eq!(run(&[], &CREDS).render_mode, RenderMode::Console);
         assert!(parse(&["--ui", "nope"], &CREDS).is_err());
+    }
+
+    #[test]
+    fn render_flag_selects_the_world_style() {
+        assert_eq!(
+            run(&["--render", "flat"], &CREDS).render_style,
+            RenderStyle::Flat
+        );
+        assert_eq!(
+            run(&["--render", "braille"], &CREDS).render_style,
+            RenderStyle::Braille
+        );
+        assert_eq!(run(&[], &CREDS).render_style, RenderStyle::Braille);
+        let mut env = CREDS.to_vec();
+        env.push(("OPENAC_RENDER", "flat"));
+        assert_eq!(run(&[], &env).render_style, RenderStyle::Flat);
+        assert_eq!(
+            run(&["--render", "braille"], &env).render_style,
+            RenderStyle::Braille
+        );
+        assert!(parse(&["--render", "nope"], &CREDS).is_err());
     }
 }
