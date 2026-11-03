@@ -313,6 +313,13 @@ impl Model {
         Self::default()
     }
 
+    /// The radar blip under terminal cell `(col, row)`, if any (its object
+    /// id), for a terminal this `cols` wide and `rows` tall.
+    #[must_use]
+    pub fn radar_blip_at(&self, cols: usize, rows: usize, col: u16, row: u16) -> Option<u32> {
+        radar_blip_at(&layout(cols, rows), &self.radar, col, row)
+    }
+
     /// Fold the scene into the model: the vitals and target, the drained
     /// chat and status, and the interface events (the target's health and
     /// selection).
@@ -550,6 +557,39 @@ fn draw_radar(g: &mut Grid, radar: &RadarSnapshot, d: Rect) {
         let x = (d.x + d.w / 2 + 1).saturating_sub(w / 2);
         g.put_str(x, d.y + d.h, coords, DIM, BG);
     }
+}
+
+/// The radar blip under terminal cell `(col, row)`, if any: its object id.
+/// A blip is a single cell, so a click lands within a cell of it; the nearest
+/// wins where blips crowd. Hidden blips (`blank_blips`) are not clickable.
+/// This inverts `draw_radar`'s projection.
+#[must_use]
+pub fn radar_blip_at(layout: &Layout, radar: &RadarSnapshot, col: u16, row: u16) -> Option<u32> {
+    if radar.blank_blips {
+        return None;
+    }
+    let d = layout.radar;
+    let (cx, cy) = (d.x as f32 + d.w as f32 / 2.0, d.y as f32 + d.h as f32 / 2.0);
+    let (rx, ry) = (d.w as f32 / 2.0, d.h as f32 / 2.0);
+    let (mx, my) = (col as f32, row as f32);
+    let mut best: Option<(f32, u32)> = None;
+    for b in &radar.blips {
+        let x = (cx + (b.pixel_x - 60.0) * (rx / 50.0)).round();
+        let y = (cy + (b.pixel_y - 60.0) * (ry / 50.0)).round();
+        let dx = (x - mx).abs();
+        let dy = (y - my).abs();
+        if dx <= 1.0 && dy <= 1.0 {
+            let dist = dx + dy;
+            let take = match best {
+                None => true,
+                Some((d0, _)) => dist < d0,
+            };
+            if take {
+                best = Some((dist, b.object_id));
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 /// A compass point's bearing offset from the player's heading (radians).
@@ -932,5 +972,63 @@ mod tests {
         // The coordinates line, under the disc.
         let coords = g.rows()[14].iter().map(|c| c.ch).collect::<String>();
         assert!(coords.contains("42.1N,33.9E"), "coordinates: {coords:?}");
+    }
+
+    /// A click on a blip's cell selects that blip's object; a click far from
+    /// any blip, or with the blips hidden, selects nothing. This inverts
+    /// `draw_radar`'s projection.
+    #[test]
+    fn a_radar_click_selects_the_blip_under_the_cell() {
+        use ac_ui::draw::Color;
+        use ac_ui::radar::RadarBlip;
+        let d = Rect {
+            x: 100,
+            y: 2,
+            w: 24,
+            h: 12,
+        };
+        let layout = Layout {
+            viewport: d,
+            vitals: d,
+            chat: d,
+            radar: d,
+        };
+        let snapshot = RadarSnapshot {
+            player_heading_degrees: 0.0,
+            blips: vec![RadarBlip {
+                object_id: 1,
+                name: "east".into(),
+                pixel_x: 90.0,
+                pixel_y: 60.0,
+                color: Color::rgba(1.0, 0.5, 0.0, 1.0),
+                shape: BlipShape::Plus,
+                selected: false,
+            }],
+            coordinates_text: None,
+            blank_blips: false,
+            ui_locked: false,
+        };
+        // The blip's cell (the draw test lands it at row 8, column 119).
+        assert_eq!(
+            radar_blip_at(&layout, &snapshot, 119, 8),
+            Some(1),
+            "on the blip"
+        );
+        // A cell far from the blip and the disc hits nothing.
+        assert_eq!(
+            radar_blip_at(&layout, &snapshot, 0, 0),
+            None,
+            "off the blip"
+        );
+        // Hidden blips are not clickable.
+        let hidden = RadarSnapshot {
+            blank_blips: true,
+            ..snapshot.clone()
+        };
+        assert_eq!(
+            radar_blip_at(&layout, &hidden, 119, 8),
+            None,
+            "hidden blips"
+        );
     }
 }

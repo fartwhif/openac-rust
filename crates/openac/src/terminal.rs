@@ -789,6 +789,7 @@ fn handle_event(
 /// Handle one terminal mouse event: the buttons and wheel go to the gameplay
 /// input (a click's select/examine/use comes back as a `WorldClick`), and the
 /// pointer's cell is remembered for the click's pick and a drag's travel.
+#[allow(clippy::too_many_arguments)]
 fn handle_mouse(
     m: MouseEvent,
     gameplay: &mut GameplayInput,
@@ -797,6 +798,7 @@ fn handle_mouse(
     now_ms: u64,
     input: &mut TerminalInput,
     offscreen: &mut Offscreen,
+    model: &termui::Model,
 ) {
     let (column, row) = (m.column, m.row);
     match m.kind {
@@ -820,6 +822,10 @@ fn handle_mouse(
                 gameplay_now,
                 &mut outs,
             );
+            // A radar blip under the pointer, if any: it is what the click
+            // acts on, in place of the world's pick.
+            let radar_pick =
+                model.radar_blip_at(input.size.0 as usize, input.size.1 as usize, column, row);
             for action in take_world_clicks(outs, commands) {
                 resolve_world_click(
                     offscreen,
@@ -828,6 +834,7 @@ fn handle_mouse(
                     input.cursor,
                     action,
                     now_ms,
+                    radar_pick,
                 );
             }
         }
@@ -900,15 +907,22 @@ fn resolve_world_click(
     cursor: (u16, u16),
     action: WorldClick,
     now_ms: u64,
+    radar_pick: Option<u32>,
 ) {
     let (x, y) = cursor_pixel(cursor);
     let picked = offscreen.pick(x, y);
+    // A radar blip under the pointer, if hit, is what the click acts on in
+    // place of the world's pick.
+    let guid = radar_pick.or(picked.map(|(g, _)| g));
     let facts = ClickFacts::default();
-    let outcome = memory.click(action, picked.map(|(guid, _)| guid), facts, now_ms);
-    if let Some((guid, local_id)) = picked
-        && outcome.pulse == Some(guid)
+    let outcome = memory.click(action, guid, facts, now_ms);
+    // The selection flash needs a local render, which a radar blip has no
+    // claim to (the object may be off the frame), so only a world pick flashes.
+    if radar_pick.is_none()
+        && let Some((picked_guid, local_id)) = picked
+        && outcome.pulse == Some(picked_guid)
     {
-        offscreen.begin_selection_flash(guid, local_id);
+        offscreen.begin_selection_flash(picked_guid, local_id);
     }
     for command in outcome.commands {
         let _ = commands.send(command);
@@ -955,6 +969,7 @@ fn drain_input(
                     now_ms,
                     input,
                     offscreen,
+                    model,
                 );
             }
             other => {
