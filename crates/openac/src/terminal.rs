@@ -20,6 +20,11 @@ use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+use nix::unistd::{dup, dup2_stderr};
+#[cfg(unix)]
+use std::os::unix::io::{AsFd, OwnedFd};
+
 use ac_render::gameplay_input::{DeviceState, GameplayInput, GameplayOutput};
 use ac_render::scene::SceneSource;
 use ac_render::{GraphicsOptions, Offscreen, WorldSettings};
@@ -99,6 +104,54 @@ impl super::SessionLog for RenderLog {
         if let Some(error) = &summary.error {
             errln!("{} ended with an error: {error}", self.stamp());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Keeping standard error off the frame.
+// ---------------------------------------------------------------------------
+
+/// The terminal and standard error are the same screen. While the render loop
+/// owns the frame, anything a crate writes to stderr — the session log, a
+/// `vfx:` notice — would land at the cursor and scrawl across the world and
+/// the HUD. `StderrToLog` points descriptor 2 at a log file for as long as it
+/// lives and restores it on drop, so every writer is diverted at once. Off
+/// Unix it is a no-op (there is no alt screen sharing the console).
+#[cfg(unix)]
+struct StderrToLog(OwnedFd);
+#[cfg(not(unix))]
+struct StderrToLog;
+
+impl StderrToLog {
+    /// Divert standard error to `openac-terminal-<pid>.log` in the temp dir.
+    /// Setup failures are reported before this is taken, so they still reach
+    /// the console; only the frame's ongoing diagnostics are moved off screen.
+    fn take_stderr() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let path =
+                std::env::temp_dir().join(format!("openac-terminal-{}.log", std::process::id()));
+            let log = std::fs::File::create(&path)?;
+            // Keep a copy of the console's descriptor, then point descriptor
+            // 2 at the log; dropping `log` closes its own descriptor while
+            // descriptor 2 keeps the file open.
+            let saved = dup(io::stderr().as_fd()).map_err(io::Error::other)?;
+            dup2_stderr(log.as_fd()).map_err(io::Error::other)?;
+            Ok(Self(saved))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StderrToLog {
+    fn drop(&mut self) {
+        // Point descriptor 2 back at the console; the kept copy is released
+        // when it drops, leaving descriptor 2 to hold the console.
+        let _ = dup2_stderr(self.0.as_fd());
     }
 }
 
@@ -340,6 +393,13 @@ fn run_render_loop(
     let mut session_code: Option<ExitCode> = None;
     let mut model = termui::Model::new();
     let mut last_drawn: Option<Vec<Vec<Cell>>> = None;
+    // Divert standard error to a log file for the rest of this run so the
+    // session log and `vfx:` notices never scrawl over the frame; the guard
+    // restores the console when `run_render_loop` returns. Failing to divert
+    // only re-exposes the frame to stderr, so carry on.
+    let _stderr = StderrToLog::take_stderr().map_err(|e| {
+        errln!("openac: could not divert standard error: {e}");
+    });
     loop {
         let now = Instant::now();
         let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
@@ -364,11 +424,12 @@ fn run_render_loop(
         let fly = gameplay.tick(dt, gameplay_now, &state, None, &mut outs);
         route_outputs(outs, &commands);
 
-        // The terminal never reports a key coming up, so the keys pressed
-        // since the last frame are let go now, after the held poll has
-        // seen them: a press is one frame of input, and a held key is the
-        // terminal's autorepeat pressing it again frame after frame.
-        for (key, mods) in input.taps.take_releases() {
+        // The terminal may never report a key coming up: the held keys are
+        // let go now, after the held poll has seen them, once their
+        // autorepeat has gone quiet for the grace — a held key stays down
+        // across its stream instead of walking and stopping at the
+        // autorepeat's cadence.
+        for (key, mods) in input.taps.take_releases(Instant::now()) {
             let s = input_state(mods);
             let mut outs = Vec::new();
             gameplay.key(key, false, &s, None, gameplay_now, &mut outs);
@@ -475,43 +536,81 @@ fn input_state(modifiers: Modifiers) -> DeviceState<'static> {
     }
 }
 
-/// A plain terminal never reports a key coming up: it sends the press
-/// and nothing else, so without a let-go every key the player presses
-/// stays held and the character keeps turning or walking with no input
-/// at all. A press is therefore a tap: the key is held for the frame's
-/// held poll (so the movement it means fires) and let go at once after
-/// it. A key the player keeps down still moves the character — the
-/// terminal's autorepeat re-presses it frame after frame. A release
-/// that does arrive (an enhanced keyboard protocol) cancels its tap.
-#[derive(Debug, Default)]
+/// A plain terminal often never reports a key coming up: it sends the press
+/// (and the autorepeat re-presses) and nothing else. Without a let-go every
+/// key the player presses stays held and the character keeps turning or
+/// walking with no input at all; but letting a press go after one frame
+/// makes a held key walk-stop-walk-stop at the autorepeat's cadence (the
+/// movement "pauses every small iteration"). A key is therefore held across
+/// its autorepeat stream and let go only once the stream goes quiet for the
+/// grace: a repeat press (faster than the grace) keeps it down, a real
+/// let-go (no more repeats) is felt after the grace. A release that does
+/// arrive (an enhanced keyboard protocol) lets the key go at once.
+///
+/// The grace is longer than the terminal's autorepeat cadence so a held
+/// key's stream keeps it down; it is the let-go's latency when the terminal
+/// reports no releases. Tunable with `OPENAC_KEY_HOLD_MS`.
+fn key_hold_grace() -> Duration {
+    std::env::var("OPENAC_KEY_HOLD_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(300))
+}
+
+#[derive(Debug)]
 struct KeyTaps {
-    pending: Vec<(Key, Modifiers)>,
+    /// The keys still held: (key, modifiers, last press).
+    held: Vec<(Key, Modifiers, Instant)>,
+    /// The quiet period before a held key is let go.
+    grace: Duration,
+}
+
+impl Default for KeyTaps {
+    fn default() -> Self {
+        Self {
+            held: Vec::new(),
+            grace: key_hold_grace(),
+        }
+    }
 }
 
 impl KeyTaps {
-    /// No key is pending a let-go.
+    /// No key is held.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A key event: a press (a repeat press does not stack) waits for
-    /// the frame's poll before it is let go; a release cancels the
-    /// pending tap.
+    /// A key event: a press (a repeat refreshes the hold, it does not stack)
+    /// is kept down; a release lets it go at once.
     pub fn key(&mut self, key: Key, pressed: bool, modifiers: Modifiers) {
         if pressed {
-            if !self.pending.iter().any(|(held, _)| *held == key) {
-                self.pending.push((key, modifiers));
+            let now = Instant::now();
+            match self.held.iter_mut().find(|(held, _, _)| *held == key) {
+                Some(entry) => {
+                    entry.1 = modifiers;
+                    entry.2 = now;
+                }
+                None => self.held.push((key, modifiers, now)),
             }
         } else {
-            self.pending.retain(|(held, _)| *held != key);
+            self.held.retain(|(held, _, _)| *held != key);
         }
     }
 
-    /// The frame's held poll has run: let go of every key pressed since
-    /// the last one, in press order.
-    pub fn take_releases(&mut self) -> Vec<(Key, Modifiers)> {
-        std::mem::take(&mut self.pending)
+    /// Let go of the held keys whose autorepeat has gone quiet for the grace
+    /// (no press since), in press order; the rest stay down.
+    pub fn take_releases(&mut self, now: Instant) -> Vec<(Key, Modifiers)> {
+        let mut out = Vec::new();
+        self.held.retain(|(key, mods, last)| {
+            let gone = now.duration_since(*last) >= self.grace;
+            if gone {
+                out.push((*key, *mods));
+            }
+            !gone
+        });
+        out
     }
 }
 
@@ -1221,9 +1320,10 @@ mod tests {
             }),
             "the press should turn left, got {out:?}"
         );
-        // The terminal never sends a release: the tap is let go after the
-        // poll.
-        for (key, mods) in taps.take_releases() {
+        // The terminal never sends a release: the key is let go once its
+        // autorepeat has gone quiet for the grace.
+        let quiet = Instant::now() + key_hold_grace() + Duration::from_millis(1);
+        for (key, mods) in taps.take_releases(quiet) {
             let s = input_state(mods);
             gameplay.key(key, false, &s, None, 0.02, &mut out);
         }
@@ -1245,23 +1345,29 @@ mod tests {
         );
     }
 
-    /// The tap bookkeeping: a press waits for the next frame poll; a
-    /// repeat press does not stack; a release that does arrive cancels
-    /// its tap; let-gos come back in press order.
+    /// The hold bookkeeping: a fresh press is still within the grace (not
+    /// let go); once the autorepeat has gone quiet for the grace the key is
+    /// let go (a repeat did not stack it); a release that does arrive cancels
+    /// the hold at once; let-gos come back in press order.
     #[test]
-    fn key_taps_wait_for_the_frame_poll() {
+    fn key_taps_hold_across_the_autorepeat_stream() {
+        let grace = key_hold_grace();
         let mut taps = KeyTaps::new();
         taps.key(Key::A, true, Modifiers::NONE);
         taps.key(Key::A, true, Modifiers::NONE); // autorepeat
-        assert_eq!(taps.take_releases(), vec![(Key::A, Modifiers::NONE)]);
-        assert!(KeyTaps::new().take_releases().is_empty());
+        // A fresh press is still within the grace: nothing is let go yet.
+        assert!(taps.take_releases(Instant::now()).is_empty());
+        // Once the stream has gone quiet for the grace, the key is let go.
+        let quiet = Instant::now() + grace + Duration::from_millis(1);
+        assert_eq!(taps.take_releases(quiet), vec![(Key::A, Modifiers::NONE)]);
+        assert!(KeyTaps::new().take_releases(quiet).is_empty());
         taps.key(Key::W, true, Modifiers::SHIFT);
         taps.key(Key::W, false, Modifiers::SHIFT); // a real release
-        assert!(taps.take_releases().is_empty());
+        assert!(taps.take_releases(quiet).is_empty());
         taps.key(Key::A, true, Modifiers::NONE);
         taps.key(Key::D, true, Modifiers::NONE);
         assert_eq!(
-            taps.take_releases(),
+            taps.take_releases(quiet),
             vec![(Key::A, Modifiers::NONE), (Key::D, Modifiers::NONE)]
         );
     }

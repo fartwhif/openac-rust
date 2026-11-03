@@ -35,6 +35,10 @@ ac-bits.workspace = true
 # The animation regression test drives a motion state through the presenter.
 ac-motion.workspace = true
 ac-physics.workspace = true
+# The terminal front end diverts standard error off the rendered frame on Unix
+# (the alt screen and stderr share the terminal); `nix::unistd::dup2` does it.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs"] }
 
 # The console-stop test sends SIGTERM and SIGHUP to the client on Unix.
 [target.'cfg(unix)'.dev-dependencies]
