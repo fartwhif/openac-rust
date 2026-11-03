@@ -15,10 +15,14 @@ use std::time::Instant;
 
 use crate::camera::FlyInput;
 use crate::device_health::DeviceHealth;
+use crate::effects::ServerEffect;
+use crate::portal_space::tunnel::WAIT_TEXT;
+use crate::portal_space::PortalCue;
 use crate::renderer::{WorldRenderer, WorldSettings, WorldStats};
-use crate::scene::{Scene, SceneSource};
+use crate::scene::{Scene, SceneEffect, SceneSource};
 use crate::surface::{block_on, choose_adapter, device_descriptor, supported_sample_counts};
 use crate::{GraphicsOptions, RenderError};
+use ac_runtime::session::SessionCommand;
 
 /// The offscreen target's format: 8-bit, non-sRGB, like the window's frame
 /// buffer (the screenshot readback uses the same formats).
@@ -315,25 +319,39 @@ impl Offscreen {
         }
 
         let now = Instant::now();
-        if let Some(source) = self.scene.as_mut() {
-            source.pump();
-            source.scene_mut().present_at(now);
-        }
-        let motions = self
-            .scene
-            .as_mut()
-            .map(|source| source.scene_mut().take_motions())
-            .unwrap_or_default();
-        let world = &mut self.world;
-        world.queue_motions(motions);
-        world.prepare(
+        // Apply the presentations and drain what they added (the effects,
+        // the motions) as owned values: the effects are handed to the world
+        // next, and the world and the scene can't be borrowed at once.
+        let (effects, motions) = match self.scene.as_mut() {
+            Some(source) => {
+                source.pump();
+                let effects = source.scene_mut().take_effects();
+                source.scene_mut().present_at(now);
+                let motions = source.scene_mut().take_motions();
+                (effects, motions)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        // The scene's effects drive the world (server sounds and scripts,
+        // portal space, a new world) — the delivery the window makes before
+        // prepare.
+        self.present_scene_effects(effects);
+        self.world.queue_motions(motions);
+        self.world.prepare(
             &self.device,
             &self.queue,
             self.scene.as_deref().map(SceneSource::scene),
             fly,
         );
-        self.notices.extend(world.take_notices());
+        let notices = self.world.take_notices();
+        // prepare advanced portal space: what it asked for (the destination
+        // shown, the login complete, the wait line) goes back to the
+        // session — that is what releases a held login and makes the server
+        // show the character.
+        self.present_portal_cues();
+        self.notices.extend(notices);
 
+        let world = &mut self.world;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -368,6 +386,84 @@ impl Offscreen {
         self.queue.submit([encoder.finish()]);
         self.readback_pending = true;
         Ok(ready)
+    }
+
+    /// The scene's effects, delivered to the world (server sounds and
+    /// scripts, portal space, a new world): the delivery the window makes in
+    /// `AttachedWindow::present_effects` before its prepare. Offscreen has
+    /// no audio and no world-hold selection, so only the world's side of
+    /// each effect runs.
+    fn present_scene_effects(&mut self, effects: Vec<SceneEffect>) {
+        for effect in effects {
+            match effect {
+                // Sounds and script plays queue with the world, which holds
+                // them until their object is ready.
+                SceneEffect::Sound(sound) => {
+                    self.world.queue_server_effect(ServerEffect::Sound {
+                        guid: sound.guid,
+                        sound_type: sound.sound_type,
+                        volume: sound.volume,
+                    });
+                }
+                SceneEffect::PlayScript(play) => {
+                    self.world.queue_server_effect(ServerEffect::PlayScript {
+                        guid: play.guid,
+                        script_id: play.script_id,
+                    });
+                }
+                SceneEffect::PlayScriptType(play) => {
+                    self.world.queue_server_effect(ServerEffect::PlayScriptType {
+                        guid: play.guid,
+                        script_type: play.script_type,
+                        intensity: play.intensity,
+                    });
+                }
+                SceneEffect::AdminEnvirons(change) => {
+                    let _ = self.world.admin_environs(change);
+                }
+                SceneEffect::PortalSpace(event) => self.world.portal_space_event(event),
+                SceneEffect::WorldReplaced => {
+                    // A new world from the session: portal space under way
+                    // ends, and the next login is withheld until its area has
+                    // loaded.
+                    self.world.portal_space_reset();
+                    self.world.restart_login_reveal();
+                }
+            }
+        }
+    }
+
+    /// What portal space produced since the last frame, sent back to the
+    /// session (the destination shown, the login complete, the reveal's wait
+    /// record, the wait line): the window's one way of releasing a held login
+    /// or arrival, mirrored here so the terminal's login and portal exits
+    /// complete. Sounds and the stall notice have no offscreen counterpart.
+    fn present_portal_cues(&mut self) {
+        let Some(source) = self.scene.as_ref() else {
+            // No session to answer: still drain so the cues don't pile up.
+            let _ = self.world.take_portal_cues();
+            return;
+        };
+        for cue in self.world.take_portal_cues() {
+            match cue {
+                PortalCue::WaitText => {
+                    source.send(SessionCommand::ShowInterfaceText(WAIT_TEXT.to_owned()));
+                }
+                PortalCue::DestinationShown(shown) => {
+                    source.send(SessionCommand::DestinationShown(shown));
+                }
+                PortalCue::LoginShown(readiness) => {
+                    source.send(SessionCommand::LoginShown(readiness));
+                }
+                PortalCue::RevealWaited { generation, waited } => {
+                    source.send(SessionCommand::RevealWaited { generation, waited });
+                }
+                PortalCue::EnterSound
+                | PortalCue::ExitSound
+                | PortalCue::TunnelHook(_)
+                | PortalCue::DestinationStalled { .. } => {}
+            }
+        }
     }
 
     /// The last completed frame (RGBA8), `None` until the first one has
