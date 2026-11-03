@@ -27,6 +27,7 @@ use std::os::unix::io::{AsFd, OwnedFd};
 
 use ac_render::gameplay_input::{DeviceState, GameplayInput, GameplayOutput};
 use ac_render::scene::SceneSource;
+use ac_render::world_click::{ClickFacts, WorldClick, WorldClicks};
 use ac_render::{GraphicsOptions, Offscreen, WorldSettings};
 use ac_runtime::session::{
     LifecycleCommand, ObjectSummary, PresentationEvent, SessionCommand, SessionEvent,
@@ -34,7 +35,9 @@ use ac_runtime::session::{
 };
 use ac_ui::input::bindings::KeyBindings;
 use ac_ui::{Key, Modifiers};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::options::{LogLevel, Options, RenderStyle};
 use crate::stdio::errln;
@@ -388,6 +391,9 @@ fn run_render_loop(
         modifiers: Modifiers::NONE,
         size: (cols as u16, rows as u16),
         taps: KeyTaps::new(),
+        cursor: (cols as u16 / 2, rows as u16 / 2),
+        mouse_buttons: 0,
+        world_clicks: WorldClicks::default(),
     };
     let mut quit = false;
     let mut session_code: Option<ExitCode> = None;
@@ -405,6 +411,7 @@ fn run_render_loop(
         let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
         last = now;
         let gameplay_now = input_start.elapsed().as_secs_f32();
+        let now_ms = u64::try_from(input_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // Drain input that arrived since the last frame (non-blocking); Esc quits.
         if drain_input(
@@ -412,8 +419,10 @@ fn run_render_loop(
             &mut gameplay,
             &commands,
             gameplay_now,
+            now_ms,
             &mut input,
             &mut model,
+            &mut offscreen,
         ) {
             quit = true;
         }
@@ -495,8 +504,10 @@ fn run_render_loop(
                 &mut gameplay,
                 &commands,
                 gameplay_now,
+                now_ms,
                 &mut input,
                 &mut model,
+                &mut offscreen,
             )
         {
             quit = true;
@@ -534,6 +545,47 @@ fn input_state(modifiers: Modifiers) -> DeviceState<'static> {
         want_mouse: false,
         want_keyboard: false,
     }
+}
+
+/// The gameplay input's device state for the terminal's mouse: the held
+/// buttons (the orbit reads them) and the modifiers. `want_mouse` stays off —
+/// the terminal has no cursor to capture, and `pointer_moved` orbits only
+/// while the mouse is not captured.
+fn mouse_state(modifiers: Modifiers, buttons: u32) -> DeviceState<'static> {
+    DeviceState {
+        keys: None,
+        buttons,
+        modifiers,
+        want_mouse: false,
+        want_keyboard: false,
+    }
+}
+
+/// A crossterm mouse button as the gameplay's button number (left 0, right 1,
+/// middle 2).
+fn mouse_button(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 1,
+        MouseButton::Middle => 2,
+    }
+}
+
+/// A wheel event as the gameplay's vertical notches (positive away from the
+/// user): up one, down one, sideways none (the terminal has no window to
+/// scroll sideways in).
+fn scroll_notches(kind: MouseEventKind) -> f32 {
+    match kind {
+        MouseEventKind::ScrollUp => 1.0,
+        MouseEventKind::ScrollDown => -1.0,
+        _ => 0.0,
+    }
+}
+
+/// A pointer cell's centre in offscreen pixels: a cell is two sub-pixels wide
+/// and four tall (the 2:1 cell aspect the world is drawn at).
+fn cursor_pixel(cursor: (u16, u16)) -> (f32, f32) {
+    (cursor.0 as f32 * 2.0 + 1.0, cursor.1 as f32 * 4.0 + 2.0)
 }
 
 /// A plain terminal often never reports a key coming up: it sends the press
@@ -615,13 +667,20 @@ impl KeyTaps {
 }
 
 /// The mutable input state the terminal feeds to the gameplay dispatcher:
-/// the held modifiers, the terminal's size, and the presses waiting their
-/// let-go (the terminal's missing key releases).
+/// the held modifiers, the terminal's size, the presses waiting their let-go
+/// (the terminal's missing key releases), and the pointer (its last cell, the
+/// buttons held, and the click memory a target mode's claim needs).
 struct TerminalInput {
     modifiers: Modifiers,
     /// The terminal's current size (the last `Resize` event).
     size: (u16, u16),
     taps: KeyTaps,
+    /// The last cell the pointer was in (for a click's pick and a drag's travel).
+    cursor: (u16, u16),
+    /// The mouse buttons held, one bit per button number.
+    mouse_buttons: u32,
+    /// The click memory a target mode's claim needs.
+    world_clicks: WorldClicks,
 }
 
 /// Where one terminal key goes: into the entry box (with the line the box
@@ -727,18 +786,150 @@ fn handle_event(
     false
 }
 
+/// Handle one terminal mouse event: the buttons and wheel go to the gameplay
+/// input (a click's select/examine/use comes back as a `WorldClick`), and the
+/// pointer's cell is remembered for the click's pick and a drag's travel.
+fn handle_mouse(
+    m: MouseEvent,
+    gameplay: &mut GameplayInput,
+    commands: &mpsc::Sender<SessionCommand>,
+    gameplay_now: f32,
+    now_ms: u64,
+    input: &mut TerminalInput,
+    offscreen: &mut Offscreen,
+) {
+    let (column, row) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::Down(button) | MouseEventKind::Up(button) => {
+            let pressed = matches!(m.kind, MouseEventKind::Down(_));
+            let button = mouse_button(button);
+            if pressed {
+                input.mouse_buttons |= 1u32 << button;
+            } else {
+                input.mouse_buttons &= !(1u32 << button);
+            }
+            input.cursor = (column, row);
+            let state = mouse_state(input.modifiers, input.mouse_buttons);
+            let mut outs = Vec::new();
+            gameplay.button(
+                button,
+                pressed,
+                now_ms,
+                &state,
+                Some(offscreen.cameras_mut()),
+                gameplay_now,
+                &mut outs,
+            );
+            for action in take_world_clicks(outs, commands) {
+                resolve_world_click(
+                    offscreen,
+                    commands,
+                    &mut input.world_clicks,
+                    input.cursor,
+                    action,
+                    now_ms,
+                );
+            }
+        }
+        // A held button's travel: the chase camera orbits while the right
+        // button is held (the window's orbit; the terminal has no orbit
+        // camera for the left button).
+        MouseEventKind::Drag(_) => {
+            let (last_column, last_row) = input.cursor;
+            let dx = i32::from(column) - i32::from(last_column);
+            let dy = i32::from(row) - i32::from(last_row);
+            input.cursor = (column, row);
+            let state = mouse_state(input.modifiers, input.mouse_buttons);
+            gameplay.pointer_moved(
+                dx as f32 * 2.0,
+                dy as f32 * 4.0,
+                &state,
+                Some(offscreen.cameras_mut()),
+                gameplay_now,
+            );
+        }
+        // No button held: the cell is only the next click's pick point.
+        MouseEventKind::Moved => {
+            input.cursor = (column, row);
+        }
+        MouseEventKind::ScrollUp
+        | MouseEventKind::ScrollDown
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => {
+            let notches = scroll_notches(m.kind);
+            if notches != 0.0 {
+                let state = mouse_state(input.modifiers, input.mouse_buttons);
+                let mut outs = Vec::new();
+                gameplay.wheel(
+                    notches,
+                    &state,
+                    Some(offscreen.cameras_mut()),
+                    gameplay_now,
+                    &mut outs,
+                );
+                route_outputs(outs, commands);
+            }
+        }
+    }
+}
+
+/// Route the non-click outputs to the session and return the clicks (which
+/// need the frame's pick, done by the caller).
+fn take_world_clicks(
+    outs: Vec<GameplayOutput>,
+    commands: &mpsc::Sender<SessionCommand>,
+) -> Vec<WorldClick> {
+    let mut clicks = Vec::new();
+    for out in outs {
+        match out {
+            GameplayOutput::WorldClick(click) => clicks.push(click),
+            other => route_outputs(vec![other], commands),
+        }
+    }
+    clicks
+}
+
+/// A click on the 3-D view: what the frame drew under the pointer is
+/// selected, examined or used (the window's `WorldClick` handling), and
+/// flashes. The terminal has no windows, so nothing is in a target mode and
+/// nothing is wielded.
+fn resolve_world_click(
+    offscreen: &mut Offscreen,
+    commands: &mpsc::Sender<SessionCommand>,
+    memory: &mut WorldClicks,
+    cursor: (u16, u16),
+    action: WorldClick,
+    now_ms: u64,
+) {
+    let (x, y) = cursor_pixel(cursor);
+    let picked = offscreen.pick(x, y);
+    let facts = ClickFacts::default();
+    let outcome = memory.click(action, picked.map(|(guid, _)| guid), facts, now_ms);
+    if let Some((guid, local_id)) = picked
+        && outcome.pulse == Some(guid)
+    {
+        offscreen.begin_selection_flash(guid, local_id);
+    }
+    for command in outcome.commands {
+        let _ = commands.send(command);
+    }
+}
+
 /// Wait up to `timeout` for input, then drain everything that has arrived, so
 /// input is handled as it comes rather than once per rendered frame. With a
 /// zero timeout it drains whatever is already pending; otherwise it blocks
 /// until the deadline (keeping the render on its own cadence). Returns `true`
 /// when the user asks to quit.
+#[allow(clippy::too_many_arguments)]
 fn drain_input(
     timeout: Duration,
     gameplay: &mut GameplayInput,
     commands: &mpsc::Sender<SessionCommand>,
     gameplay_now: f32,
+    now_ms: u64,
     input: &mut TerminalInput,
     model: &mut termui::Model,
+    offscreen: &mut Offscreen,
 ) -> bool {
     let deadline = Instant::now() + timeout;
     let mut quit = false;
@@ -754,7 +945,22 @@ fn drain_input(
         let Ok(evt) = event::read() else {
             break;
         };
-        quit = handle_event(evt, gameplay, commands, gameplay_now, input, model);
+        match evt {
+            Event::Mouse(m) => {
+                handle_mouse(
+                    m,
+                    gameplay,
+                    commands,
+                    gameplay_now,
+                    now_ms,
+                    input,
+                    offscreen,
+                );
+            }
+            other => {
+                quit = handle_event(other, gameplay, commands, gameplay_now, input, model);
+            }
+        }
         if quit {
             break;
         }
@@ -890,6 +1096,7 @@ fn enter_terminal() -> io::Result<()> {
     queue!(
         out,
         crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
         crossterm::cursor::Hide
     )?;
     out.flush()?;
@@ -900,6 +1107,7 @@ fn leave_terminal() {
     let mut out = io::stdout();
     let _ = crossterm::execute!(
         out,
+        crossterm::event::DisableMouseCapture,
         crossterm::cursor::Show,
         crossterm::terminal::LeaveAlternateScreen
     );
@@ -980,6 +1188,33 @@ mod tests {
             rgba.extend_from_slice(&[color[0], color[1], color[2], 255]);
         }
         (rgba, width)
+    }
+
+    /// The mouse buttons map to the gameplay's numbers (left 0, right 1,
+    /// middle 2).
+    #[test]
+    fn a_mouse_button_maps_to_its_gameplay_number() {
+        assert_eq!(mouse_button(MouseButton::Left), 0);
+        assert_eq!(mouse_button(MouseButton::Right), 1);
+        assert_eq!(mouse_button(MouseButton::Middle), 2);
+    }
+
+    /// The wheel scrolls away from the user by one notch, and a sideways step
+    /// does nothing (there is no window to scroll sideways in).
+    #[test]
+    fn a_wheel_step_is_one_vertical_notch() {
+        assert_eq!(scroll_notches(MouseEventKind::ScrollUp), 1.0);
+        assert_eq!(scroll_notches(MouseEventKind::ScrollDown), -1.0);
+        assert_eq!(scroll_notches(MouseEventKind::ScrollLeft), 0.0);
+        assert_eq!(scroll_notches(MouseEventKind::ScrollRight), 0.0);
+    }
+
+    /// A cell maps to the centre of its two-wide by four-tall sub-pixel block.
+    #[test]
+    fn a_cell_maps_to_the_centre_of_its_sub_pixel_block() {
+        assert_eq!(cursor_pixel((0, 0)), (1.0, 2.0));
+        assert_eq!(cursor_pixel((1, 1)), (3.0, 6.0));
+        assert_eq!(cursor_pixel((19, 9)), (39.0, 38.0));
     }
 
     #[test]
@@ -1119,6 +1354,9 @@ mod tests {
             modifiers: Modifiers::NONE,
             size: (80, 24),
             taps: KeyTaps::new(),
+            cursor: (0, 0),
+            mouse_buttons: 0,
+            world_clicks: WorldClicks::default(),
         };
         let mut model = termui::Model::new();
         assert!(!handle_event(
