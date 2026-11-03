@@ -282,7 +282,9 @@ impl Inventory {
             .iter()
             .any(|a| a.kind == ItemPolicyActionKind::SetGroundObject && a.object_id == object)
         {
-            self.request_external_open(object, ctx);
+            // The click that sent this use has already said why a locked
+            // container stays unviewed.
+            self.attempt_set_ground_object(object, false, ctx);
         }
     }
 

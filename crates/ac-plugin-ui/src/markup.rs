@@ -20,8 +20,8 @@ pub use flex_attrs::{FlexContainer, FlexItem};
 mod flex_attrs;
 
 use crate::value::{
-    BindingKind, BindingSchema, Rgba, UiValue, bound_color, parse_bool, parse_color, parse_float,
-    parse_hex, parse_int,
+    BindingKind, BindingSchema, LIGHT_COLOR_MARKER, Rgba, UiValue, bound_color, light_color,
+    parse_bool, parse_color, parse_float, parse_hex, parse_int,
 };
 
 /// Why markup cannot become a panel.
@@ -172,6 +172,14 @@ pub enum ColorSource {
     /// A literal (`#AARRGGBB`, white when unreadable, or the element's
     /// default when the attribute is absent).
     Literal(Rgba),
+    /// `#AARRGGBB|light:#AARRGGBB`: the first colour, or the second in a
+    /// themed window under a light theme.
+    Paired {
+        /// Under Classic, every dark theme, and in an unthemed window.
+        dark: Rgba,
+        /// Under a light theme, in a themed window.
+        light: Rgba,
+    },
     /// A declared binding read as a colour.
     Bound(String),
     /// `theme:token|#fallback`: the plugin theme's colour on a themed
@@ -186,12 +194,13 @@ pub enum ColorSource {
 }
 
 impl ColorSource {
-    /// The colour now (a theme colour reads its classic fallback; the
-    /// window picks the theme's when one applies).
+    /// The colour now (a theme colour reads its classic fallback and a pair
+    /// its first colour; the window picks the theme's when one applies).
     #[must_use]
     pub fn read(&self, values: &dyn Values) -> Rgba {
         match self {
             Self::Literal(c) => *c,
+            Self::Paired { dark, .. } => *dark,
             Self::Bound(name) => bound_color(values.value(name)),
             Self::Theme { classic, .. } => *classic,
         }
@@ -753,6 +762,8 @@ pub enum Element {
         open: bool,
         /// Header caption colour.
         color: Option<ColorSource>,
+        /// Framed like a group box (`border`, default true).
+        framed: bool,
     },
     /// Two panes with a bar between them the player drags.
     Split {
@@ -1362,6 +1373,20 @@ impl<'a> Parser<'a> {
             return Ok(Some(ColorSource::Theme {
                 token: token.to_owned(),
                 classic: parse_color(Some(a)),
+            }));
+        }
+        if let Some(light) = light_color(a) {
+            // A pair is two literals: a binding in either would be dropped.
+            if a.split(LIGHT_COLOR_MARKER)
+                .any(|part| is_binding(part.trim()))
+            {
+                return err(format!(
+                    "The colour '{a}' binds a value, so it cannot name a colour for light themes."
+                ));
+            }
+            return Ok(Some(ColorSource::Paired {
+                dark: parse_color(Some(a)),
+                light,
             }));
         }
         if is_binding(a) && self.kind(inner(a)).is_some() {
@@ -2839,6 +2864,9 @@ impl<'a> Parser<'a> {
                 let open = Self::strict_bool(el, "open", true, |other| {
                     format!("<expander open=\"{other}\"> must be true or false")
                 })?;
+                let framed = Self::strict_bool(el, "border", true, |other| {
+                    format!("<expander border=\"{other}\"> must be true or false")
+                })?;
                 let onchange = self.optional_action(
                     attr(el, "onchange"),
                     "expander onchange",
@@ -2862,6 +2890,7 @@ impl<'a> Parser<'a> {
                         onchange,
                         open,
                         color,
+                        framed,
                     },
                     common,
                     rect(el),

@@ -9,11 +9,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use ac_plugin_ui::fonts::{FontBake, FontView};
 use ac_plugin_ui::{
-    CanvasView, PaintCmd, PluginUiView, PointerEvent, PointerKind, UiInput, canvas_origin,
+    CanvasPlace, CanvasView, PaintCmd, PluginUiView, PointerEvent, PointerKind, UiInput,
+    canvas_origin,
 };
 
-use crate::draw::{Color, DEFAULT_OUTLINE_COLOR, RenderContext};
+use crate::draw::{Color, DEFAULT_OUTLINE_COLOR, RenderContext, TextureRef};
 use crate::event::{UiEvent, kind};
 use crate::font::UiFont;
 use crate::geometry::AnchorEdges;
@@ -26,6 +28,78 @@ use super::{Icon, PluginOutbox};
 /// The overlay band layer the canvases sit on.
 pub const LAYER_NAME: &str = "PluginCanvasLayer";
 
+/// A font a plugin holds, once its atlases are textures of this window.
+#[derive(Debug, Clone)]
+pub struct CanvasFont {
+    /// The font, which sets every advance, kerning and line metric.
+    pub font: Arc<FontBake>,
+    /// Its atlas.
+    pub texture: TextureRef,
+    /// Its sharper bake for the display in use: the scale, the bake and its
+    /// atlas.
+    pub sharp: Option<(f32, Arc<FontBake>, TextureRef)>,
+}
+
+/// The eight ways an outline's copies sit round a glyph.
+const OUTLINE_OFFSETS: [(f32, f32); 8] = [
+    (-1.0, -1.0),
+    (0.0, -1.0),
+    (1.0, -1.0),
+    (-1.0, 0.0),
+    (1.0, 0.0),
+    (-1.0, 1.0),
+    (0.0, 1.0),
+    (1.0, 1.0),
+];
+
+impl CanvasFont {
+    /// One line of text with its top-left at `at`. The pen moves by the font's
+    /// own metrics whichever atlas the glyphs come from, so text measures the
+    /// same at every scale. An outline is eight copies in the outline colour
+    /// under the fill.
+    pub fn draw(
+        &self,
+        rc: &mut RenderContext<'_>,
+        text: &str,
+        at: (f32, f32),
+        color: Color,
+        outline: bool,
+    ) {
+        if outline {
+            for (dx, dy) in OUTLINE_OFFSETS {
+                self.pass(rc, text, (at.0 + dx, at.1 + dy), DEFAULT_OUTLINE_COLOR);
+            }
+        }
+        self.pass(rc, text, at, color);
+    }
+
+    fn pass(&self, rc: &mut RenderContext<'_>, text: &str, at: (f32, f32), tint: Color) {
+        let pixels = rc.pixels_per_unit();
+        // At one framebuffer pixel a unit or less it would be no sharper.
+        let sharp = self.sharp.as_ref().filter(|_| pixels > 1.0);
+        let (scale, texture, grid) = match sharp {
+            // The sharper glyphs sit on the framebuffer's pixels.
+            Some((scale, _, texture)) => (*scale, *texture, scale.min(pixels)),
+            None => (1.0, self.texture, 1.0),
+        };
+        let baseline = at.1 + self.font.ascent;
+        let mut placed = Vec::with_capacity(text.len());
+        self.font.lay_out(text, |c, glyph, pen| {
+            let glyph = sharp
+                .and_then(|(_, fine, _)| fine.glyph(c))
+                .unwrap_or(glyph);
+            placed.push((
+                at.0 + pen + glyph.x / scale,
+                baseline + glyph.y / scale,
+                glyph.width / scale,
+                glyph.height / scale,
+                (glyph.u0, glyph.v0, glyph.u1, glyph.v1),
+            ));
+        });
+        rc.placed_glyphs(texture, tint, grid, placed);
+    }
+}
+
 /// One canvas on the screen.
 #[derive(Debug)]
 pub struct CanvasWidget {
@@ -33,10 +107,13 @@ pub struct CanvasWidget {
     pub canvas: CanvasView,
     /// Its plugin's images by handle.
     pub images: HashMap<u32, Icon>,
+    /// Its plugin's fonts by handle.
+    pub fonts: HashMap<u32, CanvasFont>,
     font: Option<Arc<UiFont>>,
     outbox: PluginOutbox,
     held: Option<u8>,
     releases_seen: u32,
+    place: CanvasPlace,
 }
 
 fn color(c: ac_plugin_ui::Color8) -> Color {
@@ -56,6 +133,7 @@ impl CanvasWidget {
                 modifiers,
                 wheel_delta: wheel,
             },
+            place: Some(self.place),
         });
     }
 
@@ -199,6 +277,7 @@ impl Widget for CanvasWidget {
                     at,
                     color: c,
                     outline,
+                    font: 0,
                 } => {
                     if let Some(font) = self.font.as_ref() {
                         rc.string_dat(
@@ -210,6 +289,17 @@ impl Widget for CanvasWidget {
                             *outline,
                             DEFAULT_OUTLINE_COLOR,
                         );
+                    }
+                }
+                PaintCmd::Text {
+                    text,
+                    at,
+                    color: c,
+                    outline,
+                    font,
+                } => {
+                    if let Some(font) = self.fonts.get(font) {
+                        font.draw(rc, text, *at, color(*c), *outline);
                     }
                 }
                 PaintCmd::Image { image, rect, tint } => {
@@ -298,13 +388,15 @@ impl CanvasLayer {
 
     /// One frame: the canvases as the copy has them, placed on the band's
     /// viewport, with their plugins' images (`image`: a plugin's handle to
-    /// its texture).
+    /// its texture) and fonts (`font_of`: a font to its textures).
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         ui: &mut UiRoot,
         host: &OverlayHost,
         view: &PluginUiView,
         image: &mut dyn FnMut(&str, u32) -> Option<Icon>,
+        font_of: &mut dyn FnMut(&FontView) -> CanvasFont,
         font: Option<&Arc<UiFont>>,
         outbox: &PluginOutbox,
     ) {
@@ -334,6 +426,10 @@ impl CanvasLayer {
                 canvas.descriptor.height as f32,
             );
             let (x, y) = canvas_origin(canvas.anchor, canvas.offset, size, viewport);
+            let place = CanvasPlace {
+                origin: (x, y),
+                layer: viewport,
+            };
             let el = *self.elements.entry(canvas.id).or_insert_with(|| {
                 let mut e = Element::at(x, y, size.0, size.1).with_anchors(AnchorEdges::NONE);
                 e.name = Some(format!(
@@ -346,10 +442,12 @@ impl CanvasLayer {
                     CanvasWidget {
                         canvas: canvas.clone(),
                         images: HashMap::new(),
+                        fonts: HashMap::new(),
                         font: font.cloned(),
                         outbox: std::rc::Rc::clone(outbox),
                         held: None,
                         releases_seen: canvas.release_count,
+                        place,
                     },
                 );
                 OverlayHost::add_to_layer(ui, self.layer, el, true);
@@ -361,10 +459,18 @@ impl CanvasLayer {
                 .filter(|i| i.owner == canvas.owner.id)
                 .filter_map(|i| image(&i.owner, i.handle).map(|icon| (i.handle, icon)))
                 .collect();
+            let fonts: HashMap<u32, CanvasFont> = view
+                .fonts
+                .values()
+                .filter(|f| f.owner == canvas.owner.id)
+                .map(|f| (f.handle, font_of(f)))
+                .collect();
             let mut release = false;
             if let Some(w) = ui.widget_mut::<CanvasWidget>(el) {
                 w.canvas = canvas.clone();
                 w.images = images;
+                w.place = place;
+                w.fonts = fonts;
                 if w.releases_seen != canvas.release_count {
                     w.releases_seen = canvas.release_count;
                     // The plugin let go: no cancel follows.
@@ -385,5 +491,148 @@ impl CanvasLayer {
             ui.set_visible(el, canvas.visible);
         }
         ui.set_visible(self.layer, !view.canvases.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use ac_plugin_ui::fonts::{DEFAULT_RANGES, MAXIMUM_GLYPHS, NOTO_SANS_REGULAR, bake};
+
+    use super::*;
+    use crate::draw::{DrawCmd, DrawList, NoSprites, Quad};
+
+    const ATLAS: TextureRef = TextureRef::Runtime(70);
+    const SHARP: TextureRef = TextureRef::Runtime(71);
+
+    fn font(size: f32) -> Arc<FontBake> {
+        Arc::new(
+            bake(
+                NOTO_SANS_REGULAR.to_vec(),
+                size,
+                &DEFAULT_RANGES,
+                MAXIMUM_GLYPHS,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn plain() -> CanvasFont {
+        CanvasFont {
+            font: font(16.0),
+            texture: ATLAS,
+            sharp: None,
+        }
+    }
+
+    fn sharper() -> CanvasFont {
+        CanvasFont {
+            sharp: Some((2.0, font(32.0), SHARP)),
+            ..plain()
+        }
+    }
+
+    /// The glyph runs of a line of text at `pixels` framebuffer pixels a unit.
+    fn runs(
+        font: &CanvasFont,
+        text: &str,
+        at: (f32, f32),
+        outline: bool,
+        pixels: f32,
+    ) -> Vec<(TextureRef, Color, Vec<Quad>)> {
+        let mut list = DrawList::default();
+        let mut rc =
+            RenderContext::new(&mut list, (800.0, 600.0), &NoSprites).with_pixels_per_unit(pixels);
+        font.draw(&mut rc, text, at, Color::WHITE, outline);
+        list.commands()
+            .filter_map(|c| match c {
+                DrawCmd::Glyphs {
+                    texture,
+                    tint,
+                    quads,
+                } => Some((*texture, *tint, quads.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn drawing_lands_at_the_measured_positions_in_one_coverage_run() {
+        let f = plain();
+        let text = "AV To";
+        let runs = runs(&f, text, (10.0, 20.0), false, 1.0);
+        assert_eq!(runs.len(), 1);
+        let (texture, _, quads) = &runs[0];
+        assert_eq!(*texture, ATLAS);
+        assert_eq!(quads.len(), 4, "a space has nothing to draw");
+        let width = f.font.measure_width(text);
+        let last = quads.last().unwrap();
+        let o = f.font.glyph('o').unwrap();
+        assert!((last.x - (10.0 + width - o.advance + o.x)).abs() <= 0.5);
+        let baseline = (20.0 + f.font.ascent).floor();
+        assert_eq!(quads[0].y, baseline + f.font.glyph('A').unwrap().y);
+        for q in quads {
+            assert_eq!((q.x.fract(), q.y.fract()), (0.0, 0.0), "on whole pixels");
+        }
+    }
+
+    #[test]
+    fn an_outline_is_eight_copies_in_the_outline_colour_under_the_fill() {
+        let runs = runs(&plain(), "A", (10.0, 20.0), true, 1.0);
+        assert_eq!(runs.len(), 9);
+        for (_, tint, _) in &runs[..8] {
+            assert_eq!(*tint, DEFAULT_OUTLINE_COLOR);
+        }
+        assert_eq!(runs[8].1, Color::WHITE);
+        let fill = &runs[8].2[0];
+        let offsets: Vec<(f32, f32)> = runs[..8]
+            .iter()
+            .map(|(_, _, q)| (q[0].x - fill.x, q[0].y - fill.y))
+            .collect();
+        assert_eq!(offsets, OUTLINE_OFFSETS);
+    }
+
+    #[test]
+    fn at_a_higher_density_glyphs_come_from_the_sharper_bake_on_device_pixels() {
+        let f = sharper();
+        let runs = runs(&f, "AV", (10.25, 20.25), false, 2.0);
+        assert_eq!(runs.len(), 1);
+        let (texture, _, quads) = &runs[0];
+        assert_eq!(*texture, SHARP);
+        let (_, fine, _) = f.sharp.as_ref().unwrap();
+        let a = fine.glyph('A').unwrap();
+        assert_eq!((quads[0].w, quads[0].h), (a.width / 2.0, a.height / 2.0));
+        for q in quads {
+            assert_eq!(((q.x * 2.0).fract(), (q.y * 2.0).fract()), (0.0, 0.0));
+        }
+        assert_eq!((quads[0].u0, quads[0].v0), (a.u0, a.v0));
+    }
+
+    #[test]
+    fn a_sharper_bake_changes_no_advance() {
+        let (plain, sharp) = (plain(), sharper());
+        let at_one = runs(&plain, "AVTo", (0.0, 0.0), false, 1.0);
+        let at_two = runs(&sharp, "AVTo", (0.0, 0.0), false, 2.0);
+        let last = |r: &[(TextureRef, Color, Vec<Quad>)]| r[0].2.last().unwrap().x;
+        assert!((last(&at_one) - last(&at_two)).abs() <= 1.0);
+    }
+
+    #[test]
+    fn at_one_pixel_a_unit_the_sharper_bake_is_not_used() {
+        let runs = runs(&sharper(), "A", (0.0, 0.0), false, 1.0);
+        assert_eq!(runs[0].0, ATLAS);
+    }
+
+    #[test]
+    fn without_a_sharper_bake_a_high_density_display_draws_the_fonts_own_glyphs_on_whole_units() {
+        let runs = runs(&plain(), "A", (10.5, 20.5), false, 2.0);
+        assert_eq!(runs[0].0, ATLAS);
+        let q = &runs[0].2[0];
+        assert_eq!((q.x.fract(), q.y.fract()), (0.0, 0.0));
+    }
+
+    #[test]
+    fn nothing_to_draw_makes_no_run() {
+        assert!(runs(&plain(), "", (0.0, 0.0), false, 1.0).is_empty());
+        assert!(runs(&plain(), "   ", (0.0, 0.0), false, 1.0).is_empty());
     }
 }

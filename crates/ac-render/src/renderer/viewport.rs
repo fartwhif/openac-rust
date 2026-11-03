@@ -40,6 +40,10 @@ pub(crate) struct Viewports {
     /// Models the previews draw that no world object holds (the scenery
     /// behind them), kept from the sweep.
     models: HashSet<u32>,
+    /// The looks each creation preview shows and last asked for, kept
+    /// from the sweep.
+    shown_looks: [Option<AppearanceKey>; 2],
+    wanted_looks: [Option<AppearanceKey>; 2],
     epoch: Instant,
     generation: u64,
 }
@@ -55,6 +59,8 @@ impl Viewports {
             ],
             poses: HashMap::new(),
             models: HashSet::new(),
+            shown_looks: [None, None],
+            wanted_looks: [None, None],
             epoch: Instant::now(),
             generation: 0,
         }
@@ -63,6 +69,31 @@ impl Viewports {
     /// The models the viewports draw that must not be released.
     pub(crate) fn models(&self) -> impl Iterator<Item = u32> + '_ {
         self.models.iter().copied()
+    }
+
+    /// Character creation is over: its previews let their looks go and
+    /// start afresh next time (their figures name the looks' variants).
+    pub(crate) fn end_creation(&mut self) {
+        if self
+            .shown_looks
+            .iter()
+            .chain(&self.wanted_looks)
+            .any(Option::is_some)
+        {
+            self.shown_looks = [None, None];
+            self.wanted_looks = [None, None];
+            self.chargen = [
+                ChargenPreviewState::new(false),
+                ChargenPreviewState::new(true),
+            ];
+        }
+    }
+
+    /// The looks the viewports draw that no world object may hold (the
+    /// creation previews'); the paperdoll and the examine portrait draw
+    /// world objects, whose looks the world keeps.
+    pub(crate) fn appearance_keys(&self) -> impl Iterator<Item = &AppearanceKey> + '_ {
+        self.shown_looks.iter().chain(&self.wanted_looks).flatten()
     }
 }
 
@@ -303,7 +334,16 @@ impl WorldRenderer {
         all.sort_by_key(|d| d.guid);
         all.truncate(MAX_HELD);
         let turn = figure_turn();
-        let (min, max) = turned_box(creature_box(bounds, &main.parts), turn);
+        // The copy is drawn at the creature's size, so the box it is
+        // framed by is too: the model's box grown by the size, or the
+        // parts where they stand in the creature's own frame.
+        let scale = object.scale.filter(|s| *s > 0.0).unwrap_or(1.0);
+        let own = main.root.inverse() * main.world;
+        let offsets = main
+            .parts
+            .iter()
+            .map(|p| (own * p.transform).w_axis.truncate());
+        let (min, max) = turned_box(creature_box(bounds, scale, offsets), turn);
         let mut parts = Vec::new();
         // The creature shows as the world shows it (not at all while
         // hidden); what it holds always shows.
@@ -329,9 +369,16 @@ impl WorldRenderer {
         now: f64,
     ) -> Option<SceneDraw> {
         let index = usize::from(slot == ViewportSlot::ChargenSummary);
-        if self.viewports.chargen[index].needs_rebuild(look.heritage, look.gender, &look.selection)
-            && let Some(figure) = self.chargen_figure(look)
-        {
+        let rebuild = self.viewports.chargen[index].needs_rebuild(
+            look.heritage,
+            look.gender,
+            &look.selection,
+        );
+        if rebuild {
+            self.viewports.wanted_looks[index] = Some(look.key.clone());
+        }
+        if rebuild && let Some(figure) = self.chargen_figure(look) {
+            self.viewports.shown_looks[index] = Some(look.key.clone());
             if look.backdrop_setup != 0 {
                 self.viewports.models.insert(look.backdrop_setup);
             }
@@ -384,10 +431,10 @@ impl WorldRenderer {
             self.viewports.models.insert(key.setup_id);
             return self.wanted_model(key.setup_id);
         }
-        match self.appearances.get(key) {
+        match self.looks.get(key) {
             Some(parts) => parts.clone(),
             None => {
-                if self.requested_appearances.insert(key.clone()) {
+                if self.looks.ask(key) {
                     self.loader
                         .request(LoadRequest::Appearance(Box::new(key.clone())));
                 }
@@ -459,6 +506,34 @@ mod tests {
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         crate::test_gpu::device()
+    }
+
+    /// The creation previews' looks are kept while a character is being
+    /// made and let go once one is in the world.
+    #[test]
+    fn creation_looks_are_let_go_once_a_character_is_in_the_world() {
+        let mut viewports = Viewports::new(wgpu::TextureFormat::Rgba8Unorm);
+        let look = AppearanceKey {
+            setup_id: HUMAN_MALE_SETUP,
+            texture_changes: vec![(0, 0x0500_0001, 0x0500_0002)],
+            ..AppearanceKey::default()
+        };
+        viewports.shown_looks[0] = Some(look.clone());
+        viewports.wanted_looks[1] = Some(look.clone());
+        let snapshot = |player_guid| {
+            ac_runtime::session::PresentationEvent::Snapshot(ac_runtime::world::WorldSnapshot {
+                player_guid,
+                objects: Vec::new(),
+            })
+        };
+        let mut scene = Scene::default();
+        scene.apply(snapshot(None));
+        let used = super::super::looks_in_use(Some(&scene), &mut viewports);
+        assert!(used.contains(&look), "kept while making a character");
+        scene.apply(snapshot(Some(0x5000_000A)));
+        let used = super::super::looks_in_use(Some(&scene), &mut viewports);
+        assert!(!used.contains(&look), "let go in the world");
+        assert_eq!(viewports.appearance_keys().count(), 0);
     }
 
     #[test]

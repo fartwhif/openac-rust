@@ -66,7 +66,7 @@ const COMPONENT_CLASS_MAP_ID: u32 = 0x2700_0002;
 
 impl WindowUi {
     /// The dat tables the panels read: the experience curves, the skill
-    /// table and the spell components.
+    /// table, the spell components and each school's focus.
     pub(super) fn load_tables(&mut self, dats: &DatCollection) {
         match dats.get::<ExperienceTable>(EXPERIENCE_TABLE_ID) {
             Ok(Some(table)) => self.experience = Some(ExperienceCurves::from(&table)),
@@ -106,6 +106,19 @@ impl WindowUi {
                 "ui: cannot read the spell component class map: {e}"
             )),
         }
+        let foci = match ac_runtime::gameplay::tables::magic_packs(dats) {
+            Ok(foci) => foci,
+            Err(e) => {
+                self.notices
+                    .push(format!("ui: cannot read the foci map: {e}"));
+                std::collections::HashMap::new()
+            }
+        };
+        self.spell_components = ac_core::spells::SpellComponentRequirements::new(
+            std::collections::HashMap::new(),
+            self.component_classes.clone(),
+            foci,
+        );
     }
 
     /// Mount the toolbar, the spell bars, the spellbook, the examination

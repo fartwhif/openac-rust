@@ -61,16 +61,21 @@ pub mod route;
 
 use std::collections::BTreeMap;
 
+pub use ac_plugin_abi::ui::theme_metrics;
 pub use ac_plugin_abi::ui::{
-    ActionValue, BindingDecl, BindingKind, CanvasState, Color, ItemRows, MapPoint, PaintCmd,
-    PointerEvent, ProjectileSample, Rect, RowAction, RowStep, TypedBindingDecl, TypedBindingKind,
-    TypedValue, UiAction, UiEvent, UiValue, WorldLabel, WorldLine,
+    ActionValue, BindingDecl, BindingKind, CanvasState, CodepointRange, Color, FONT_MAXIMUM_BYTES,
+    FONT_MAXIMUM_COUNT, FONT_MAXIMUM_FILE_BYTES, FONT_MAXIMUM_GLYPHS, FONT_MAXIMUM_PIXEL_SIZE,
+    FONT_MINIMUM_PIXEL_SIZE, FontWeight, GroundShape, GroundShapeKind, ItemRows, MapPoint,
+    MarkerAnchor, PaintCmd, PointerEvent, ProjectileSample, Rect, RowAction, RowStep,
+    TypedBindingDecl, TypedBindingKind, TypedValue, UiAction, UiEvent, UiValue, WorldIcon,
+    WorldLabel, WorldLine, WorldTriangle,
 };
 use ac_plugin_abi::ui::{
-    CanvasChange, CanvasPaint, CanvasRegistration, ClientWindowRequest, ControlLabel, ControlRef,
-    ControlVisible, DialogRequest, EncodedImage, ImageInfo, ItemRow, ItemTypeDecl, ItemValue,
-    LineSet, ModalShow, NamedItemValue, NamedTypedValue, NamedValue, PanelRegistration,
-    PanelValues, RgbaImage, TextSize, TypedPanelRegistration, TypedPanelValues, ViewShow,
+    BundledFontRequest, CanvasChange, CanvasPaint, CanvasRegistration, ClientWindowRequest,
+    ControlLabel, ControlRef, ControlVisible, DialogRequest, EncodedImage, FontInfo,
+    FontLoadRequest, FontMeasure, IconSet, ImageInfo, ItemRow, ItemTypeDecl, ItemValue, LineSet,
+    ModalShow, NamedItemValue, NamedTypedValue, NamedValue, PanelRegistration, PanelValues,
+    RgbaImage, ShapeSet, TextSize, TriangleSet, TypedPanelRegistration, TypedPanelValues, ViewShow,
 };
 use ac_plugin_abi::{Import, Wire};
 
@@ -107,7 +112,7 @@ pub const MAXIMUM_LABELS: usize = 256;
 /// The most characters one label may have.
 pub const MAXIMUM_LABEL_TEXT: usize = 128;
 
-/// A window to register: its identity, shelf button, markup and bindings
+/// A window to register: its identity, dock slot, markup and bindings
 /// (OpenAC `PluginPanelDescriptor` plus the markup and the binding type).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PanelSpec {
@@ -175,7 +180,7 @@ impl ItemType {
 
 impl PanelSpec {
     /// A window `window_id` captioned `title` showing `markup`: open at
-    /// once, on the plugin shelf, no bindings yet.
+    /// once, on the plugin dock, no bindings yet.
     #[must_use]
     pub fn new(window_id: &str, title: &str, markup: &str) -> Self {
         Self {
@@ -189,6 +194,7 @@ impl PanelSpec {
                 markup: markup.to_owned(),
                 binding_type: "Bindings".to_owned(),
                 bindings: Vec::new(),
+                icon_file: None,
             },
             typed: Vec::new(),
             item_types: Vec::new(),
@@ -250,17 +256,26 @@ impl PanelSpec {
         self
     }
 
-    /// Initials on the shelf button when there is no icon.
+    /// Initials on the dock slot when there is no icon.
     #[must_use]
     pub fn icon_text(mut self, text: &str) -> Self {
         self.registration.icon_text = Some(text.to_owned());
         self
     }
 
-    /// The shelf button's icon (a full image id or a bare index).
+    /// The dock slot's icon (a full image id or a bare index).
     #[must_use]
     pub fn icon(mut self, surface: u32) -> Self {
         self.registration.icon_surface_id = surface;
+        self
+    }
+
+    /// The dock slot's own picture: a `.png` in the plugin's folder, by a path
+    /// relative to it (API 1.4). It comes ahead of the plugin's `icon.png` and
+    /// [`Self::icon`].
+    #[must_use]
+    pub fn icon_file(mut self, path: &str) -> Self {
+        self.registration.icon_file = Some(path.to_owned());
         self
     }
 
@@ -271,7 +286,7 @@ impl PanelSpec {
         self
     }
 
-    /// No button on the plugin shelf.
+    /// No slot on the plugin dock.
     #[must_use]
     pub fn off_shelf(mut self) -> Self {
         self.registration.show_in_side_panel = false;
@@ -364,7 +379,7 @@ impl Panel {
         Ok(())
     }
 
-    /// Shows or hides the window as its shelf and close buttons do.
+    /// Shows or hides the window as its dock slot and close button do.
     pub fn show(&self, host: &mut Host<'_>, visible: bool) -> bool {
         host.show_panel(&self.window_id, visible)
     }
@@ -392,6 +407,52 @@ pub struct Image {
     pub width: u32,
     /// Height, pixels.
     pub height: u32,
+}
+
+/// A font at one size that the client holds for the plugin, for drawing
+/// canvas text ([`Painter::text_in`]). Each size of each font is its own
+/// `Font`, and the metrics are here so text can be laid out without asking
+/// again. Sizes and metrics are in canvas pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Font {
+    /// The client's number for it; 0 means no font.
+    pub handle: u32,
+    /// The size prepared: the size asked for, to the nearest quarter pixel.
+    pub pixel_size: f32,
+    /// How far apart two lines of this font sit.
+    pub line_height: f32,
+    /// How far below the top of a line its baseline sits, so text in different
+    /// fonts can share a baseline.
+    pub ascent: f32,
+}
+
+impl Font {
+    /// No font: what every refused request returns. Text drawn with it
+    /// draws nothing and measures nothing.
+    pub const NONE: Self = Self {
+        handle: 0,
+        pixel_size: 0.0,
+        line_height: 0.0,
+        ascent: 0.0,
+    };
+
+    /// The client issued it. A released font stays valid by this test but
+    /// draws nothing.
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.handle != 0
+    }
+}
+
+impl From<FontInfo> for Font {
+    fn from(info: FontInfo) -> Self {
+        Self {
+            handle: info.handle,
+            pixel_size: info.pixel_size,
+            line_height: info.line_height,
+            ascent: info.ascent,
+        }
+    }
 }
 
 impl Image {
@@ -544,8 +605,30 @@ impl Painter {
 
     /// One line of text with its top-left at `at`.
     pub fn text(&mut self, text: &str, at: (f32, f32), color: Color, outline: bool) {
-        self.commands
-            .push(PaintCmd::Text(text.to_owned(), at.0, at.1, color, outline));
+        self.commands.push(PaintCmd::Text(
+            text.to_owned(),
+            at.0,
+            at.1,
+            color,
+            outline,
+            0,
+        ));
+    }
+
+    /// One line of text in one of the plugin's fonts, with its top-left at
+    /// `at`. A font that was refused or released draws nothing.
+    pub fn text_in(&mut self, font: Font, text: &str, at: (f32, f32), color: Color, outline: bool) {
+        // Without a font this would be the interface font's text.
+        if font.is_valid() {
+            self.commands.push(PaintCmd::Text(
+                text.to_owned(),
+                at.0,
+                at.1,
+                color,
+                outline,
+                font.handle,
+            ));
+        }
     }
 
     /// An image stretched over a rectangle, tinted.
@@ -754,6 +837,168 @@ impl LineLayer {
     }
 }
 
+/// A layer of filled world triangles (API 1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TriangleLayer {
+    id: u32,
+}
+
+impl TriangleLayer {
+    /// Replaces the layer's triangles. False, and the layer keeps what it
+    /// had, when this set and the plugin's other layers' triangles come to
+    /// more than 65,536. Meant for sets of up to a few thousand replaced a
+    /// few times a second, not every frame.
+    pub fn set_triangles(self, host: &mut Host<'_>, triangles: &[WorldTriangle]) -> bool {
+        let request = TriangleSet {
+            layer: self.id,
+            triangles: triangles.to_vec(),
+        }
+        .to_bytes();
+        let reply = ui_call!(host, UiTrianglesSet, ui_triangles_set, &request);
+        decode(Import::UiTrianglesSet, &reply)
+    }
+
+    /// Removes the layer and its triangles.
+    pub fn remove(self, host: &mut Host<'_>) -> bool {
+        let request = self.id.to_bytes();
+        let reply = ui_call!(host, UiTrianglesRemove, ui_triangles_remove, &request);
+        decode(Import::UiTrianglesRemove, &reply)
+    }
+}
+
+/// A layer of world markers (API 1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkerLayer {
+    id: u32,
+}
+
+impl MarkerLayer {
+    /// Replaces the layer's icons. False, and the layer keeps what it had,
+    /// when this set and the plugin's other layers' icons come to more than
+    /// 256. Icons pinned to nothing or with an image of 0, or a size or
+    /// range that is not usable, are dropped from the set.
+    pub fn set_icons(self, host: &mut Host<'_>, icons: &[WorldIcon]) -> bool {
+        let request = IconSet {
+            layer: self.id,
+            icons: icons.to_vec(),
+        }
+        .to_bytes();
+        let reply = ui_call!(host, UiMarkersSetIcons, ui_markers_set_icons, &request);
+        decode(Import::UiMarkersSetIcons, &reply)
+    }
+
+    /// Replaces the layer's ground shapes. False, and the layer keeps what
+    /// it had, when this set and the plugin's other layers' shapes come to
+    /// more than 256. Shapes pinned to nothing, or with a radius, band or
+    /// sweep that is not usable, are dropped from the set.
+    pub fn set_shapes(self, host: &mut Host<'_>, shapes: &[GroundShape]) -> bool {
+        let request = ShapeSet {
+            layer: self.id,
+            shapes: shapes.to_vec(),
+        }
+        .to_bytes();
+        let reply = ui_call!(host, UiMarkersSetShapes, ui_markers_set_shapes, &request);
+        decode(Import::UiMarkersSetShapes, &reply)
+    }
+
+    /// Removes the layer and its markers.
+    pub fn remove(self, host: &mut Host<'_>) -> bool {
+        let request = self.id.to_bytes();
+        let reply = ui_call!(host, UiMarkersRemove, ui_markers_remove, &request);
+        decode(Import::UiMarkersRemove, &reply)
+    }
+}
+
+/// An icon of `image` at `anchor`: 24 points, untinted, unframed, shown up to
+/// 60 m away and over the world. Set [`WorldIcon::hidden_by_world`] for one
+/// that hides behind it.
+#[must_use]
+pub fn world_icon(anchor: MarkerAnchor, image: Image) -> WorldIcon {
+    WorldIcon {
+        anchor,
+        image: image.handle,
+        size: 24.0,
+        tint_rgba: 0xFFFF_FFFF,
+        border_rgba: None,
+        max_range: 60.0,
+        hidden_by_world: false,
+    }
+}
+
+/// The width of an arc's band when none is given, metres.
+pub const DEFAULT_ARC_WIDTH: f32 = 0.15;
+
+/// A band all the way round `anchor`, `width` metres wide inward from
+/// `radius`, in one colour, `0xRRGGBBAA`.
+#[must_use]
+pub fn ground_ring(anchor: MarkerAnchor, radius: f32, width: f32, rgba: u32) -> GroundShape {
+    GroundShape {
+        anchor,
+        kind: GroundShapeKind::Ring,
+        radius,
+        width,
+        sweep_degrees: 360.0,
+        color_rgba: rgba,
+        ..GroundShape::default()
+    }
+}
+
+/// A filled circle around `anchor`, in one colour, `0xRRGGBBAA`.
+#[must_use]
+pub fn ground_disc(anchor: MarkerAnchor, radius: f32, rgba: u32) -> GroundShape {
+    GroundShape {
+        anchor,
+        kind: GroundShapeKind::Disc,
+        radius,
+        sweep_degrees: 360.0,
+        filled: true,
+        color_rgba: rgba,
+        ..GroundShape::default()
+    }
+}
+
+/// Part of a circle around `anchor`, in one colour, `0xRRGGBBAA`:
+/// `sweep_degrees` clockwise from the compass bearing `start_degrees`, a
+/// wedge when `filled` and otherwise a band [`DEFAULT_ARC_WIDTH`] wide. Set
+/// [`GroundShape::faces_object`] for an arc that turns with its object.
+#[must_use]
+pub fn ground_arc(
+    anchor: MarkerAnchor,
+    radius: f32,
+    start_degrees: f32,
+    sweep_degrees: f32,
+    filled: bool,
+    rgba: u32,
+) -> GroundShape {
+    GroundShape {
+        anchor,
+        kind: GroundShapeKind::Arc,
+        radius,
+        width: DEFAULT_ARC_WIDTH,
+        start_degrees,
+        sweep_degrees,
+        filled,
+        color_rgba: rgba,
+        ..GroundShape::default()
+    }
+}
+
+/// A triangle between `a`, `b` and `c` filled in one colour,
+/// `0xRRGGBBAA` (its alpha is how opaque the fill is). Give
+/// [`WorldTriangle::color_b`] and [`WorldTriangle::color_c`] their own
+/// colours to blend across the face.
+#[must_use]
+pub fn triangle(a: MapPoint, b: MapPoint, c: MapPoint, rgba: u32) -> WorldTriangle {
+    WorldTriangle {
+        a,
+        b,
+        c,
+        color_a: rgba,
+        color_b: rgba,
+        color_c: rgba,
+    }
+}
+
 /// A label over `object` saying `text`: white, outlined, on the first
 /// line, shown up to 60 m away (OpenAC `PluginWorldLabel`'s defaults).
 #[must_use]
@@ -792,6 +1037,7 @@ impl Host<'_> {
                 binding_type: r.binding_type.clone(),
                 bindings: spec.typed.clone(),
                 item_types: spec.item_types.clone(),
+                icon_file: r.icon_file.clone(),
             }
             .to_bytes();
             let r = &request;
@@ -963,6 +1209,94 @@ impl Host<'_> {
         (size.width, size.height)
     }
 
+    /// The client's bundled font, Noto Sans, at a size from
+    /// [`FONT_MINIMUM_PIXEL_SIZE`] to [`FONT_MAXIMUM_PIXEL_SIZE`] pixels, in a
+    /// weight. [`FontWeight::SemiBold`] is the weight themed window titles are
+    /// set in. Shared with every plugin: a size counts its atlas against
+    /// [`FONT_MAXIMUM_BYTES`] only while no other plugin holds it too.
+    /// [`Font::NONE`] when refused, which is logged (see [`Self::font_load`]).
+    /// Asking twice returns the same font, held twice. The same with or
+    /// without a window.
+    pub fn font_bundled(&mut self, pixel_size: f32, weight: FontWeight) -> Font {
+        let request = BundledFontRequest { pixel_size, weight }.to_bytes();
+        let reply = ui_call!(self, UiFontBundled, ui_font_bundled, &request);
+        decode::<FontInfo>(Import::UiFontBundled, &reply).into()
+    }
+
+    /// A TrueType (`.ttf`) or OpenType (`.otf`) font the plugin ships, usually
+    /// with `include_bytes!`, under the plugin's own name for the file. It
+    /// prepares the characters `ranges` names, where the font has them, so an
+    /// icon font can name the whole private-use area; no ranges prepare U+0020
+    /// to U+024F, U+0370 to U+052F and U+2000 to U+206F. A character that was
+    /// not prepared draws as the font's `?` if that was prepared, and as
+    /// nothing otherwise.
+    ///
+    /// A plugin may hold [`FONT_MAXIMUM_COUNT`] fonts, each of at most
+    /// [`FONT_MAXIMUM_GLYPHS`] characters, and its own fonts may take
+    /// [`FONT_MAXIMUM_BYTES`], counting the files and their atlases. A name
+    /// may be 256 bytes and a request may list 256 ranges. A file over
+    /// [`FONT_MAXIMUM_FILE_BYTES`], one that is not a usable font or whose
+    /// outlines take too much work to draw, or a request past a limit is
+    /// [`Font::NONE`]. A refusal is logged once; each kind of refusal (size,
+    /// count, budget, an unusable file and so on) for at most eight requests,
+    /// then once more to say the rest are left out. A font whose kerning
+    /// takes too long to read is kept with part of it, and that is logged. A
+    /// second request for the same name, size and characters is the same font
+    /// held once more.
+    /// Preparing a font takes some milliseconds, so ask up front.
+    pub fn font_load(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        pixel_size: f32,
+        ranges: &[CodepointRange],
+    ) -> Font {
+        // Past this the request itself would not fit a call.
+        let bytes = if bytes.len() > FONT_MAXIMUM_FILE_BYTES {
+            &bytes[..FONT_MAXIMUM_FILE_BYTES + 1]
+        } else {
+            bytes
+        };
+        let request = FontLoadRequest {
+            name: name.to_owned(),
+            bytes: bytes.to_vec(),
+            pixel_size,
+            ranges: ranges.to_vec(),
+        }
+        .to_bytes();
+        let reply = ui_call!(self, UiFontLoad, ui_font_load, &request);
+        decode::<FontInfo>(Import::UiFontLoad, &reply).into()
+    }
+
+    /// The width of `text` in a font, with its kerning, as it is drawn, and the
+    /// font's line height, pixels. Nothing for a font the plugin does not hold.
+    #[must_use]
+    pub fn font_measure(&mut self, font: Font, text: &str) -> (f32, f32) {
+        let request = FontMeasure {
+            font: font.handle,
+            text: text.to_owned(),
+        }
+        .to_bytes();
+        let reply = ui_call!(self, UiFontMeasure, ui_font_measure, &request);
+        let size: TextSize = decode(Import::UiFontMeasure, &reply);
+        (size.width, size.height)
+    }
+
+    /// Lets go of one hold on a font: it goes on the last. False for a font
+    /// the plugin does not hold. A plugin's fonts go when it unloads.
+    pub fn font_release(&mut self, font: Font) -> bool {
+        let request = font.handle.to_bytes();
+        let reply = ui_call!(self, UiFontRelease, ui_font_release, &request);
+        decode(Import::UiFontRelease, &reply)
+    }
+
+    /// How many distinct fonts the plugin holds.
+    #[must_use]
+    pub fn font_count(&mut self) -> u32 {
+        let reply = ui_call!(self, UiFontCount, ui_font_count, &[]);
+        decode(Import::UiFontCount, &reply)
+    }
+
     /// The plugin theme the player picked under Appearance and its colours,
     /// so a canvas can paint like the plugin's themed windows (the client
     /// restyles `theme="plugin"` windows itself). Classic, with no palette,
@@ -1055,6 +1389,24 @@ impl Host<'_> {
         let reply = ui_call!(self, UiLinesCreate, ui_lines_create, &[]);
         LineLayer {
             id: decode(Import::UiLinesCreate, &reply),
+        }
+    }
+
+    /// A new, empty world-triangle layer (API 1.3).
+    pub fn create_triangle_layer(&mut self) -> TriangleLayer {
+        let reply = ui_call!(self, UiTrianglesCreate, ui_triangles_create, &[]);
+        TriangleLayer {
+            id: decode(Import::UiTrianglesCreate, &reply),
+        }
+    }
+
+    /// A new, empty world-marker layer (API 1.3). Its markers over objects
+    /// go when the character leaves the world (those at fixed positions
+    /// stay), and the layer stays usable for the next stay.
+    pub fn create_marker_layer(&mut self) -> MarkerLayer {
+        let reply = ui_call!(self, UiMarkersCreate, ui_markers_create, &[]);
+        MarkerLayer {
+            id: decode(Import::UiMarkersCreate, &reply),
         }
     }
 

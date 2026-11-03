@@ -557,3 +557,107 @@ fn a_spell_is_named_by_id_or_by_its_name() {
     assert_eq!(resolve_spell(&world, "Vit"), Some(666));
     assert_eq!(resolve_spell(&world, "Nothing"), None);
 }
+
+// -- The examination window's component list ---------------------------------
+//
+// Golden values from OpenAC
+// `tests/AcDream.Core.Tests/Spells/SpellComponentRequirementServiceTests.cs`
+// (`InfusedSchoolOrDirectlyCarriedFocus_UsesScarabOnlyFormula`: a War I
+// spell carried with its school's focus is scarab 1 plus one prismatic taper
+// 0xBC; `FocusNestedInsidePack_DoesNotCountAsRetailMagicPackOwnership`), as
+// `MagicRuntime.GetExamineComponents` lists them.
+
+const WAR_FOCUS_CLASS: u32 = 900;
+
+fn examine_table(focus_container: Option<u32>) -> ac_core::items::ClientObjectTable {
+    let mut objects = ac_core::items::ClientObjectTable::new();
+    let mut ev = Vec::new();
+    let mut put = |id: u32, class: u32, container: u32| {
+        let mut o = ac_core::items::ClientObject::new(id);
+        o.weenie_class_id = class;
+        o.container_id = container;
+        objects.add_or_update(o, &mut ev);
+    };
+    put(PLAYER, 0, 0);
+    put(0x8000_0010, 700, PLAYER);
+    // The scarab and the prismatic taper.
+    put(0x8000_0011, 101, PLAYER);
+    put(0x8000_0012, 188, PLAYER);
+    if let Some(container) = focus_container {
+        put(0x8000_0013, WAR_FOCUS_CLASS, container);
+    }
+    objects
+}
+
+fn war_spell() -> SpellMetadata {
+    SpellMetadata {
+        school_id: ac_core::spells::MagicSchool::WAR_MAGIC,
+        formula_components: vec![1, 63, 10],
+        formula_version: 0,
+        ..SpellMetadata::new(50, "War I", 0)
+    }
+}
+
+fn examine_requirements() -> SpellComponentRequirements {
+    SpellComponentRequirements::new(
+        HashMap::new(),
+        HashMap::from([(1, 101), (0xBC, 188), (63, 163), (10, 110)]),
+        HashMap::from([(1, WAR_FOCUS_CLASS)]),
+    )
+}
+
+#[test]
+fn a_carried_focus_shows_the_spell_as_scarabs_and_prismatic_tapers() {
+    let objects = examine_table(Some(PLAYER));
+    let world = TableComponentWorld {
+        objects: &objects,
+        player: PLAYER,
+    };
+    assert_eq!(
+        examine_components(&examine_requirements(), &world, "testaccount", &war_spell()),
+        [(1, true), (0xBC, true)]
+    );
+}
+
+#[test]
+fn without_a_focus_in_the_main_pack_the_spell_shows_its_own_components() {
+    // No focus, and a focus inside a side pack: neither counts.
+    for focus in [None, Some(0x8000_0010)] {
+        let objects = examine_table(focus);
+        let world = TableComponentWorld {
+            objects: &objects,
+            player: PLAYER,
+        };
+        assert_eq!(
+            examine_components(&examine_requirements(), &world, "testaccount", &war_spell()),
+            [(1, true), (63, false), (10, false)]
+        );
+    }
+}
+
+#[test]
+fn the_examined_formula_is_personalised_for_the_account() {
+    let formula = vec![6, 63, 10, 64, 20, 30, 65, 40];
+    let spell = SpellMetadata {
+        formula_components: formula.clone(),
+        formula_version: 3,
+        ..war_spell()
+    };
+    let objects = examine_table(None);
+    let world = TableComponentWorld {
+        objects: &objects,
+        player: PLAYER,
+    };
+    let expected: Vec<u32> =
+        ac_core::spells::customize_for_account(&formula, 3, "CanonicalAccount")
+            .into_iter()
+            .filter(|&c| c != 0)
+            .collect();
+    let shown: Vec<u32> =
+        examine_components(&examine_requirements(), &world, "CanonicalAccount", &spell)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+    assert_eq!(shown, expected);
+    assert_ne!(shown, formula);
+}

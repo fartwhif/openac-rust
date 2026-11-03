@@ -237,6 +237,50 @@ fn no_in_game_window_shows_under_the_selection_screen() {
     assert!(ui.hidden_under_pregame().is_empty());
 }
 
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_plugin_dock_stays_hidden_under_the_selection_screen_and_comes_back_in_the_world() {
+    use ac_plugin_ui::{BindingSchema, PanelDescriptor, PluginUi, UiOwner};
+    use ac_runtime::session::interface::InterfaceEvent;
+    let dock = ac_ui::plugin::dock::WINDOW;
+    let size = (1280, 720);
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    let mut plugins = PluginUi::new();
+    plugins.set_window_attached(true);
+    plugins
+        .register_panel(
+            &UiOwner::new("test.demo", "Demo"),
+            PanelDescriptor::new("main", "Demo"),
+            "<panel/>",
+            BindingSchema::new("Demo"),
+        )
+        .unwrap();
+    let mut scene = at_selection();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        plugins.snapshot(),
+    )));
+    // Several frames: the screen hides it once, and it must not come back.
+    for _ in 0..3 {
+        ui.feed(&mut scene);
+        ui.frame(Instant::now(), size);
+        assert!(ui.pregame_active());
+        assert!(
+            !ui.host().root.is_window_visible(dock),
+            "the dock shows under the selection screen"
+        );
+    }
+
+    let mut in_world = scene.pregame().selection.clone().expect("a selection");
+    in_world.lifecycle = SelectionLifecycle::InWorld;
+    scene.apply(PresentationEvent::PreGame(PreGameEvent::Selection(
+        Box::new(in_world),
+    )));
+    ui.feed(&mut scene);
+    ui.frame(Instant::now(), size);
+    assert!(!ui.pregame_active());
+    assert!(ui.host().root.is_window_visible(dock));
+}
+
 /// The session's identity snapshot as the character starts entering: who
 /// the player is, before the server has created him.
 fn horan_entering() -> PresentationEvent {

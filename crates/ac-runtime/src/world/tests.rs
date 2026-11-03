@@ -751,6 +751,7 @@ fn a_view_carries_what_the_radar_reads_from_the_description() {
             radar_blip_color: Some(4),
             radar_behavior: Some(3),
             object_description_flags: 0x0000_0010,
+            monarch_id: Some(0x5000_0777),
             ..ac_proto::PublicWeenieDesc::default()
         }),
     })));
@@ -762,11 +763,40 @@ fn a_view_carries_what_the_radar_reads_from_the_description() {
             public_weenie_bitfield: 0x10,
             radar_behavior: Some(3),
             radar_blip_color: 4,
+            monarch_id: 0x5000_0777,
         }
     );
     // An undescribed object reads zero.
     let bare = world_with_door().snapshot().objects[0].radar;
     assert_eq!(bare, super::RadarFacts::default());
+}
+
+#[test]
+fn a_monarch_update_reaches_the_radar_facts_as_a_delta() {
+    // Swearing allegiance announces the monarch with an instance-id update
+    // (Monarch, 26); breaking it sends 0. The window learns it from the
+    // object's delta.
+    let mut world = world_with_door();
+    world.drain_changes();
+    let monarch_update = |value| {
+        Inbound::PublicUpdatePropertyInstanceId(ac_proto::PublicUpdatePropertyInstanceId {
+            sequence: 0,
+            guid: DOOR,
+            property: 26,
+            value,
+        })
+    };
+    let radar_of = |world: &mut World| {
+        let changes: Vec<_> = world.drain_changes().collect();
+        match world.deltas(&changes).as_slice() {
+            [ObjectDelta::Upsert(view)] => view.radar,
+            other => panic!("expected the door's delta, got {other:?}"),
+        }
+    };
+    world.apply(&monarch_update(0x5000_0777));
+    assert_eq!(radar_of(&mut world).monarch_id, 0x5000_0777);
+    world.apply(&monarch_update(0));
+    assert_eq!(radar_of(&mut world).monarch_id, 0);
 }
 
 #[test]

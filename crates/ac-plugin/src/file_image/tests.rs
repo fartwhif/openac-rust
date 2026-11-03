@@ -529,3 +529,85 @@ fn resolve_path_refuses_a_file_link_that_points_outside_the_folder_on_windows() 
     let reason = resolve_image_path(&folder, "icons/sword.png").unwrap_err();
     assert!(reason.contains("points outside"), "{reason}");
 }
+
+// ── A window's own dock icon ─────────────────────────────────────────────
+
+fn dock_icon_folder() -> TemporaryDirectory {
+    let root = TemporaryDirectory::new("dock-icon");
+    std::fs::create_dir_all(root.path().join("icons")).unwrap();
+    root
+}
+
+#[test]
+fn a_dock_icon_of_64_pixels_is_read_by_any_spelling() {
+    let root = dock_icon_folder();
+    std::fs::write(root.path().join("icons/a.png"), png(64, 64)).unwrap();
+    for spelling in [
+        "icons/a.png",
+        "./icons//a.png",
+        r"icons\a.png",
+        "icons/../icons/a.PNG",
+    ] {
+        // A file system that tells letter case apart has no `a.PNG`.
+        let read = load_dock_icon(root.path(), spelling);
+        if spelling.ends_with("PNG") && matches!(read, Ok(None)) {
+            continue;
+        }
+        let icon = read.unwrap().unwrap_or_else(|| panic!("{spelling}"));
+        assert_eq!((icon.width, icon.height), (64, 64), "{spelling}");
+    }
+}
+
+#[test]
+fn a_missing_dock_icon_is_not_an_error() {
+    let root = dock_icon_folder();
+    assert_eq!(load_dock_icon(root.path(), "icons/gone.png"), Ok(None));
+}
+
+#[test]
+fn a_dock_icon_is_refused_for_each_rule_it_breaks() {
+    let root = dock_icon_folder();
+    let write = |name: &str, bytes: &[u8]| std::fs::write(root.path().join(name), bytes).unwrap();
+    write("small.png", &png(32, 32));
+    write("big.png", &vec![0u8; ICON_MAXIMUM_BYTES + 1]);
+    write("text.png", b"this is not a PNG");
+    write("a.jpg", &red_jpeg());
+    write("a.svg", b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+    for (path, reason) in [
+        ("small.png", "must be exactly 64x64"),
+        ("big.png", "is larger than"),
+        ("text.png", "is not a PNG"),
+        ("a.jpg", "is not a .png file"),
+        ("a.svg", "is not a .png file"),
+        ("../a.png", OUTSIDE),
+        ("icons/../../a.png", OUTSIDE),
+        ("/etc/a.png", OUTSIDE),
+        (r"C:\a.png", OUTSIDE),
+        ("", OUTSIDE),
+    ] {
+        let refused = load_dock_icon(root.path(), path).unwrap_err();
+        assert!(refused.contains(reason), "{path}: {refused}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dock_icon_cannot_be_a_link_out_of_the_folder_or_a_pipe() {
+    let root = dock_icon_folder();
+    let outside = TemporaryDirectory::new("dock-icon-outside");
+    std::fs::write(outside.path().join("a.png"), png(64, 64)).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("a.png"), root.path().join("link.png")).unwrap();
+    assert_eq!(
+        load_dock_icon(root.path(), "link.png").unwrap_err(),
+        OUTSIDE
+    );
+
+    // Refused for what it read, at once: nothing ever writes to this pipe.
+    let pipe = root.path().join("pipe.png");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    assert!(load_dock_icon(root.path(), "pipe.png").is_err());
+}

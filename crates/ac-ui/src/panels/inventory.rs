@@ -219,9 +219,7 @@ fn configure_resize_layout(ui: &mut UiRoot, layout: &ImportedLayout) {
 }
 
 pub(crate) fn is_bag(item: &ClientObject) -> bool {
-    item.container_type_hint != 0
-        || item.item_type.intersects(ItemType::CONTAINER)
-        || item.items_capacity > 0
+    ac_core::items::placement::is_pack(item)
 }
 
 fn is_capacity_rejection(r: Option<PlacementRejection>) -> bool {
@@ -570,7 +568,7 @@ impl InventoryController {
         p: &ItemDragPayload,
         view: &ItemsView<'_>,
     ) -> DragAcceptance {
-        if p.source_kind == ItemDragSource::ShortcutBar {
+        if p.source_kind.is_alias() {
             return DragAcceptance::None;
         }
         let target_item = slot(ui, cell).map_or(0, |s| s.object_id);
@@ -692,7 +690,7 @@ impl InventoryController {
         p: &ItemDragPayload,
         view: &ItemsView<'_>,
     ) {
-        if p.source_kind == ItemDragSource::ShortcutBar {
+        if p.source_kind.is_alias() {
             return;
         }
         let item = p.obj_id;

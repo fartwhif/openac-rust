@@ -621,7 +621,7 @@ fn route_console_line(
     match (console::parse(line, &[]), window) {
         (ConsoleInput::Window { .. }, Some(host)) => {
             let (to_window, from_session) = std::sync::mpsc::channel();
-            let spec = prefs.window_spec("openAC".to_owned());
+            let spec = prefs.window_spec();
             match host.attach_to_session(spec, from_session, commands.clone()) {
                 Ok(()) => Routed {
                     notice: None,
@@ -739,8 +739,11 @@ impl Logger {
             let distance = o
                 .distance
                 .map_or_else(String::new, |d| format!(" {d:.1} m"));
+            let monarch = o
+                .monarch
+                .map_or_else(String::new, |m| format!(", monarch 0x{m:08X}"));
             outln!(
-                "    0x{:08X} #{:<5} {:<32} {place}{distance}",
+                "    0x{:08X} #{:<5} {:<32} {place}{distance}{monarch}",
                 o.guid,
                 o.local_id,
                 o.name.as_deref().unwrap_or("?")

@@ -32,7 +32,7 @@ fn the_inventory_figure_is_asked_for_while_the_inventory_shows() {
     let mut scene = Scene::default();
     ui.feed(&mut scene);
     ui.frame(Instant::now(), size);
-    let (requests, _) = ui.viewport_requests(&scene);
+    let (requests, _) = ui.viewport_requests(&scene, 1.0);
     assert!(
         requests.iter().all(|r| r.slot != ViewportSlot::Paperdoll),
         "the inventory is closed: {requests:?}"
@@ -41,7 +41,7 @@ fn the_inventory_figure_is_asked_for_while_the_inventory_shows() {
     ui.host_mut().root.show_window(INVENTORY_WINDOW);
     ui.feed(&mut scene);
     ui.frame(Instant::now(), size);
-    let (requests, _) = ui.viewport_requests(&scene);
+    let (requests, _) = ui.viewport_requests(&scene, 1.0);
     let doll = requests
         .iter()
         .find(|r| r.slot == ViewportSlot::Paperdoll)

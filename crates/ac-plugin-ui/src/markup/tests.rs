@@ -664,6 +664,43 @@ fn bound_colours_follow_their_values() {
 }
 
 #[test]
+fn a_colour_may_name_a_second_colour_for_light_themes() {
+    let doc = parse(
+        r##"<panel theme="plugin"><label text="a" color="#FF112233|light:#FF445566"/></panel>"##,
+        &BindingSchema::new("T"),
+    )
+    .unwrap();
+    let Element::Label { color, .. } = &doc.nodes[0].element else {
+        panic!()
+    };
+    let color = color.clone().unwrap();
+    assert_eq!(
+        color,
+        ColorSource::Paired {
+            dark: Rgba::argb(0xFF11_2233),
+            light: Rgba::argb(0xFF44_5566),
+        }
+    );
+    assert_eq!(color.read(&NoValues), Rgba::argb(0xFF11_2233));
+}
+
+/// A pair is two literals: a binding on either side is refused rather than
+/// dropped.
+#[test]
+fn a_colour_pair_with_a_binding_is_refused() {
+    let schema = schema("T", &[("Accent", K::Uint)]);
+    for value in ["{Accent}|light:#FF445566", "#FF112233|light:{Accent}"] {
+        let markup = format!(r#"<panel theme="plugin"><label text="a" color="{value}"/></panel>"#);
+        assert_eq!(
+            error(&markup, &schema),
+            format!(
+                "The colour '{value}' binds a value, so it cannot name a colour for light themes."
+            )
+        );
+    }
+}
+
+#[test]
 fn theme_colours_name_a_token_and_keep_a_classic_fallback() {
     // OpenAC MarkupDocument's theme branch (PluginUiPalette.Token).
     let doc = parse(

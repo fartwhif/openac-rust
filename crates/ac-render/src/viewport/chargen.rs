@@ -221,9 +221,10 @@ impl ChargenPreviewState {
     }
 
     /// Show `figure` for this look; `backdrop` is the heritage's scenery
-    /// Setup. A new heritage or gender moves the eye to that body's eye; a
-    /// zoomed-in preview stays zoomed in (at rest); a slide in progress is
-    /// dropped.
+    /// Setup. A new heritage or gender moves the eye to that body's eye and
+    /// drops a slide in progress; a new look of the same body keeps both
+    /// (the face and clothes choices change the headgear as they zoom); a
+    /// zoomed-in preview stays zoomed in (at rest).
     pub fn rebuild(
         &mut self,
         heritage: u32,
@@ -244,11 +245,12 @@ impl ChargenPreviewState {
             } else {
                 chargen_default_eye(heritage)
             };
+            self.zoom = None;
         }
         if self.built.is_none_or(|b| b.heritage != heritage) {
             self.backdrop = backdrop;
         }
-        self.zoom = Some(ZoomTween::default());
+        self.zoom.get_or_insert_with(ZoomTween::default);
         self.figure = Some(figure);
         self.built = Some(Built {
             heritage,
@@ -551,6 +553,25 @@ mod tests {
         p.rebuild(OLTHOI, 1, other, figure(), 0x0200_0002);
         assert_eq!(p.eye, chargen_default_eye(OLTHOI));
         assert_eq!(p.backdrop(), 0x0200_0002);
+    }
+
+    #[test]
+    fn a_new_look_keeps_the_slide_in_progress() {
+        // The clothes choice puts the headgear back and zooms out: the new
+        // look's figure must not stop the slide.
+        let mut p = built(false, ALUVIAN);
+        p.zoom_in();
+        p.tick(1.0);
+        p.tick(10.0);
+        p.zoom_out();
+        let other = ChargenAppearanceSelection {
+            headgear_style: 1,
+            ..ChargenAppearanceSelection::default()
+        };
+        p.rebuild(ALUVIAN, 1, other, figure(), 0x0200_0BEE);
+        p.tick(20.0);
+        p.tick(30.0);
+        assert_eq!(p.eye, chargen_zoomed_out_eye(ALUVIAN));
     }
 
     #[test]

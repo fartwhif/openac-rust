@@ -15,6 +15,8 @@ fn book(ids: &[u32]) -> Spellbook {
     )))
 }
 
+/// A record as the server sends one: its operation bit (multiply or add)
+/// matches its list, and its spell category is its own (the spell id).
 fn typed(
     spell_id: u32,
     layer: u32,
@@ -23,14 +25,25 @@ fn typed(
     value: f32,
     bucket: u32,
 ) -> ActiveEnchantmentRecord {
+    let operation = match bucket {
+        1 => MULTIPLICATIVE,
+        2 => ADDITIVE,
+        // Vitae records carry the multiplicative bit.
+        4 => MULTIPLICATIVE,
+        _ => 0,
+    };
     ActiveEnchantmentRecord {
-        stat_mod_type: Some(stat_mod_type),
+        stat_mod_type: Some(stat_mod_type | operation),
         stat_mod_key: Some(key),
         stat_mod_value: Some(value),
         bucket,
+        spell_category: spell_id,
         ..ActiveEnchantmentRecord::new(spell_id, layer, 60.0, 0)
     }
 }
+
+const MULTIPLICATIVE: u32 = 0x4000;
+const ADDITIVE: u32 = 0x8000;
 
 fn vitae(spell_id: u32, value: f32) -> ActiveEnchantmentRecord {
     ActiveEnchantmentRecord {
@@ -268,6 +281,29 @@ fn health_rounds_half_endurance_and_includes_gear() {
     s.on_vital_update(7, 0, 10, 0, 40);
     assert_eq!(s.get_base_max_approx(VitalKind::Health), Some(40));
     assert_eq!(s.get_max_approx(VitalKind::Health), Some(40));
+}
+
+#[test]
+fn health_adds_two_per_enlightenment_before_vitae() {
+    let mut b = book(&[1]);
+    b.on_enchantment_added(vitae(1, 0.95));
+    let mut s = LocalPlayerState::new(Some(b));
+    s.on_int_properties(BTreeMap::from([(PropertyInt::ENLIGHTENMENT.0, 4)]));
+    s.on_vital_update(1, 100, 0, 0, 103);
+    s.on_vital_update(3, 100, 0, 0, 95);
+    // (100 + 4 x 2) x 0.95 = 102.6, shown as 103; stamina has no such term.
+    assert_eq!(s.get_base_max_approx(VitalKind::Health), Some(108));
+    assert_eq!(s.get_max_approx(VitalKind::Health), Some(103));
+    assert_eq!(s.get_max_approx(VitalKind::Stamina), Some(95));
+}
+
+#[test]
+fn gear_health_update_mid_session_moves_the_maximum() {
+    let mut s = LocalPlayerState::default();
+    s.on_int_properties(BTreeMap::new());
+    s.on_vital_update(1, 100, 0, 0, 100);
+    s.on_int_property_update(PropertyInt::GEAR_MAX_HEALTH.0, 12);
+    assert_eq!(s.get_max_approx(VitalKind::Health), Some(112));
 }
 
 #[test]
@@ -613,6 +649,7 @@ fn spells_scale_first_and_add_second() {
 fn vitae_scales_the_augmented_skill() {
     let mut b = book(&[1]);
     b.on_enchantment_added(ActiveEnchantmentRecord {
+        stat_mod_type: Some(MULTIPLICATIVE),
         stat_mod_value: Some(0.95),
         bucket: 4,
         ..ActiveEnchantmentRecord::new(1, 1, 0.0, 0)
@@ -634,4 +671,224 @@ fn augmentations_read_from_int_properties() {
     s.on_int_property_update(PropertyInt::LUM_AUG_ALL_SKILLS.0, 5);
     train(&mut s, 208, 0, TRAINED);
     assert_eq!(s.get_effective_skill(SKILL_ID), Some(528));
+}
+
+// Stacking as the game client stacks for its attribute, vital and skill
+// panels: the records that apply to the stat are culled from the
+// multiplicative list, then the additive list, each walked from its head
+// (the newest record), into one list holding one record per spell
+// category. Test cases adapted from PR #36 by evantaylor.
+
+const STRENGTH: u32 = 1;
+const MELEE_DEFENSE: u32 = 6;
+
+/// `typed` in spell category `category` at `power`, started at `start`.
+fn ranked(
+    record: ActiveEnchantmentRecord,
+    category: u32,
+    power: u32,
+    start: f64,
+) -> ActiveEnchantmentRecord {
+    ActiveEnchantmentRecord {
+        spell_category: category,
+        power_level: power,
+        start_time: start,
+        ..record
+    }
+}
+
+/// A spellbook holding `records` (each arriving in turn), whose spell table
+/// knows every spell, with the record's own category as its family.
+fn book_holding(records: &[ActiveEnchantmentRecord]) -> Spellbook {
+    let table = SpellTable::create(
+        records
+            .iter()
+            .map(|r| SpellMetadata::new(r.spell_id, "Test", r.spell_category)),
+    )
+    .expect("unique");
+    book_with_table(table, records)
+}
+
+fn book_with_table(table: SpellTable, records: &[ActiveEnchantmentRecord]) -> Spellbook {
+    let mut b = Spellbook::new(Some(Arc::new(table)));
+    for &record in records {
+        b.on_enchantment_added(record);
+    }
+    b
+}
+
+fn strength_in(b: Spellbook) -> Option<i32> {
+    let mut s = LocalPlayerState::new(Some(b));
+    s.on_attribute_update(STRENGTH, 100, 100, 0);
+    s.get_effective_attribute(AttributeKind::Strength)
+}
+
+fn strength_with(records: &[ActiveEnchantmentRecord]) -> Option<i32> {
+    strength_in(book_holding(records))
+}
+
+fn skill_with(skill_id: u32, base: u32, records: &[ActiveEnchantmentRecord]) -> Option<i32> {
+    let mut s = LocalPlayerState::new(Some(book_holding(records)));
+    s.on_skill_update(skill_id, base, 2, 0, 0, 0, 0.0, 0);
+    s.get_effective_skill(skill_id)
+}
+
+#[test]
+fn a_spell_missing_from_the_spell_table_counts() {
+    let record = typed(9999, 1, ATTRIBUTE, STRENGTH, 40.0, 2);
+    assert_eq!(
+        strength_in(book_with_table(SpellTable::empty(), &[record])),
+        Some(240)
+    );
+}
+
+#[test]
+fn records_group_by_their_own_spell_category() {
+    // Both records name category 7; the table's family (0 here, which
+    // would keep them apart) plays no part. The stronger one counts alone.
+    let weak = ranked(typed(1, 1, ATTRIBUTE, STRENGTH, 40.0, 2), 7, 400, 0.0);
+    let strong = ranked(typed(2, 2, ATTRIBUTE, STRENGTH, 56.0, 2), 7, 16300, 0.0);
+    let table =
+        || SpellTable::create([1, 2].map(|id| SpellMetadata::new(id, "Test", 0))).expect("unique");
+    assert_eq!(
+        strength_in(book_with_table(table(), &[weak, strong])),
+        Some(256)
+    );
+    assert_eq!(
+        strength_in(book_with_table(table(), &[strong, weak])),
+        Some(256)
+    );
+}
+
+#[test]
+fn spell_category_zero_is_a_category_like_any_other() {
+    let first = ranked(typed(1, 1, ATTRIBUTE, STRENGTH, 40.0, 2), 0, 1, 0.0);
+    let second = ranked(typed(2, 2, ATTRIBUTE, STRENGTH, 30.0, 2), 0, 2, 0.0);
+    assert_eq!(strength_with(&[first, second]), Some(230));
+}
+
+#[test]
+fn a_higher_power_level_beats_a_higher_spell_id() {
+    // PR #36's Melee Defense: a +56 timed buff of high power against a +45
+    // permanent one of a higher spell id, same category.
+    let timed = ranked(
+        typed(2245, 2, SKILL, MELEE_DEFENSE, 56.0, 2),
+        37,
+        16300,
+        0.0,
+    );
+    let permanent = ranked(typed(4560, 1, SKILL, MELEE_DEFENSE, 45.0, 2), 37, 400, 0.0);
+    assert_eq!(
+        skill_with(MELEE_DEFENSE, 574, &[timed, permanent]),
+        Some(630)
+    );
+    assert_eq!(
+        skill_with(MELEE_DEFENSE, 574, &[permanent, timed]),
+        Some(630)
+    );
+}
+
+#[test]
+fn at_equal_power_the_later_start_wins() {
+    let earlier = ranked(typed(4560, 1, SKILL, MELEE_DEFENSE, 45.0, 2), 37, 400, 10.0);
+    let later = ranked(typed(2245, 2, SKILL, MELEE_DEFENSE, 56.0, 2), 37, 400, 20.0);
+    assert_eq!(skill_with(MELEE_DEFENSE, 574, &[earlier, later]), Some(630));
+    assert_eq!(skill_with(MELEE_DEFENSE, 574, &[later, earlier]), Some(630));
+}
+
+#[test]
+fn an_exact_tie_goes_to_the_older_record() {
+    // A new record goes to the head of its list and the head is culled
+    // first, so the record that arrived first is the later challenger and
+    // takes an exact tie. No spell-id tiebreak.
+    let older = ranked(typed(1, 1, ATTRIBUTE, STRENGTH, 40.0, 2), 7, 400, 5.0);
+    let newer = ranked(typed(2, 2, ATTRIBUTE, STRENGTH, 56.0, 2), 7, 400, 5.0);
+    assert_eq!(strength_with(&[older, newer]), Some(240));
+    assert_eq!(strength_with(&[newer, older]), Some(256));
+}
+
+#[test]
+fn a_multiplier_and_an_addition_of_one_category_compete() {
+    let scale = ranked(typed(1, 1, ATTRIBUTE, STRENGTH, 1.1, 1), 5, 10, 0.0);
+    let add = ranked(typed(2, 2, ATTRIBUTE, STRENGTH, 10.0, 2), 5, 5, 0.0);
+    assert_eq!(strength_with(&[scale, add]), Some(220));
+    let stronger_add = ranked(add, 5, 20, 0.0);
+    assert_eq!(strength_with(&[scale, stronger_add]), Some(210));
+}
+
+#[test]
+fn a_multiple_stat_record_applies_whatever_its_key() {
+    let blessing = typed(
+        1,
+        1,
+        (EnchantmentTypeFlags::ATTRIBUTE | EnchantmentTypeFlags::MULTIPLE_STAT).0,
+        3,
+        9.0,
+        2,
+    );
+    assert_eq!(strength_with(&[blessing]), Some(209));
+}
+
+#[test]
+fn an_all_attack_skills_record_raises_the_attack_skills_only() {
+    let attack = typed(1, 1, SKILL | 0x1_0000, 0, 10.0, 2);
+    for skill in [33, 34, 41, 43, 44, 45, 46, 47, 49] {
+        assert_eq!(
+            skill_with(skill, 100, &[attack]),
+            Some(110),
+            "skill {skill}"
+        );
+    }
+    for skill in [1, 6, 24, 35, 36, 42, 48, 50] {
+        assert_eq!(
+            skill_with(skill, 100, &[attack]),
+            Some(100),
+            "skill {skill}"
+        );
+    }
+}
+
+#[test]
+fn an_all_defense_skills_record_raises_the_defense_skills_only() {
+    let defense = typed(1, 1, SKILL | 0x2_0000, 0, 10.0, 2);
+    for skill in [6, 7, 15, 48] {
+        assert_eq!(
+            skill_with(skill, 100, &[defense]),
+            Some(110),
+            "skill {skill}"
+        );
+    }
+    for skill in [5, 8, 14, 16, 24, 45, 47, 49] {
+        assert_eq!(
+            skill_with(skill, 100, &[defense]),
+            Some(100),
+            "skill {skill}"
+        );
+    }
+}
+
+#[test]
+fn the_type_bits_decide_add_or_multiply_with_add_first() {
+    // A record carrying both operation bits adds, whichever list holds it.
+    let both = ActiveEnchantmentRecord {
+        stat_mod_type: Some(ATTRIBUTE | MULTIPLICATIVE | ADDITIVE),
+        ..typed(1, 1, ATTRIBUTE, STRENGTH, 10.0, 1)
+    };
+    assert_eq!(strength_with(&[both]), Some(210));
+    // One with neither bit changes nothing.
+    let neither = ActiveEnchantmentRecord {
+        stat_mod_type: Some(ATTRIBUTE),
+        ..typed(2, 2, ATTRIBUTE, STRENGTH, 10.0, 2)
+    };
+    assert_eq!(strength_with(&[neither]), Some(200));
+}
+
+#[test]
+fn vitae_then_each_record_rounds_to_a_float_in_turn() {
+    // 200 x 0.95 = 190, x 1.1 = 209 exactly in single precision; scaling
+    // by the product 0.95 x 1.1 first gives 208.99998, shown as 208.
+    let b = book_holding(&[vitae(1, 0.95), typed(2, 2, SKILL, MELEE_DEFENSE, 1.1, 1)]);
+    let mut s = LocalPlayerState::new(Some(b));
+    s.on_skill_update(MELEE_DEFENSE, 200, 2, 0, 0, 0, 0.0, 0);
+    assert_eq!(s.get_effective_skill(MELEE_DEFENSE), Some(209));
 }

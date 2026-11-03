@@ -15,7 +15,9 @@
 use std::sync::Arc;
 
 use ac_core::combat::CombatMode;
-use ac_core::items::shortcuts::{ShortcutDropSource, ShortcutMutation, plan_shortcut_drop};
+use ac_core::items::shortcuts::{
+    ShortcutDropSource, ShortcutMutation, plan_refused_shortcut_drop, plan_shortcut_drop,
+};
 use ac_core::items::{
     ClientObject, ItemType, PublicWeenieFlags, ShortcutEntry, ShortcutStore, StackSplitQuantity,
     ToolbarAmmo,
@@ -133,7 +135,31 @@ pub struct ToolbarController {
     target_mode: bool,
     player: u32,
     queue: Vec<(ElementId, ElementMessage)>,
+    /// Items from outside the bar dropped on a slot, judged at the next
+    /// update against the objects: (slot, payload).
+    fresh_drops: Vec<(i32, ItemDragPayload)>,
     ammo_object: u32,
+}
+
+/// Whether a toolbar slot takes the drag: an item itself, or a shortcut
+/// moved along the bar; any other alias (a salvage, vendor or house
+/// window cell) is refused.
+fn takes_shortcut_drop(p: &ItemDragPayload) -> bool {
+    !p.source_kind.is_alias() || p.source_kind == ItemDragSource::ShortcutBar
+}
+
+/// `item` may have a shortcut: it is not stuck in place, not a creature
+/// and not in the open vendor's stock, unless it is a player.
+fn is_shortcut_eligible(o: &ClientObject, view: &ItemsView<'_>) -> bool {
+    let flags = o.flags();
+    let is_player = o.object_id() == view.player || flags.contains(PublicWeenieFlags::PLAYER);
+    if flags.contains(PublicWeenieFlags::STUCK) && !is_player {
+        return false;
+    }
+    if o.item_type.intersects(ItemType::CREATURE) && !is_player {
+        return false;
+    }
+    o.container_id == 0 || o.container_id != view.open_vendor
 }
 
 fn cell_of(ui: &UiRoot, list: Option<ElementId>) -> Option<ElementId> {
@@ -222,7 +248,7 @@ impl ToolbarController {
             w.item_drag_accept_sprite = PACK_DRAG_ACCEPT_SPRITE;
             w.listeners.item_drop = true;
             w.on_item_drag_over = Some(Box::new(|p: &ItemDragPayload| {
-                if p.obj_id != 0 && p.source_kind != ItemDragSource::ShortcutBar {
+                if p.obj_id != 0 && !p.source_kind.is_alias() {
                     DragAcceptance::Accept
                 } else {
                     DragAcceptance::None
@@ -258,6 +284,7 @@ impl ToolbarController {
             target_mode: false,
             player: 0,
             queue: Vec::new(),
+            fresh_drops: Vec::new(),
             ammo_object: 0,
         };
         c.show_combat_mode(ui, CombatMode::NON_COMBAT);
@@ -402,14 +429,10 @@ impl ToolbarController {
         let Some(o) = view.get(item).filter(|_| item != 0) else {
             return false;
         };
-        let flags = o.flags();
-        let is_player = item == view.player || flags.contains(PublicWeenieFlags::PLAYER);
-        if flags.contains(PublicWeenieFlags::STUCK) && !is_player {
+        if !is_shortcut_eligible(o, view) {
             return false;
         }
-        if o.item_type.intersects(ItemType::CREATURE) && !is_player {
-            return false;
-        }
+        let is_player = item == view.player || o.flags().contains(PublicWeenieFlags::PLAYER);
         if !is_player && !view.objects.is_owned_by_object(item, view.player) {
             return false;
         }
@@ -429,25 +452,77 @@ impl ToolbarController {
         true
     }
 
-    fn drop_on_slot(&mut self, ui: &mut UiRoot, target_slot: i32, p: &ItemDragPayload) {
-        let source = if p.source_kind == ItemDragSource::ShortcutBar {
-            ShortcutDropSource::ShortcutAlias
-        } else {
-            ShortcutDropSource::FreshItem
-        };
-        let dragged = p.shortcut.unwrap_or(ShortcutEntry {
+    fn dragged_entry(p: &ItemDragPayload) -> ShortcutEntry {
+        p.shortcut.unwrap_or(ShortcutEntry {
             index: p.source_slot,
             object_id: p.obj_id,
             spell_id: 0,
-        });
+        })
+    }
+
+    /// A shortcut dragged from another slot, dropped on `target_slot`.
+    fn drop_shortcut_on_slot(&mut self, ui: &mut UiRoot, target_slot: i32, p: &ItemDragPayload) {
         let plan = plan_shortcut_drop(
             &self.store.snapshot(),
-            source,
+            ShortcutDropSource::ShortcutAlias,
             p.source_slot,
             target_slot,
-            dragged,
+            Self::dragged_entry(p),
         );
         apply(ui, &mut self.store, &plan);
+    }
+
+    /// An item from outside the bar dropped on `target_slot`. The slot's
+    /// shortcut makes way (to the first empty slot on its right) whatever
+    /// the item is. An item that may not have a shortcut gets none; one of
+    /// the player's gets it at once; anything else (on the ground, in an
+    /// outside container) is picked up into the preferred pack first, and
+    /// the session gives it the shortcut once that request goes out.
+    fn drop_fresh_item_on_slot(
+        &mut self,
+        ui: &mut UiRoot,
+        target_slot: i32,
+        p: &ItemDragPayload,
+        view: &ItemsView<'_>,
+    ) {
+        let item = p.obj_id;
+        if item == 0 {
+            return;
+        }
+        let Some(o) = view.get(item).filter(|o| is_shortcut_eligible(o, view)) else {
+            let plan = plan_refused_shortcut_drop(&self.store.snapshot(), target_slot, item);
+            apply(ui, &mut self.store, &plan);
+            return;
+        };
+        let plan = plan_shortcut_drop(
+            &self.store.snapshot(),
+            ShortcutDropSource::FreshItem,
+            p.source_slot,
+            target_slot,
+            Self::dragged_entry(p),
+        );
+        let is_player = item == view.player || o.flags().contains(PublicWeenieFlags::PLAYER);
+        if is_player || view.objects.is_owned_by_object(item, view.player) {
+            apply(ui, &mut self.store, &plan);
+            return;
+        }
+        for m in plan {
+            match m {
+                // The item's shortcut elsewhere and its new one are the
+                // session's to change once the pickup has gone out.
+                ShortcutMutation::Remove(slot) if slot != target_slot => {}
+                ShortcutMutation::Add(e) if e.object_id == item && e.index == target_slot => {
+                    emit(
+                        ui,
+                        PanelOutput::Session(SessionCommand::Item(ItemCommand::PickUpToShortcut {
+                            item: ObjectRef::Guid(item),
+                            slot: target_slot,
+                        })),
+                    );
+                }
+                m => apply(ui, &mut self.store, &[m]),
+            }
+        }
     }
 
     /// Resolve what was queued against `view`, then show it.
@@ -478,6 +553,9 @@ impl ToolbarController {
                 self.inventory_button_drop(ui, &p, view);
             }
         }
+        for (slot, p) in std::mem::take(&mut self.fresh_drops) {
+            self.drop_fresh_item_on_slot(ui, slot, &p, view);
+        }
         self.populate(ui, view, icons);
     }
 
@@ -487,7 +565,7 @@ impl ToolbarController {
         p: &ItemDragPayload,
         view: &ItemsView<'_>,
     ) {
-        if p.obj_id == 0 || p.source_kind == ItemDragSource::ShortcutBar {
+        if p.obj_id == 0 || p.source_kind.is_alias() {
             return;
         }
         if view.player == 0 || view.get(p.obj_id).is_none() {
@@ -624,7 +702,7 @@ impl ToolbarController {
                 }
             }
             ElementMessage::ItemDragEntered(p) => {
-                let a = if p.obj_id != 0 {
+                let a = if p.obj_id != 0 && takes_shortcut_drop(p) {
                     DragAcceptance::Accept
                 } else {
                     DragAcceptance::None
@@ -633,7 +711,14 @@ impl ToolbarController {
                     s.set_drag_acceptance(a);
                 }
             }
-            ElementMessage::ItemDropped(p) => self.drop_on_slot(ui, index, p),
+            ElementMessage::ItemDropped(p) if p.source_kind == ItemDragSource::ShortcutBar => {
+                self.drop_shortcut_on_slot(ui, index, p);
+            }
+            // Judged against the objects at the next update.
+            // Another alias (a salvage, vendor or house window cell) is
+            // refused before it is judged as an item.
+            ElementMessage::ItemDropped(p) if !takes_shortcut_drop(p) => {}
+            ElementMessage::ItemDropped(p) => self.fresh_drops.push((index, p.clone())),
             _ => {}
         }
         let selected = self.selection.get();

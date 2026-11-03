@@ -481,9 +481,8 @@ fn labels_stay_up_while_a_camera_and_their_anchor_are_there() {
     // OpenAC `WorldLabelOverlayController.Tick` reads only the plugins'
     // labels, the anchors (`WorldSelectionQuery.TryResolveWorldLabelAnchor`,
     // the live entity) and the game camera (`SelectionCameraSource`, never
-    // the portal tunnel's); nothing hides the layer in portal space, so a
-    // label over the player stays up through a portal (smoke 3, note 5:
-    // kept as OpenAC). Only a missing camera, anchor or label takes it down.
+    // the portal tunnel's). Here only a missing camera, anchor or label takes
+    // it down; the window passes no labels while the portal view shows.
     let mut ui = root(800.0, 600.0);
     let mut host = OverlayHost::mount(&mut ui);
     let mut overlay = WorldLabelOverlay::mount(&mut ui, &mut host, Some(font()));

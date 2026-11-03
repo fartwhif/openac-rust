@@ -12,6 +12,9 @@ use std::sync::Arc;
 use crate::draw::{Color, DEFAULT_OUTLINE_COLOR, RenderContext, TextureRef};
 use crate::event::{Key, UiEvent, kind};
 use crate::font::UiFont;
+use crate::plugin::Palette;
+use crate::plugin::style::{self, PointerState};
+use crate::plugin::widgets::ButtonLook;
 use crate::root::{ElementMessage, UiRoot};
 use crate::text::Scrollable;
 use crate::tree::{Element, ElementId, Widget};
@@ -167,6 +170,8 @@ pub struct Menu {
     pub plain_selected_color: Color,
     /// Plain hovered row.
     pub plain_hover_color: Color,
+    /// The plugin theme the plain look draws in (none: flat).
+    pub theme_palette: Option<Palette>,
     /// The popup opens above the button (else below).
     pub open_upward: bool,
     /// A search band above the entries keeps those whose caption holds
@@ -196,6 +201,7 @@ pub struct Menu {
     /// The last fitted button caption.
     caption_fit: Option<CaptionFit>,
     face_pressed: bool,
+    pointer: PointerState,
     hovered_popup_index: Option<usize>,
     dragging_popup_thumb: bool,
     popup_thumb_drag_offset: f32,
@@ -257,6 +263,7 @@ impl Default for Menu {
             plain_triangle_color: Color::rgba(0.91, 0.87, 0.76, 1.0),
             plain_selected_color: Color::rgba(0.28, 0.23, 0.08, 0.95),
             plain_hover_color: Color::rgba(0.40, 0.33, 0.14, 0.95),
+            theme_palette: None,
             open_upward: true,
             searchable: false,
             plain_popup_scrollbar: false,
@@ -267,6 +274,7 @@ impl Default for Menu {
             popup_left: 0.0,
             caption_fit: None,
             face_pressed: false,
+            pointer: PointerState::default(),
             hovered_popup_index: None,
             dragging_popup_thumb: false,
             popup_thumb_drag_offset: 0.0,
@@ -678,6 +686,7 @@ impl Menu {
         };
         self.search.background_color = self.plain_background_color;
         self.search.selection_color = self.plain_selected_color;
+        self.search.theme_palette = self.theme_palette;
     }
 
     /// Hand the search entry an event (styled as the menu draws it).
@@ -993,15 +1002,30 @@ impl Menu {
         );
     }
 
-    fn draw_closed(&self, rc: &mut RenderContext<'_>, w: f32, h: f32) {
+    fn draw_closed(&self, rc: &mut RenderContext<'_>, w: f32, h: f32, live: bool) {
         if !self.retail_button_art {
-            rc.fill(0.0, 0.0, w, h, self.plain_background_color);
-            let border = if self.open || self.face_pressed {
+            let open = self.open || self.face_pressed;
+            let border = if open {
                 self.plain_open_border_color
             } else {
                 self.plain_border_color
             };
-            rc.rect_outline(0.0, 0.0, w, h, border, 1.0);
+            let mut caption = self.plain_text_color;
+            if let Some(p) = &self.theme_palette {
+                let look = if open {
+                    ButtonLook::Normal
+                } else {
+                    self.pointer.look(live)
+                };
+                let face = (0.0, 0.0, w, h);
+                style::button(rc, p, face, self.plain_background_color, border, look);
+                if !live {
+                    caption = style::faded(caption);
+                }
+            } else {
+                rc.fill(0.0, 0.0, w, h, self.plain_background_color);
+                rc.rect_outline(0.0, 0.0, w, h, border, 1.0);
+            }
             let font = self.caption_font();
             if let Some(f) = font {
                 let y = (h - f.line_height) * 0.5;
@@ -1010,10 +1034,15 @@ impl Menu {
                     self.shown_caption(),
                     PLAIN_PADDING,
                     y,
-                    self.plain_text_color,
+                    caption,
                     self.outline,
                     self.outline_color,
                 );
+            }
+            if self.theme_palette.is_some() {
+                let triangle = self.plain_triangle_color;
+                style::chevron(rc, w - 14.0, (h - 4.0) * 0.5, 8.0, 4.0, triangle);
+                return;
             }
             let (tw, right) = (7.0, 6.0);
             let (x, y) = (w - right - tw, (h - 4.0) * 0.5);
@@ -1071,7 +1100,19 @@ impl Menu {
         let (ow, oh) = (self.popup_outer_width(), self.popup_outer_height());
         let shown = self.display_indices();
         let plain = !self.retail_button_art;
-        if plain {
+        if plain && self.theme_palette.is_some() {
+            style::popup_shadow(rc, 0.0, top, ow, oh);
+            style::surface(
+                rc,
+                0.0,
+                top,
+                ow,
+                oh,
+                style::CONTAINER_RADIUS,
+                self.plain_background_color,
+                self.plain_border_color,
+            );
+        } else if plain {
             rc.fill(0.0, top, ow, oh, self.plain_background_color);
             rc.rect_outline(0.0, top, ow, oh, self.plain_border_color, 1.0);
         } else {
@@ -1119,22 +1160,20 @@ impl Menu {
             let selected = self.selected == Some(self.items[shown[i]].payload)
                 || (self.searchable && self.hovered_popup_index == Some(i));
             if plain {
-                if selected {
-                    rc.fill(
-                        x,
-                        y,
-                        self.row_width(),
-                        self.row_height,
-                        self.plain_selected_color,
-                    );
+                let highlight = if selected {
+                    Some(self.plain_selected_color)
                 } else if self.hovered_popup_index == Some(i) {
-                    rc.fill(
-                        x,
-                        y,
-                        self.row_width(),
-                        self.row_height,
-                        self.plain_hover_color,
-                    );
+                    Some(self.plain_hover_color)
+                } else {
+                    None
+                };
+                if let Some(color) = highlight {
+                    let (rw, rh) = (self.row_width(), self.row_height);
+                    if self.theme_palette.is_some() {
+                        style::row(rc, x, y, rw, rh, color);
+                    } else {
+                        rc.fill(x, y, rw, rh, color);
+                    }
                 }
             } else {
                 let id = if selected {
@@ -1186,14 +1225,16 @@ impl Menu {
         rc.push_transform(BORDER, top + BORDER);
         self.search.draw_detached(w, h, rc);
         rc.pop_transform();
-        rc.rect_outline(
-            BORDER,
-            top + BORDER,
-            w,
-            h,
-            self.plain_open_border_color,
-            1.0,
-        );
+        if self.theme_palette.is_none() {
+            rc.rect_outline(
+                BORDER,
+                top + BORDER,
+                w,
+                h,
+                self.plain_open_border_color,
+                1.0,
+            );
+        }
         if self.search.text().is_empty() {
             let y = top + BORDER + (self.search_height() - self.line_h()) * 0.5;
             self.label(rc, "Search...", BORDER + 7.0, y, self.text_color_ghosted);
@@ -1216,6 +1257,18 @@ impl Menu {
         }
         let ih = self.interior_h();
         let (dec, inc) = self.scroll_extents();
+        if let Some(p) = self
+            .theme_palette
+            .as_ref()
+            .filter(|_| !self.retail_button_art)
+        {
+            if self.popup_scroll.has_overflow() {
+                let (ty, th) = thumb_rect(&self.popup_scroll, dec, (ih - dec - inc).max(0.0));
+                let active = self.dragging_popup_thumb;
+                style::scroll_thumb(rc, p, x, y + ty, self.scrollbar_width, th, active);
+            }
+            return;
+        }
         if !self.retail_button_art && (self.plain_popup_scrollbar || self.scroll_track_sprite == 0)
         {
             rc.fill(x, y, self.scrollbar_width, ih, self.plain_background_color);
@@ -1281,6 +1334,9 @@ impl Widget for Menu {
             return false;
         };
         let own = e.target == Some(me);
+        if own {
+            self.pointer.observe(e);
+        }
         if self.open {
             self.place_popup(ui, me);
         }
@@ -1451,7 +1507,8 @@ impl Widget for Menu {
         let Some((w, h)) = ui.element(me).map(|e| (e.width, e.height)) else {
             return;
         };
-        self.draw_closed(rc, w, h);
+        let live = ui.element(me).is_some_and(|e| e.enabled);
+        self.draw_closed(rc, w, h, live);
     }
 
     fn draw_overlay(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut RenderContext<'_>) {

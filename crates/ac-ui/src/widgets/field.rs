@@ -12,6 +12,8 @@ use std::sync::Arc;
 use crate::draw::{Color, DEFAULT_OUTLINE_COLOR, RenderContext, TextureRef};
 use crate::event::{Key, Modifiers, UiEvent, kind};
 use crate::font::UiFont;
+use crate::plugin::Palette;
+use crate::plugin::style;
 use crate::root::{ElementMessage, RecallRequest, UiOutput, UiRoot};
 use crate::text::Scrollable;
 use crate::tree::{Element, ElementId, Widget};
@@ -87,6 +89,8 @@ pub struct Field {
     pub has_submit_handler: bool,
     /// The unfocused image.
     pub background_sprite: u32,
+    /// The plugin theme the box draws in (none: a flat fill).
+    pub theme_palette: Option<Palette>,
     /// The focused left rail image.
     pub focus_rail_left_sprite: u32,
     /// Its width, pixels.
@@ -168,6 +172,7 @@ impl Default for Field {
             reports_focus_loss: false,
             has_submit_handler: false,
             background_sprite: 0,
+            theme_palette: None,
             focus_rail_left_sprite: 0,
             focus_rail_left_width: 1.0,
             focus_rail_right_sprite: 0,
@@ -877,7 +882,10 @@ impl Field {
             lit = true;
         }
         if !lit {
-            rc.fill(0.0, 0.0, w, h, self.background_color);
+            match &self.theme_palette {
+                Some(p) => style::field(rc, p, w, h, self.background_color, self.focused),
+                None => rc.fill(0.0, 0.0, w, h, self.background_color),
+            }
         }
     }
 

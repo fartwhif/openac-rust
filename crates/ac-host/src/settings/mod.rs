@@ -53,6 +53,26 @@ const QUALITY_NAMES: [(&str, QualityPreset); 5] = [
     ("Potato", QualityPreset::Potato),
 ];
 
+/// The smallest interface scale, percent.
+pub const UI_SCALE_MIN_PERCENT: i32 = 50;
+/// The largest interface scale, percent.
+pub const UI_SCALE_MAX_PERCENT: i32 = 300;
+/// The interface scale's step, percent.
+pub const UI_SCALE_STEP_PERCENT: i32 = 10;
+/// The interface scale by default: one interface unit a pixel.
+pub const UI_SCALE_DEFAULT_PERCENT: i32 = 100;
+
+/// `percent` as an interface scale the options offer: within
+/// [`UI_SCALE_MIN_PERCENT`] to [`UI_SCALE_MAX_PERCENT`], on the nearest
+/// [`UI_SCALE_STEP_PERCENT`] step (a half step rounds up).
+#[must_use]
+pub fn ui_scale_percent(percent: i32) -> i32 {
+    let clamped = percent.clamp(UI_SCALE_MIN_PERCENT, UI_SCALE_MAX_PERCENT);
+    let steps =
+        (clamped - UI_SCALE_MIN_PERCENT + UI_SCALE_STEP_PERCENT / 2) / UI_SCALE_STEP_PERCENT;
+    (UI_SCALE_MIN_PERCENT + steps * UI_SCALE_STEP_PERCENT).min(UI_SCALE_MAX_PERCENT)
+}
+
 /// How far particles are drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParticleRange {
@@ -105,6 +125,9 @@ pub struct DisplaySettings {
     pub landscape_draw_distance: i32,
     /// Building detail textures.
     pub building_detail_textures: bool,
+    /// Landscape detail textures: a fine pattern repeated over the outdoor
+    /// terrain near the player. Off by default (the game shipped it off).
+    pub landscape_detail_textures: bool,
     /// Multi-pass alpha.
     pub multi_pass_alpha: bool,
     /// Keep distant buildings.
@@ -115,6 +138,10 @@ pub struct DisplaySettings {
     pub ui_only: bool,
     /// Interface only while the window is in the background.
     pub ui_only_when_unfocused: bool,
+    /// How large the in-game interface is drawn, percent
+    /// ([`UI_SCALE_MIN_PERCENT`] to [`UI_SCALE_MAX_PERCENT`] in steps of
+    /// [`UI_SCALE_STEP_PERCENT`]; 100 is one interface unit a pixel).
+    pub ui_scale_percent: i32,
     /// The render-pack selection, kept as read (`None`: the retail pack).
     pub render_pack: Option<Node>,
 }
@@ -139,11 +166,13 @@ impl Default for DisplaySettings {
             texture_filtering: 1,
             landscape_draw_distance: 8,
             building_detail_textures: true,
+            landscape_detail_textures: false,
             multi_pass_alpha: false,
             keep_distant_buildings: true,
             potato_mode: false,
             ui_only: false,
             ui_only_when_unfocused: false,
+            ui_scale_percent: UI_SCALE_DEFAULT_PERCENT,
             render_pack: None,
         }
     }
@@ -553,11 +582,17 @@ fn read_display(d: &[Member], version: i32) -> Result<DisplaySettings, Unreadabl
             "buildingDetailTextures",
             def.building_detail_textures,
         ),
+        landscape_detail_textures: read_bool(
+            d,
+            "landscapeDetailTextures",
+            def.landscape_detail_textures,
+        ),
         multi_pass_alpha: read_bool(d, "multiPassAlpha", def.multi_pass_alpha),
         keep_distant_buildings: read_bool(d, "keepDistantBuildings", def.keep_distant_buildings),
         potato_mode: read_bool(d, "potatoMode", def.potato_mode),
         ui_only: read_bool(d, "uiOnly", def.ui_only),
         ui_only_when_unfocused: read_bool(d, "uiOnlyWhenUnfocused", def.ui_only_when_unfocused),
+        ui_scale_percent: ui_scale_percent(read_int(d, "uiScalePercent", def.ui_scale_percent)?),
         render_pack: member(d, "renderPack")
             .filter(|n| !is_retail_pack(n))
             .cloned(),
@@ -620,7 +655,7 @@ fn display_object(d: &DisplaySettings) -> String {
             out
         },
     );
-    let fields: [(&str, String); 23] = [
+    let fields: [(&str, String); 25] = [
         ("automaticDegrades", boolean(d.automatic_degrades)),
         (
             "buildingDetailTextures",
@@ -636,6 +671,10 @@ fn display_object(d: &DisplaySettings) -> String {
         ("gamma", float(d.gamma)),
         ("graphicsPerformance", float(d.graphics_performance)),
         ("keepDistantBuildings", boolean(d.keep_distant_buildings)),
+        (
+            "landscapeDetailTextures",
+            boolean(d.landscape_detail_textures),
+        ),
         (
             "landscapeDrawDistance",
             d.landscape_draw_distance.to_string(),
@@ -658,6 +697,7 @@ fn display_object(d: &DisplaySettings) -> String {
         ("textureFiltering", d.texture_filtering.to_string()),
         ("uiOnly", boolean(d.ui_only)),
         ("uiOnlyWhenUnfocused", boolean(d.ui_only_when_unfocused)),
+        ("uiScalePercent", d.ui_scale_percent.to_string()),
         ("vsync", boolean(d.vsync)),
     ];
     object_text(&fields)
@@ -751,17 +791,82 @@ mod tests {
             texture_filtering: 2,
             landscape_draw_distance: 5,
             building_detail_textures: false,
+            landscape_detail_textures: true,
             multi_pass_alpha: true,
             keep_distant_buildings: false,
             potato_mode: true,
             ui_only: true,
             ui_only_when_unfocused: true,
+            ui_scale_percent: 230,
             render_pack: None,
         };
         t.store().save_display(&original).unwrap();
         let (loaded, warning) = t.store().load_display();
         assert_eq!(warning, None);
         assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn landscape_detail_textures_default_off_and_round_trip() {
+        let t = Temp::new("landscapedetail");
+        assert!(!DisplaySettings::default().landscape_detail_textures);
+        // A file from before the option reads it as off.
+        t.write(r#"{ "version": 4, "display": { "buildingDetailTextures": true } }"#);
+        assert!(!t.store().load_display().0.landscape_detail_textures);
+        let on = DisplaySettings {
+            landscape_detail_textures: true,
+            ..DisplaySettings::default()
+        };
+        t.store().save_display(&on).unwrap();
+        let text = std::fs::read_to_string(&t.0).unwrap();
+        assert!(text.contains("\"landscapeDetailTextures\": true"), "{text}");
+        assert!(t.store().load_display().0.landscape_detail_textures);
+    }
+
+    #[test]
+    fn the_ui_scale_defaults_to_one_hundred_percent_and_round_trips() {
+        let t = Temp::new("uiscale");
+        assert_eq!(t.store().load_display().0.ui_scale_percent, 100);
+        let scaled = DisplaySettings {
+            ui_scale_percent: 150,
+            ..DisplaySettings::default()
+        };
+        t.store().save_display(&scaled).unwrap();
+        let text = std::fs::read_to_string(&t.0).unwrap();
+        assert!(text.contains("\"uiScalePercent\": 150"), "{text}");
+        assert_eq!(t.store().load_display().0.ui_scale_percent, 150);
+    }
+
+    #[test]
+    fn a_stored_ui_scale_off_the_steps_reads_as_the_nearest_offered_one() {
+        let t = Temp::new("uiscale-range");
+        for (stored, read) in [
+            (10, 50),
+            (49, 50),
+            (154, 150),
+            (155, 160),
+            (1000, 300),
+            (-5, 50),
+        ] {
+            t.write(&format!(
+                r#"{{ "version": 4, "display": {{ "uiScalePercent": {stored} }} }}"#
+            ));
+            assert_eq!(
+                t.store().load_display().0.ui_scale_percent,
+                read,
+                "{stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ui_scale_steps_are_ten_percent_from_fifty_to_three_hundred() {
+        let mut offered: Vec<i32> = (0..=400).map(ui_scale_percent).collect();
+        offered.dedup();
+        assert_eq!(offered, (50..=300).step_by(10).collect::<Vec<_>>());
+        assert_eq!(ui_scale_percent(100), 100);
+        assert_eq!(ui_scale_percent(i32::MAX), 300);
+        assert_eq!(ui_scale_percent(i32::MIN), 50);
     }
 
     #[test]

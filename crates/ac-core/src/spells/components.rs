@@ -156,7 +156,13 @@ impl SpellComponentRequirements {
             .any(|item| item.weenie_class_id == wcid && is_owned_by_player(world, &item, player_id))
     }
 
-    fn appropriate_formula_for(
+    /// The formula the player casts `formula` with: the scarab-only recipe
+    /// when components are switched off, the school is infused or the
+    /// school's focus sits directly in the player's pack; otherwise the
+    /// account's personalised recipe. For a caller that holds the spell's
+    /// formula itself (a window reading the spellbook's copy).
+    #[must_use]
+    pub fn appropriate_formula_for(
         &self,
         world: &impl SpellComponentWorld,
         formula: &SpellFormulaDefinition,

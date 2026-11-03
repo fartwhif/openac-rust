@@ -16,8 +16,8 @@ use ac_ui::draw::Color;
 use ac_ui::font::DEFAULT_FONT_ID;
 use ac_ui::import::LayoutSource;
 use ac_ui::overlay::{
-    OverlayCamera, OverlayHost, VividTargetIndicator, VividTargetInfo, WorldLabelOverlay,
-    WorldLine, WorldLineOverlay, load_vivid_target_images,
+    OverlayCamera, OverlayHost, VividTargetIndicator, VividTargetInfo, WorldIconOverlay,
+    WorldLabelOverlay, WorldLine, WorldLineOverlay, load_vivid_target_images,
 };
 use glam::{Mat4, Quat, Vec3};
 
@@ -32,6 +32,7 @@ const VIVID_TARGETING_BIT: u32 = 0x0000_8000;
 #[derive(Debug, Default)]
 pub struct Overlays {
     host: Option<OverlayHost>,
+    icons: Option<WorldIconOverlay>,
     labels: Option<WorldLabelOverlay>,
     vivid: Option<VividTargetIndicator>,
     camera: Option<OverlayCamera>,
@@ -49,6 +50,11 @@ impl Overlays {
         self.host.as_mut()
     }
 
+    /// The plugins' world icons (none before they are mounted).
+    pub(super) fn icons_mut(&mut self) -> Option<&mut WorldIconOverlay> {
+        self.icons.as_mut()
+    }
+
     /// The camera the world was last drawn with.
     pub(super) fn camera(&self) -> Option<OverlayCamera> {
         self.camera
@@ -56,15 +62,18 @@ impl Overlays {
 }
 
 impl WindowUi {
-    /// Mount the overlay band, the world labels and the vivid target
-    /// indicator.
+    /// Mount the overlay band, the world icons and labels (the labels'
+    /// text over the icons) and the vivid target indicator.
     pub(super) fn mount_overlays(&mut self) {
         let mut host = OverlayHost::mount(&mut self.host.root);
-        let labels = WorldLabelOverlay::mount(
+        let font = self.content.font(DEFAULT_FONT_ID);
+        let line_height = font.as_ref().map_or(0.0, |f| f.line_height);
+        self.status.overlays.icons = Some(WorldIconOverlay::mount(
             &mut self.host.root,
             &mut host,
-            self.content.font(DEFAULT_FONT_ID),
-        );
+            line_height,
+        ));
+        let labels = WorldLabelOverlay::mount(&mut self.host.root, &mut host, font);
         let navigation = WorldLineOverlay::mount(&mut self.host.root, &mut host, NAVIGATION_LAYER);
         self.status.overlays.host = Some(host);
         self.status.overlays.labels = Some(labels);
@@ -104,8 +113,8 @@ impl WindowUi {
     }
 
     /// One frame of the overlays. The plugins' labels follow only the
-    /// labels, their anchors and the game camera, so they stay up in portal
-    /// space as OpenAC's do.
+    /// labels, their anchors and the game camera; the window gives them no
+    /// labels while the portal view hides the world.
     pub(super) fn tick_overlays(&mut self) {
         let overlays = &mut self.status.overlays;
         let camera = overlays.camera;
@@ -248,19 +257,24 @@ pub(crate) fn placement(world: &WorldRenderer, object: &ObjectView) -> Option<Pl
 /// (by `objects`: in his packs or wielded by him), placed or held by
 /// another, its setup's selection sphere turned with it and scaled (a
 /// 0.1 m sphere at its base when the setup has none).
+///
+/// `viewport` is the framebuffer in UI units
+/// (`crate::ui_scale::UiScale::overlay_viewport`): what the camera puts at
+/// a pixel the overlays place at that pixel in units, so the UI scale
+/// draws it back over the pixel.
 pub(crate) fn world_view(
     world: &WorldRenderer,
     scene: &Scene,
     dats: &DatCollection,
     objects: &ClientObjectTable,
-    viewport: (u32, u32),
+    viewport: (f32, f32),
 ) -> (Option<OverlayCamera>, Option<VividTargetInfo>) {
     let camera = world
         .view_matrices()
         .map(|(view, projection)| OverlayCamera {
             view,
             projection,
-            viewport: (viewport.0 as f32, viewport.1 as f32),
+            viewport,
         });
     let target = (|| {
         let selected = scene.player_view()?.selected?;

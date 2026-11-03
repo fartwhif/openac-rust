@@ -422,6 +422,9 @@ pub struct InterfaceState {
     pub external_container: u32,
     /// The player is within use range of it (its window closes when not).
     pub external_container_in_range: bool,
+    /// The account name spell formulas are personalised for (the
+    /// examination window shows a spell's components by it).
+    pub account: String,
 }
 
 /// The selected object's health, for the selected-object strip.
@@ -468,6 +471,7 @@ impl InterfaceState {
             external_container,
             external_container_in_range: external_container == 0
                 || state.within_use_range(external_container),
+            account: state.gameplay.account().to_owned(),
         }
     }
 }

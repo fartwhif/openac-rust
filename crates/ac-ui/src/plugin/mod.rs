@@ -1,6 +1,6 @@
 //! Plugin UI in the window: the session's plugin windows built from their
 //! markup and kept in step with the session's copy (`ac_plugin_ui`), the
-//! plugins' canvases on the overlay band, and the plugin shelf.
+//! plugins' canvases on the overlay band, and the plugin dock.
 //!
 //! Nothing here decides anything: the session owns the plugin UI state
 //! (which values, which windows are shown, what a canvas shows), the
@@ -12,13 +12,14 @@ pub mod color;
 pub mod content_size;
 pub mod controls;
 pub mod dialog;
+pub mod dock;
 pub mod flex_box;
 pub mod fold;
 pub mod hotkeys;
 pub mod layout;
 pub mod list_ext;
 mod repeat;
-pub mod shelf;
+pub mod style;
 pub mod title_bar;
 pub mod widgets;
 
@@ -35,6 +36,7 @@ use ac_plugin_ui::markup::{
 };
 use ac_plugin_ui::{ActionValue, PanelView, Rgba, UiInput, UiValue};
 
+use crate::bundled_font::ModernFonts;
 use crate::draw::Color;
 use crate::font::UiFont;
 use crate::geometry::AnchorEdges;
@@ -50,7 +52,7 @@ pub use widgets::{
 
 /// What the player did with the plugins' UI, for the client to send to the
 /// session, oldest first. Shared by every plugin window, canvas and the
-/// shelf of one window.
+/// dock of one window.
 pub type PluginOutbox = Rc<RefCell<Vec<UiInput>>>;
 
 /// Resolves the images markup names: dat images, spell icons and live
@@ -81,6 +83,16 @@ pub enum PluginTheme {
     Moss,
     /// Warm graphite and brass.
     Brass,
+    /// Dark violet and lavender.
+    LavenderDusk,
+    /// Blue slate and orange.
+    Ember,
+    /// Dark warm grey and coral red.
+    Bloodmoon,
+    /// Blue-black and icy cyan.
+    Glacier,
+    /// Paper and ink, the one light theme.
+    Parchment,
 }
 
 impl From<ac_plugin_ui::ThemeKind> for PluginTheme {
@@ -89,6 +101,11 @@ impl From<ac_plugin_ui::ThemeKind> for PluginTheme {
             ac_plugin_ui::ThemeKind::Classic => Self::Classic,
             ac_plugin_ui::ThemeKind::Moss => Self::Moss,
             ac_plugin_ui::ThemeKind::Brass => Self::Brass,
+            ac_plugin_ui::ThemeKind::LavenderDusk => Self::LavenderDusk,
+            ac_plugin_ui::ThemeKind::Ember => Self::Ember,
+            ac_plugin_ui::ThemeKind::Bloodmoon => Self::Bloodmoon,
+            ac_plugin_ui::ThemeKind::Glacier => Self::Glacier,
+            ac_plugin_ui::ThemeKind::Parchment => Self::Parchment,
         }
     }
 }
@@ -101,6 +118,11 @@ impl PluginTheme {
             Self::Classic => None,
             Self::Moss => Some(Palette::MOSS),
             Self::Brass => Some(Palette::BRASS),
+            Self::LavenderDusk => Some(Palette::LAVENDER_DUSK),
+            Self::Ember => Some(Palette::EMBER),
+            Self::Bloodmoon => Some(Palette::BLOODMOON),
+            Self::Glacier => Some(Palette::GLACIER),
+            Self::Parchment => Some(Palette::PARCHMENT),
         }
     }
 }
@@ -148,12 +170,17 @@ fn anchors(a: Anchors) -> AnchorEdges {
 }
 
 fn read_color(src: &ColorSource, values: &dyn Values, palette: Option<&Palette>) -> Color {
-    if let ColorSource::Theme { token, classic } = src {
-        return palette
+    match src {
+        ColorSource::Theme { token, classic } => palette
             .and_then(|p| p.token(token))
-            .unwrap_or_else(|| color(*classic));
+            .unwrap_or_else(|| color(*classic)),
+        ColorSource::Paired { dark, light } => color(if palette.is_some_and(Palette::is_light) {
+            *light
+        } else {
+            *dark
+        }),
+        _ => color(src.read(values)),
     }
-    color(src.read(values))
 }
 
 fn texts(values: &dyn Values, name: &str) -> Vec<String> {
@@ -287,7 +314,7 @@ pub struct PluginPanelController {
     /// The font the window was built with.
     classic_font: Option<Arc<UiFont>>,
     /// The bundled sans font the modern themes draw text in, when loaded.
-    modern_font: Option<Arc<UiFont>>,
+    modern_fonts: Option<ModernFonts>,
     /// The title's colour without a theme (`controls.ini`'s `[title] color`,
     /// else white).
     title_color: Color,
@@ -386,7 +413,7 @@ fn absolute_group_size(w: f32, h: f32, scroll_x: bool, scroll_y: bool) -> FlexMe
 
 /// Builds the window of `view` (OpenAC `MarkupDocument.Build`): the frame
 /// at the markup's position and size, its title, an element per markup
-/// element in document order, and (for a window on the shelf) the minimize
+/// element in document order, and (for a window on the dock) the minimize
 /// button. Nothing is shown until [`PluginPanelController::sync`].
 pub fn build_panel(
     ui: &mut UiRoot,
@@ -430,6 +457,7 @@ pub fn build_panel_with_state(
                 ..crate::widgets::NineSliceFrame::default()
             },
             palette: None,
+            has_title: false,
         },
     );
     // A window with chrome or a flex layout has a content area inside the
@@ -460,7 +488,7 @@ pub fn build_panel_with_state(
         None
     } else {
         spec.title.as_ref().map(|t| {
-            let mut e = Element::at(8.0, 4.0, 0.0, 0.0);
+            let mut e = Element::at(LEGACY_TITLE_LEFT, LEGACY_TITLE_TOP, 0.0, 0.0);
             e.click_through = true;
             let mut label = MarkupLabel::new(font.clone());
             label.text.clone_from(t);
@@ -545,7 +573,7 @@ pub fn build_panel_with_state(
         shifts,
         notices: Vec::new(),
         classic_font: font.clone(),
-        modern_font: None,
+        modern_fonts: None,
         title_color: Color::WHITE,
         title_bar,
         content,
@@ -608,22 +636,22 @@ pub fn build_panel_with_state(
             && let Some(close) = ui.widget::<title_bar::TitleBar>(bar).map(|b| b.close)
             && let Some(e) = ui.element_mut(close)
         {
-            // The bar's close button takes the shelf's minimize button's
+            // The bar's close button takes the dock's minimize button's
             // place and says where the window went.
             e.runtime_tooltip_text = Some(ac_plugin_ui::chrome::DOCKED_CLOSE_TOOLTIP.to_owned());
         }
     }
     // A window with a title bar already has a close button, which does what
     // "-" would; a layout window without a bar has content right up to its
-    // border, where "-" would sit over it, and is closed from its shelf
-    // button, as the author chose no chrome.
+    // border, where "-" would sit over it, and is closed from its dock
+    // slot, as the author chose no chrome.
     let frame_width = ui.element(root).map_or(spec.rect.w, |e| e.width);
     controller.minimize = (view.descriptor.show_in_side_panel && !content_area).then(|| {
         let mut e = Element::at((frame_width - 23.0).max(8.0), 3.0, 18.0, 17.0)
             .with_anchors(AnchorEdges::TOP | AnchorEdges::RIGHT)
             .with_z_order(1);
         e.name = Some("PluginMinimize".to_owned());
-        e.runtime_tooltip_text = Some("Minimize to plugin sidepanel".to_owned());
+        e.runtime_tooltip_text = Some("Minimize to the plugin dock".to_owned());
         let button = MarkupButton {
             text: "\u{2013}".to_owned(),
             background: MINIMIZE_BACKGROUND,
@@ -639,7 +667,12 @@ pub fn build_panel_with_state(
     controller
 }
 
-/// The shelf's minimize button's fill in Classic.
+/// Where the legacy title label sits in Classic.
+const LEGACY_TITLE_LEFT: f32 = 8.0;
+/// Its top.
+const LEGACY_TITLE_TOP: f32 = 4.0;
+
+/// The minimize button's fill in Classic.
 const MINIMIZE_BACKGROUND: Color = Color::rgba(0.02, 0.02, 0.015, 0.94);
 /// Its border in Classic.
 const MINIMIZE_BORDER: Color = Color::rgba(0.58, 0.46, 0.17, 1.0);
@@ -650,11 +683,13 @@ struct NoMarkupIcons;
 
 /// The look one sync shows: the palette on a themed window under a modern
 /// theme, and with the bundled font loaded the text font and a menu's
-/// caption font for the theme (none: the fonts stay as built).
+/// caption font for the theme (none: the fonts stay as built), and the
+/// weight a list's header takes under the theme.
 #[derive(Debug, Default)]
 struct Look {
     palette: Option<Palette>,
     fonts: Option<ThemeFonts>,
+    heading: Option<Arc<UiFont>>,
 }
 
 /// A theme's text font and a menu's caption font.
@@ -680,8 +715,8 @@ impl PluginPanelController {
     /// `PluginUiThemeSettings.ModernFont`). Without it, every theme keeps
     /// the built font.
     #[must_use]
-    pub fn with_modern_font(mut self, font: Option<Arc<UiFont>>) -> Self {
-        self.modern_font = font;
+    pub fn with_modern_fonts(mut self, fonts: Option<ModernFonts>) -> Self {
+        self.modern_fonts = fonts;
         self
     }
 
@@ -707,7 +742,7 @@ impl PluginPanelController {
             .and_then(|s| s.nodes.get(&node).copied())
     }
 
-    /// The minimize button, on a window that is on the shelf.
+    /// The minimize button, on a window that is on the dock.
     #[must_use]
     pub fn minimize_button(&self) -> Option<ElementId> {
         self.minimize
@@ -856,32 +891,50 @@ impl PluginPanelController {
         // With the bundled font loaded: the text font and a menu's caption
         // font for this theme (OpenAC `PluginMarkupTheme`'s font bindings;
         // a menu is built without a caption font of its own).
-        let fonts = self.modern_font.as_ref().map(|modern| match p {
-            Some(_) => (Some(Arc::clone(modern)), Some(Arc::clone(modern))),
+        let fonts = self.modern_fonts.as_ref().map(|modern| match p {
+            Some(_) => (
+                Some(Arc::clone(&modern.regular)),
+                Some(Arc::clone(&modern.regular)),
+            ),
             None => (self.classic_font.clone(), None),
         });
         let text_font = fonts.as_ref().map(|(text, _)| text);
+        // The title weight under a theme; Classic's own font under Classic.
+        let title_font = match (&self.modern_fonts, p) {
+            (Some(modern), Some(_)) => Some(Arc::clone(&modern.semibold)),
+            _ => text_font
+                .cloned()
+                .unwrap_or_else(|| self.classic_font.clone()),
+        };
+        let has_title = self.title.is_some() || self.title_bar.is_some();
         if let Some(frame) = ui.widget_mut::<MarkupFrame>(self.root) {
             frame.palette = palette;
+            frame.has_title = has_title;
         }
-        if let Some(title) = self.title
-            && let Some(label) = ui.widget_mut::<MarkupLabel>(title)
-        {
-            label.color = p.map_or(self.title_color, |p| p.text);
-            label.outline = p.is_none();
-            if let Some(f) = text_font {
-                label.font.clone_from(f);
+        if let Some(title) = self.title {
+            let line = title_font.as_ref().map_or(14.0, |f| f.line_height);
+            if let Some(label) = ui.widget_mut::<MarkupLabel>(title) {
+                label.color = p.map_or(self.title_color, |p| p.text);
+                label.outline = p.is_none();
+                label.font.clone_from(&title_font);
+            }
+            // Under a theme the title sits in the header band.
+            let at = match p {
+                Some(_) => (
+                    title_bar::THEMED_TEXT_LEFT,
+                    ((style::HEADER_HEIGHT - line) / 2.0).round().max(0.0),
+                ),
+                None => (LEGACY_TITLE_LEFT, LEGACY_TITLE_TOP),
+            };
+            if let Some(e) = ui.element_mut(title)
+                && (e.left, e.top) != at
+            {
+                (e.left, e.top) = at;
+                ui.capture_current_anchor_baseline(title);
             }
         }
         if let Some(bar) = self.title_bar {
-            // The theme's font and text colour without outline under a
-            // theme; Classic's own font, title colour and outline back
-            // under Classic. The themed close button's "x" takes the
-            // theme's font.
-            let font = text_font
-                .cloned()
-                .unwrap_or_else(|| self.classic_font.clone());
-            title_bar::TitleBar::set_palette(ui, bar, palette, font, self.title_color);
+            title_bar::TitleBar::set_palette(ui, bar, palette, title_font, self.title_color);
         }
         if let Some(content) = self.content
             && let Some(area) = ui
@@ -893,8 +946,9 @@ impl PluginPanelController {
         if let Some(minimize) = self.minimize
             && let Some(b) = ui.widget_mut::<MarkupButton>(minimize)
         {
-            // The shelf's "-" follows the window's theme as the bar's close
-            // button does: a flat face, edge and caption in the palette.
+            // The "-" follows the window's theme as the bar's close
+            // button does: a button's face, edge and caption in the palette.
+            b.palette = palette;
             b.background = p.map_or(MINIMIZE_BACKGROUND, |p| p.field);
             b.border = p.map_or(MINIMIZE_BORDER, |p| p.border);
             b.text_color = p.map_or(Color::WHITE, |p| p.text);
@@ -903,7 +957,16 @@ impl PluginPanelController {
                 b.font.clone_from(f);
             }
         }
-        let look = Look { palette, fonts };
+        let heading = self
+            .modern_fonts
+            .as_ref()
+            .filter(|_| p.is_some())
+            .map(|m| Arc::clone(&m.semibold));
+        let look = Look {
+            palette,
+            fonts,
+            heading,
+        };
         self.sync_set(ui, repeat::WINDOW_SET, view, Some(view), icons, &look);
         self.sync_repeats(ui, repeat::WINDOW_SET, view, icons, &look);
     }
@@ -1002,6 +1065,7 @@ impl PluginPanelController {
                         w.fill = fill.read_f32(values);
                         w.label = caption;
                         w.bar_color = bar_color;
+                        w.theme_palette = palette;
                     }
                 }
                 Markup::Label { text, color: c } => {
@@ -1116,13 +1180,14 @@ impl PluginPanelController {
                         .read_f32(values)
                         .map(|v| ((v - min) / (max - min)).clamp(0.0, 1.0));
                     if let Some(w) = ui.widget_mut::<Scrollbar>(el) {
-                        // OpenAC `PluginMarkupTheme`: themed, flat in the
-                        // theme's colours; Classic, as authored.
+                        // OpenAC `PluginMarkupTheme`: themed, the plain look
+                        // in the theme's colours; Classic, as authored.
                         let classic = Scrollbar::default();
                         w.retail_art = p.is_none() && *retail_art;
                         w.plain_track_color = p.map_or(classic.plain_track_color, |p| p.field);
                         w.plain_border_color = p.map_or(classic.plain_border_color, |p| p.border);
                         w.plain_nub_color = p.map_or(classic.plain_nub_color, |p| p.muted);
+                        w.theme_palette = palette;
                         if !w.is_dragging()
                             && let Some(position) = position
                         {
@@ -1151,6 +1216,9 @@ impl PluginPanelController {
                         w.inner.follow_bound_text(&bound);
                         w.inner.background_color = bg;
                         w.inner.text_color = col;
+                        w.inner.theme_palette = palette;
+                        w.inner.selection_color =
+                            p.map_or(Field::default().selection_color, |p| p.selected);
                         if let Some(f) = text_font {
                             w.inner.font.clone_from(f);
                         }
@@ -1193,7 +1261,9 @@ impl PluginPanelController {
                             p.map_or(classic.plain_triangle_color, |p| p.muted);
                         w.plain_selected_color =
                             p.map_or(classic.plain_selected_color, |p| p.selected);
-                        w.plain_hover_color = p.map_or(classic.plain_hover_color, |p| p.selected);
+                        w.plain_hover_color =
+                            p.map_or(classic.plain_hover_color, |p| style::hover(p, p.field));
+                        w.theme_palette = palette;
                         if let Some((text, caption)) = &fonts {
                             w.font.clone_from(text);
                             w.button_font.clone_from(caption);
@@ -1283,6 +1353,7 @@ impl PluginPanelController {
                         w.row_files = list_row_files(values, body);
                         w.drawn_files = (!w.row_files.is_empty()).then(|| drawn.clone());
                         w.palette = palette;
+                        w.header_font.clone_from(&look.heading);
                         if let Some(f) = text_font {
                             w.font.clone_from(f);
                         }
@@ -1374,6 +1445,9 @@ impl PluginPanelController {
                     if let Some(w) = ui.widget_mut::<controls::MarkupNumber>(el) {
                         w.set_current(current);
                         w.inner.background_color = bg;
+                        w.inner.theme_palette = palette;
+                        w.inner.selection_color =
+                            p.map_or(Field::default().selection_color, |p| p.selected);
                         w.text_color = col;
                         w.palette = palette;
                         if let Some(f) = text_font {
@@ -1418,6 +1492,7 @@ impl PluginPanelController {
                     let bound = expanded.as_ref().map(|e| bool_value(values, e));
                     let header = ui.widget_mut::<fold::MarkupExpander>(el).map(|w| {
                         w.bound = bound;
+                        w.palette = palette;
                         w.header
                     });
                     if let Some(h) = header.and_then(|h| ui.widget_mut::<fold::ExpanderHeader>(h)) {
@@ -1767,7 +1842,15 @@ impl crate::tree::Widget for MarkupField {
     }
 
     fn draw(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut crate::draw::RenderContext<'_>) {
+        let faded =
+            self.inner.theme_palette.is_some() && !ui.element(me).is_some_and(|e| e.enabled);
+        if faded {
+            rc.push_alpha(style::DISABLED_ALPHA);
+        }
         self.inner.draw(ui, me, rc);
+        if faded {
+            rc.pop_alpha();
+        }
     }
 
     fn draw_after_children(
@@ -1814,3 +1897,7 @@ mod list_button_tests;
 mod repeat_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod theme_control_tests;
+#[cfg(test)]
+mod theme_tests;

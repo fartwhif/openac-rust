@@ -1283,6 +1283,7 @@ fn player() -> RadarPlayer {
         cell_id: 0xA9B4_0031,
         item_type: 0,
         pwd_bitfield: 0x8,
+        monarch_id: 0,
     }
 }
 
@@ -1295,8 +1296,71 @@ fn object(guid: u32, offset: Vec3, behavior: Option<RadarBehavior>) -> RadarObje
         item_type: 0,
         pwd_bitfield: 0,
         color_override: 0,
+        monarch_id: 0,
         relationship: RelationshipTraits::default(),
     }
+}
+
+#[test]
+fn an_object_sharing_the_players_monarch_is_a_square() {
+    // The radar draws a member of the player's allegiance (an object whose
+    // monarch is the player's) as a hollow box; one with another monarch,
+    // or none, stays a plus; a fellow keeps the fellowship's triangle.
+    const MONARCH: u32 = 0x5000_0777;
+    let at = |guid, monarch_id| RadarObject {
+        monarch_id,
+        pwd_bitfield: 0x8,
+        ..object(
+            guid,
+            Vec3::new(0.0, 10.0, 0.0),
+            Some(RadarBehavior::ShowAlways),
+        )
+    };
+    let scene = RadarScene {
+        player: Some(RadarPlayer {
+            monarch_id: MONARCH,
+            ..player()
+        }),
+        objects: vec![
+            at(0x20, MONARCH),
+            at(0x21, 0x5000_0778),
+            at(0x22, 0),
+            RadarObject {
+                relationship: RelationshipTraits {
+                    is_fellowship_member: true,
+                    ..RelationshipTraits::default()
+                },
+                ..at(0x23, MONARCH)
+            },
+        ],
+        ..RadarScene::default()
+    };
+    let shapes: Vec<_> = radar::build_snapshot(&scene)
+        .blips
+        .iter()
+        .map(|b| (b.object_id, b.shape))
+        .collect();
+    assert_eq!(
+        shapes,
+        [
+            (0x20, BlipShape::Box),
+            (0x21, BlipShape::Plus),
+            (0x22, BlipShape::Plus),
+            (0x23, BlipShape::InvertedTriangle),
+        ]
+    );
+    // A player in no allegiance: nobody without a monarch is "his".
+    let alone = RadarScene {
+        player: Some(player()),
+        ..scene
+    };
+    assert!(
+        radar::build_snapshot(&alone)
+            .blips
+            .iter()
+            .filter(|b| b.object_id != 0x23)
+            .all(|b| b.shape == BlipShape::Plus)
+    );
 }
 
 #[test]
@@ -1323,7 +1387,8 @@ fn a_scene_projects_into_blips_around_the_player() {
             ),
             RadarObject {
                 name: None,
-                pwd_bitfield: 0x8000_0000,
+                // Hidden from the UI: no blip.
+                pwd_bitfield: 0x0000_0080,
                 ..object(
                     0x14,
                     Vec3::new(1.0, 0.0, 0.0),

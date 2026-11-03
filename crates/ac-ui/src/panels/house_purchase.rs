@@ -421,7 +421,7 @@ fn populate(
         let mut slot = ItemSlot {
             slot_index: i32::try_from(index).unwrap_or(i32::MAX),
             allow_drag_source: true,
-            source_kind: ItemDragSource::Inventory,
+            source_kind: ItemDragSource::Vendor,
             ..ItemSlot::default()
         };
         fill_slot(&mut slot, Some(item), items, icons);

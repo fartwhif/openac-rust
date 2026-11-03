@@ -351,9 +351,53 @@ fn the_camera_section_round_trips_use_mouse_turning() {
         align_to_slope: false,
         invert_mouse_look_y_axis: true,
         use_mouse_turning: true,
+        modern_mouse_turning: false,
+        both_mouse_buttons_run_forward: false,
     };
     store.save_camera_turning(&original).unwrap();
     assert_eq!(store.load_camera_turning(), (original, None));
+}
+
+#[test]
+fn modern_mouse_turning_is_off_by_default_and_round_trips_under_openacs_keys() {
+    let d = CameraTurningSettings::default();
+    assert!(!d.modern_mouse_turning);
+    assert!(!d.both_mouse_buttons_run_forward);
+
+    let t = Temp::new("camera-modern");
+    let store = t.store();
+    let modern = CameraTurningSettings {
+        modern_mouse_turning: true,
+        both_mouse_buttons_run_forward: true,
+        ..d
+    };
+    store.save_camera_turning(&modern).unwrap();
+    let raw = t.raw();
+    assert!(raw.contains("\"modernMouseTurning\": true"), "{raw}");
+    assert!(
+        raw.contains("\"bothMouseButtonsRunForward\": true"),
+        "{raw}"
+    );
+    assert_eq!(store.load_camera_turning(), (modern, None));
+
+    // A file written before the options existed reads them as off.
+    t.write(r#"{ "cameraTurning": { "stiffness": 0.6, "useMouseTurning": true } }"#);
+    let (old, error) = store.load_camera_turning();
+    assert_eq!(error, None);
+    assert!(old.use_mouse_turning);
+    assert!(!old.modern_mouse_turning && !old.both_mouse_buttons_run_forward);
+}
+
+#[test]
+fn the_mouse_turning_macro_leaves_modern_mouse_turning_alone() {
+    let current = CameraTurningSettings {
+        modern_mouse_turning: true,
+        both_mouse_buttons_run_forward: true,
+        ..CameraTurningSettings::default()
+    };
+    let r = mouse_turning_macro(&current, false);
+    assert!(r.updated.modern_mouse_turning);
+    assert!(r.updated.both_mouse_buttons_run_forward);
 }
 
 // -- sections together ------------------------------------------------------
@@ -501,6 +545,44 @@ fn misc_round_trips_and_falls_back_per_field() {
 }
 
 #[test]
+fn the_plugin_dock_defaults_to_floating_and_persists_beside_the_theme() {
+    let t = Temp::new("plugin-dock");
+    let store = t.store();
+    assert_eq!(store.load_plugin_ui().0.dock, "floating");
+    let moss = PluginUiSettings {
+        theme: "Moss".into(),
+        dock: "right".into(),
+        dock_size: "bigger".into(),
+        dock_opens: "hover".into(),
+        dock_slots: 7,
+    };
+    store.save_plugin_ui(&moss).unwrap();
+    assert_eq!(store.load_plugin_ui().0, moss);
+    assert_eq!(store.load_player().0.plugin_ui, moss);
+    let brass = PluginUiSettings {
+        theme: "Brass".into(),
+        ..moss
+    };
+    store.save_plugin_ui(&brass).unwrap();
+    assert_eq!(store.load_plugin_ui().0.dock, "right");
+    assert_eq!(store.load_plugin_ui().0.dock_size, "bigger");
+    assert_eq!(store.load_plugin_ui().0.dock_opens, "hover");
+    assert_eq!(store.load_plugin_ui().0.dock_slots, 7);
+}
+
+#[test]
+fn a_settings_file_from_before_the_dock_loads_as_floating_and_keeps_its_theme() {
+    let t = Temp::new("plugin-dock-old");
+    t.write(r#"{"pluginUi":{"theme":"Brass"}}"#);
+    let loaded = t.store().load_plugin_ui().0;
+    assert_eq!(loaded.theme, "Brass");
+    assert_eq!(loaded.dock, "floating");
+    assert_eq!(loaded.dock_size, "default");
+    assert_eq!(loaded.dock_opens, "click");
+    assert_eq!(loaded.dock_slots, 0);
+}
+
+#[test]
 fn the_plugin_theme_persists_without_replacing_other_settings() {
     // PluginUiThemeTests.ThemePersistsWithoutReplacingOtherSettings.
     let t = Temp::new("plugin-ui");
@@ -510,6 +592,7 @@ fn the_plugin_theme_persists_without_replacing_other_settings() {
     store
         .save_plugin_ui(&PluginUiSettings {
             theme: "Brass".into(),
+            ..PluginUiSettings::default()
         })
         .unwrap();
     assert_eq!(store.load_plugin_ui().0.theme, "Brass");

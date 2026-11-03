@@ -198,12 +198,16 @@ fn shown(root: &UiRoot, id: ElementId) -> bool {
     true
 }
 
-/// The pixel size and laid-out aspect of a viewport element; `None` for
-/// one with no area.
-fn extent(root: &UiRoot, id: ElementId) -> Option<((u32, u32), f32)> {
+/// The pixel size and laid-out aspect of a viewport element, its texture
+/// drawn at `pixels_per_unit` framebuffer pixels a UI unit (two on Retina);
+/// `None` for one with no area.
+fn extent(root: &UiRoot, id: ElementId, pixels_per_unit: f32) -> Option<((u32, u32), f32)> {
     let e = root.element(id)?;
     let (sx, sy) = root.canvas_scale();
-    let (w, h) = ((e.width * sx).round(), (e.height * sy).round());
+    let (w, h) = (
+        (e.width * sx * pixels_per_unit).round(),
+        (e.height * sy * pixels_per_unit).round(),
+    );
     (w >= 1.0 && h >= 1.0 && e.width > 0.0 && e.height > 0.0)
         .then(|| ((w as u32, h as u32), e.width / e.height))
 }
@@ -217,10 +221,12 @@ impl WindowUi {
     }
 
     /// The viewports that show this frame and what each shows, and the
-    /// creation preview's button presses since the last frame.
+    /// creation preview's button presses since the last frame. Their textures
+    /// have `pixels_per_unit` texels a UI unit.
     pub fn viewport_requests(
         &mut self,
         scene: &Scene,
+        pixels_per_unit: f32,
     ) -> (Vec<ViewportRequest>, Vec<PreviewRequest>) {
         let mut requests = Vec::new();
         let root_frame = |ui: &UiRoot, name: &str| ui.window(name).map(|w| w.frame);
@@ -231,7 +237,7 @@ impl WindowUi {
             .filter(|id| root.widget::<Viewport>(*id).is_some());
         if let Some(id) = doll
             && shown(root, id)
-            && let Some((size, aspect)) = extent(root, id)
+            && let Some((size, aspect)) = extent(root, id, pixels_per_unit)
         {
             requests.push((
                 id,
@@ -260,7 +266,7 @@ impl WindowUi {
             .filter(|id| root.widget::<Viewport>(*id).is_some());
         if let (Some(guid), Some(id)) = (examined, portrait)
             && shown(root, id)
-            && let Some((size, aspect)) = extent(root, id)
+            && let Some((size, aspect)) = extent(root, id, pixels_per_unit)
         {
             requests.push((
                 id,
@@ -283,7 +289,7 @@ impl WindowUi {
         };
         if let (Some(preview), Some(options)) = (preview, scene.pregame().options.clone())
             && shown(&self.host.root, preview.viewport)
-            && let Some((size, aspect)) = extent(&self.host.root, preview.viewport)
+            && let Some((size, aspect)) = extent(&self.host.root, preview.viewport, pixels_per_unit)
             && let Some(look) = self.viewports.look(&options, &preview)
         {
             requests.push((
@@ -357,6 +363,21 @@ impl WindowUi {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_viewport_texture_has_a_texel_for_every_framebuffer_pixel_it_covers() {
+        let mut ui = UiRoot::new();
+        ui.set_size(800.0, 600.0);
+        let root = ui.root();
+        let id = ui.add(
+            root,
+            ac_ui::tree::Element::at(10.0, 10.0, 120.0, 200.0),
+            Viewport::default(),
+        );
+        assert_eq!(extent(&ui, id, 1.0), Some(((120, 200), 0.6)));
+        // A Retina window: two pixels a UI unit, the same laid-out aspect.
+        assert_eq!(extent(&ui, id, 2.0), Some(((240, 400), 0.6)));
+    }
 
     #[test]
     fn every_choice_reaches_the_composition() {

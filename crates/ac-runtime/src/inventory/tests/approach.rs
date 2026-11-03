@@ -164,7 +164,10 @@ fn a_walk_that_never_arrives_is_given_up_on() {
     assert!(f.sent().is_empty());
     assert_eq!(
         f.notices(),
-        [Notice::Interface(APPROACH_NEVER_COMPLETED.into())]
+        [
+            Notice::Interface("Approaching Town Crier".into()),
+            Notice::Interface(APPROACH_NEVER_COMPLETED.into())
+        ]
     );
     assert!(f.inventory.is_ready(true));
     f.now_ms += 1_000;

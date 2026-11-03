@@ -27,7 +27,7 @@ use ac_ui::panels::appraisal::{
     self, AppraisalController, AppraisalNames, AppraisalPage, ItemAppraisalReport, NameTables,
     NoNames, ReportFragment, ReportStyle, Separator, SpellExamineComponent,
 };
-use ac_ui::widgets::{Button, CatalogSlot, ScrollSource, Scrollbar, Text};
+use ac_ui::widgets::{Button, CatalogSlot, DatElement, ScrollSource, Scrollbar, Text};
 use common::items::*;
 use common::*;
 
@@ -62,9 +62,48 @@ fn none(_: u32) -> Option<SpellMetadata> {
     None
 }
 
-/// No row templates (the item and spell pages build none).
+/// No row templates (the item page builds none).
 fn no_rows(_: &mut ac_ui::root::UiRoot, _: u32, _: u32) -> Option<ElementId> {
     None
+}
+
+/// The spell page's component cell as the examination layout authors it:
+/// a 20 by 20 image with the missing overlay as its one child.
+fn component_cells(ui: &mut ac_ui::root::UiRoot, layout: u32, element: u32) -> Option<ElementId> {
+    if (layout, element) != (appraisal::LAYOUT_ID, appraisal::SPELL_COMPONENT_TEMPLATE_ID) {
+        return None;
+    }
+    let dat = |id: u32| {
+        let mut e = at(0.0, 0.0, 20.0, 20.0);
+        e.dat_element_id = id;
+        let info = Arc::new(ac_ui::element_info::ElementInfo {
+            id,
+            width: 20.0,
+            height: 20.0,
+            ..ac_ui::element_info::ElementInfo::default()
+        });
+        (e, DatElement::new(info))
+    };
+    let (e, d) = dat(appraisal::SPELL_COMPONENT_TEMPLATE_ID);
+    let cell = ui.insert(e, d);
+    let (e, d) = dat(appraisal::SPELL_COMPONENT_MISSING_ID);
+    ui.add(cell, e, d);
+    Some(cell)
+}
+
+/// Whether each cell's missing overlay shows.
+fn missing_overlays(w: &Window, cells: &[ElementId]) -> Vec<bool> {
+    cells
+        .iter()
+        .map(|&c| {
+            let m = w
+                .host
+                .root
+                .find_descendant(c, appraisal::SPELL_COMPONENT_MISSING_ID)
+                .unwrap();
+            w.host.root.element(m).unwrap().visible
+        })
+        .collect()
 }
 
 fn object(id: u32, name: &str, t: ItemType) -> ClientObject {
@@ -1082,6 +1121,7 @@ fn examining_a_spell_shows_the_spell_page() {
             Some(TextureRef::Runtime(42 + 1_000)),
             200,
             &components,
+            &mut component_cells,
         );
     });
     assert_eq!(w.with(|c, _| c.page()), AppraisalPage::Spell);
@@ -1123,15 +1163,18 @@ fn examining_a_spell_shows_the_spell_page() {
     let cells = w.with(|c, _| c.formula_cells().to_vec());
     let icons: Vec<_> = cells
         .iter()
-        .map(|c| w.host.root.widget::<CatalogSlot>(*c).unwrap().icon)
+        .map(|c| w.host.root.widget::<DatElement>(*c).unwrap().runtime_image)
         .collect();
     assert_eq!(
         icons,
         [
-            Some(TextureRef::Runtime(0x0600_0010 + 2_000)),
-            Some(TextureRef::Runtime(0x0600_0011 + 2_000))
+            Some(Some(TextureRef::Runtime(0x0600_0010 + 2_000))),
+            Some(Some(TextureRef::Runtime(0x0600_0011 + 2_000)))
         ]
     );
+    // SpellExamineComponentTemplateFactoryTests: the missing overlay shows
+    // over the herb the player does not carry, not over the scarab.
+    assert_eq!(missing_overlays(&w, &cells), [false, true]);
     // The row is centred on the authored cell.
     let f = w
         .host
@@ -1139,6 +1182,66 @@ fn examining_a_spell_shows_the_spell_page() {
         .element(w.ids[&appraisal::SPELL_FORMULA_LIST_ID])
         .unwrap();
     assert_eq!((f.left, f.width), (180.0, 40.0));
+}
+
+// OpenAC `AppraisalUiController.RefreshSpellComponents`: an item change
+// while the spell page shows lists the components again and rebuilds the
+// formula, leaving the rest of the page; on another page, or for another
+// spell, nothing changes.
+#[test]
+fn an_item_change_refreshes_the_examined_spell_s_components() {
+    let mut w = window();
+    let m = examined_spell();
+    let component = |name: &str, icon: u32, owned| SpellExamineComponent {
+        name: name.into(),
+        icon: Some(TextureRef::Runtime(icon)),
+        owned,
+    };
+    let before = [
+        component("Lead Scarab", 1, true),
+        component("Malar Herb", 2, false),
+    ];
+    w.with(|c, ui| c.examine_spell(ui, &m, None, 200, &before, &mut component_cells));
+    let after = [
+        component("Lead Scarab", 1, true),
+        component("Prismatic Taper", 3, true),
+    ];
+    let mut other = m.clone();
+    other.spell_id = 43;
+    w.with(|c, ui| c.refresh_spell_components(ui, &other, &after, &mut component_cells));
+    assert!(
+        w.lines(appraisal::SPELL_DISPLAY_TEXT_ID)
+            .iter()
+            .any(|l| l.contains("Malar Herb")),
+        "another spell's refresh leaves the page"
+    );
+    w.with(|c, ui| c.refresh_spell_components(ui, &m, &after, &mut component_cells));
+    let display = w.lines(appraisal::SPELL_DISPLAY_TEXT_ID).join("\n");
+    assert!(display.contains("Prismatic Taper"), "{display}");
+    assert!(!display.contains("Malar Herb"), "{display}");
+    assert_eq!(w.lines(appraisal::TITLE_ID), ["Incantation of Test"]);
+    let cells = w.with(|c, _| c.formula_cells().to_vec());
+    assert_eq!(missing_overlays(&w, &cells), [false, false]);
+    // Without the authored cell the row holds no cells and goes back to
+    // its authored place.
+    w.with(|c, ui| c.refresh_spell_components(ui, &m, &after, &mut no_rows));
+    assert!(w.with(|c, _| c.formula_cells().is_empty()));
+    let f = w
+        .host
+        .root
+        .element(w.ids[&appraisal::SPELL_FORMULA_LIST_ID])
+        .unwrap();
+    assert_eq!((f.left, f.width), (190.0, 20.0));
+    // On the item page the spell's components are not shown again.
+    w.apply(parsed(|a| a.guid = 0x5000_0001), &NoNames);
+    assert_eq!(w.with(|c, _| c.page()), AppraisalPage::Item);
+    w.with(|c, ui| c.refresh_spell_components(ui, &m, &before, &mut component_cells));
+    assert_eq!(w.with(|c, _| c.page()), AppraisalPage::Item);
+    assert!(
+        !w.lines(appraisal::SPELL_DISPLAY_TEXT_ID)
+            .join("\n")
+            .contains("Malar Herb")
+    );
 }
 
 #[test]
@@ -1493,7 +1596,7 @@ mod real_dats {
         assert_eq!(lines[0], "Value: 1,250");
         assert!(lines.iter().any(|l| l.contains("finely balanced")));
         host.with_controller::<AppraisalController, _>("examine", |w, ui| {
-            w.examine_spell(ui, &examined_spell(), None, 200, &[]);
+            w.examine_spell(ui, &examined_spell(), None, 200, &[], &mut no_rows);
         });
         let spell = layout.find(appraisal::SPELL_PANEL_ID).unwrap();
         assert!(host.root.element(spell).unwrap().visible);

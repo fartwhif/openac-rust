@@ -338,6 +338,58 @@ fn a_text_class_is_always_text_with_or_without_media() {
     assert!(is::<Text>(&ui, id));
 }
 
+/// The lines an authored text lays out at its own width (no font: eight
+/// pixels a character).
+fn authored_lines(one_line: Option<bool>, text: &str) -> Vec<String> {
+    let mut properties = vec![(0x17, string_info(42))];
+    if let Some(v) = one_line {
+        properties.push((0x20, PropertyValue::Bool(v)));
+    }
+    let info = text_info(&properties);
+    let (mut ui, id) = create_with(&info, &strings(&[(42, text)]));
+    let width = element(&ui, id).width;
+    let t = ui.widget_mut::<Text>(id).unwrap();
+    t.refresh_lines(width)
+        .iter()
+        .map(|l| l.text.clone())
+        .collect()
+}
+
+#[test]
+fn authored_text_wraps_to_the_element_unless_it_is_one_line() {
+    // 100 pixels wide: twelve characters a line.
+    let text = "From this screen you can modify";
+    assert_eq!(
+        authored_lines(None, text),
+        ["From this", "screen you", "can modify"]
+    );
+    assert_eq!(
+        authored_lines(Some(false), text),
+        ["From this", "screen you", "can modify"]
+    );
+    assert_eq!(authored_lines(Some(true), text), [text]);
+    assert_eq!(authored_lines(None, "Fits"), ["Fits"]);
+}
+
+#[test]
+fn a_state_string_wraps_like_the_direct_one() {
+    let mut info = text_info(&[(0x17, string_info(42))]);
+    let mut state = StateInfo::named(0x1000_0019, "Locked");
+    state.properties.set_value(0x17, string_info(43));
+    info.states.push((0x1000_0019, state));
+    let source = strings(&[(42, "Short"), (43, "From this screen you can modify")]);
+    let (mut ui, id) = create_with(&info, &source);
+    ui.set_retail_state(id, 0x1000_0019);
+    let width = element(&ui, id).width;
+    let t = ui.widget_mut::<Text>(id).unwrap();
+    let lines: Vec<String> = t
+        .refresh_lines(width)
+        .iter()
+        .map(|l| l.text.clone())
+        .collect();
+    assert_eq!(lines, ["From this", "screen you", "can modify"]);
+}
+
 // ── Geometry ──────────────────────────────────────────────────────────────
 
 #[test]

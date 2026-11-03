@@ -31,7 +31,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        # macos-latest is an Apple-silicon (arm64) image.
+        os: [windows-latest, ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -70,5 +71,15 @@ jobs:
 
       - name: Check (Linux)
         if: runner.os == 'Linux'
+        shell: bash
+        run: sh scripts/check.sh
+
+      # Nothing to install: the image's Xcode command-line tools give the C
+      # compiler (wasmtime's helper file), TLS is the system Security
+      # framework, audio CoreAudio and graphics Metal, all linked from the OS.
+      # The GPU tests use the image's Metal device if it has one; a test that
+      # finds no adapter (or needs Vulkan) skips itself, as on the Linux image.
+      - name: Check (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: sh scripts/check.sh

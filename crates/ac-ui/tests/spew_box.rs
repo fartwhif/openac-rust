@@ -287,3 +287,109 @@ fn the_revision_follows_the_state() {
     spew_box::lines(&mut state, 0.0);
     assert!(state.revision() > initial);
 }
+
+#[test]
+fn a_use_line_and_the_line_before_it_both_show_newest_on_top() {
+    // A locked chest's click queues "The %s is locked" and then "Using the
+    // %s" in one frame; both show, the newer on top and the older just
+    // below it, each for its own lifetime.
+    let mut ui = root(1024.0, 768.0);
+    let c = SpewBoxController::mount(&mut ui, None);
+    c.enqueue(&mut ui, "The Legendary Chest is locked");
+    c.enqueue(&mut ui, "Using the Legendary Chest");
+    tick(&mut ui, 1000);
+    assert_eq!(
+        texts(&c, &ui),
+        ["Using the Legendary Chest", "The Legendary Chest is locked"]
+    );
+    c.enqueue(&mut ui, "Approaching Town Crier");
+    tick(&mut ui, 3000);
+    assert_eq!(
+        texts(&c, &ui),
+        [
+            "Approaching Town Crier",
+            "Using the Legendary Chest",
+            "The Legendary Chest is locked"
+        ]
+    );
+    // The first two go together five seconds after they showed; the
+    // newest stays two seconds longer.
+    tick(&mut ui, 6001);
+    assert_eq!(texts(&c, &ui), ["Approaching Town Crier"]);
+    tick(&mut ui, 8001);
+    assert!(texts(&c, &ui).is_empty());
+}
+
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_box_keeps_the_authored_line_count_and_line_lifetime() {
+    // Golden values: the local dat's status-box layout 0x21000011. Its list
+    // (0x10000049) holds at most 4 lines (property 0x10000028), and its
+    // line template (0x1000004A) starts in state 0x10000002, whose media
+    // program is a pause of exactly 5 seconds and then the element message
+    // 0x10000003 that removes the line: no fade, no movement.
+    use ac_dat::DatCollection;
+    use ac_dat::objects::{
+        ElementDesc, LayoutDesc, MASTER_PROPERTY_ID, MasterProperty, Media, PropertyValue,
+    };
+
+    fn find(e: &ElementDesc, id: u32) -> Option<&ElementDesc> {
+        if e.element_id == id {
+            return Some(e);
+        }
+        e.children.iter().find_map(|(_, c)| find(c, id))
+    }
+
+    let dir = std::env::var_os("OPENAC_DAT_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(ac_dat::default_dat_dir)
+        .expect("no dat directory: set OPENAC_DAT_DIR");
+    let dats = DatCollection::open(dir).unwrap();
+    let master: MasterProperty = dats.get(MASTER_PROPERTY_ID).unwrap().unwrap();
+    let layout = LayoutDesc::read(&dats.local, &master, 0x2100_0011)
+        .unwrap()
+        .expect("the status-box layout");
+    let element = |id| {
+        layout
+            .elements
+            .iter()
+            .find_map(|(_, e)| find(e, id))
+            .expect("the element")
+    };
+
+    let list = element(0x1000_0049);
+    let max_items = list
+        .state_desc
+        .property(0x1000_0028)
+        .map(|p| p.value.clone());
+    assert_eq!(
+        max_items,
+        Some(PropertyValue::Integer(
+            i32::try_from(MAX_CONCURRENT_ITEMS).unwrap()
+        ))
+    );
+
+    let line = element(0x1000_004A);
+    assert_eq!(line.default_state, 0x1000_0002);
+    let (_, state) = line
+        .states
+        .iter()
+        .find(|(id, _)| *id == line.default_state)
+        .expect("the line's start state");
+    let program: Vec<&Media> = state.media.iter().map(|m| &m.media).collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let lifetime = DEFAULT_LIFETIME_SECONDS as f32;
+    assert_eq!(
+        program,
+        [
+            &Media::Pause {
+                min_duration: lifetime,
+                max_duration: lifetime,
+            },
+            &Media::Message {
+                id: 0x1000_0003,
+                probability: 1.0,
+            },
+        ]
+    );
+}

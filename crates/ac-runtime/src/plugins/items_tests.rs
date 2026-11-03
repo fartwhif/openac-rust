@@ -1262,3 +1262,529 @@ fn an_item_inside_a_corpse_reports_the_colours_it_would_on_the_ground() {
         }
     );
 }
+
+/// A chest on the ground holding a ruby and an emerald (its loose items, in
+/// that order) and a sack with a pearl in it.
+const CHEST: u32 = 0x7000_00C1;
+const RUBY: u32 = 0x8000_00C2;
+const EMERALD: u32 = 0x8000_00C3;
+const SACK: u32 = 0x8000_00C4;
+const PEARL: u32 = 0x8000_00C5;
+
+/// [`open_chest_of`] with room to spare.
+fn with_open_chest() -> (SessionState, Outbox) {
+    open_chest_of(24)
+}
+
+/// [`packed`] with [`CHEST`] (taking `capacity` loose items) open: its use
+/// answered and its contents listed. The outbox is emptied.
+fn open_chest_of(capacity: i8) -> (SessionState, Outbox) {
+    open_chest(capacity, false)
+}
+
+/// [`open_chest_of`], with the chest's listing arriving before or after its
+/// items' descriptions (`listed_first`: the server's order on an open).
+fn open_chest(capacity: i8, listed_first: bool) -> (SessionState, Outbox) {
+    use ac_core::items::{ItemType, ItemUseable, PublicWeenieFlags};
+    use ac_proto::{GameEventType, Inbound};
+
+    use crate::inventory::{ItemCommand, ObjectRef};
+    use crate::session::SessionCommand;
+    use crate::world::tests::{create, game_event, position, stamps};
+
+    let mut state = packed();
+    let mut outbox = Outbox::new();
+    let mut chest = create(CHEST, stamps(1, 1), Some(position(0xA9B4_0031, 5.0)));
+    if let Inbound::CreateObject(create) = &mut chest {
+        create.weenie = Some(ac_proto::PublicWeenieDesc {
+            name: "Chest".into(),
+            item_type: ItemType::CONTAINER.bits(),
+            object_description_flags: PublicWeenieFlags::OPENABLE.bits(),
+            useability: Some(ItemUseable::REMOTE.bits()),
+            items_capacity: Some(capacity),
+            containers_capacity: Some(4),
+            ..ac_proto::PublicWeenieDesc::default()
+        });
+    }
+    state.apply(&chest, &mut outbox, true, CLOCKS);
+    let describe_items = |state: &mut SessionState, outbox: &mut Outbox| {
+        for (guid, name, item_type, container, items) in [
+            (RUBY, "Ruby", ItemType::GEM, CHEST, None),
+            (EMERALD, "Emerald", ItemType::GEM, CHEST, None),
+            (SACK, "Sack", ItemType::CONTAINER, CHEST, Some(8)),
+            (PEARL, "Pearl", ItemType::GEM, SACK, None),
+        ] {
+            let mut item = create(guid, stamps(1, 1), None);
+            if let Inbound::CreateObject(create) = &mut item {
+                create.weenie = Some(ac_proto::PublicWeenieDesc {
+                    name: name.into(),
+                    item_type: item_type.bits(),
+                    container_id: Some(container),
+                    items_capacity: items,
+                    ..ac_proto::PublicWeenieDesc::default()
+                });
+            }
+            state.apply(&item, outbox, true, CLOCKS);
+        }
+    };
+    if !listed_first {
+        describe_items(&mut state, &mut outbox);
+    }
+    state.command(
+        SessionCommand::Item(ItemCommand::Use(ObjectRef::Guid(CHEST))),
+        &mut outbox,
+        true,
+        CLOCKS,
+    );
+    for (event, payload) in [
+        (
+            GameEventType::VIEW_CONTENTS,
+            &[CHEST, 3, RUBY, 0, EMERALD, 0, SACK, 1][..],
+        ),
+        (GameEventType::USE_DONE, &[0][..]),
+    ] {
+        let body = game_event(event, payload);
+        state.apply(&Inbound::parse(&body).unwrap(), &mut outbox, true, CLOCKS);
+    }
+    if listed_first {
+        describe_items(&mut state, &mut outbox);
+    }
+    assert_eq!(
+        state.inventory.external_containers().current_container_id(),
+        CHEST
+    );
+    assert_eq!(
+        state.world.items().get_contents(CHEST),
+        [RUBY, EMERALD, SACK]
+    );
+    assert_eq!(state.world.items().get_contents(SACK), [PEARL]);
+    outbox.drain().for_each(drop);
+    (state, outbox)
+}
+
+fn put(object_id: u32, container_id: u32, amount: u32, placement: i32) -> MoveRequest {
+    MoveRequest {
+        object_id,
+        container_id,
+        amount,
+        placement,
+    }
+}
+
+/// What went out, as message bodies.
+fn sent(outbox: &mut Outbox) -> Vec<Vec<u8>> {
+    outbox.drain().map(|o| o.body).collect()
+}
+
+// A put into the open container needs one open, and names it.
+#[test]
+fn a_put_with_no_container_open_is_an_invalid_target() {
+    let mut state = packed();
+    let mut outbox = Outbox::new();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidTarget);
+        let result = call::<calls::LootPut>(b, &put(GEM, 0, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidTarget);
+    });
+    assert!(outbox.is_empty());
+}
+
+#[test]
+fn a_put_into_a_container_that_is_not_the_open_one_is_an_invalid_target() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, PLAYER, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidTarget);
+        let result = call::<calls::LootPut>(b, &put(GEM, 0x9999, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidTarget);
+    });
+    assert!(outbox.is_empty());
+}
+
+// The item is the character's own or already in the open container.
+#[test]
+fn a_put_of_an_item_neither_owned_nor_in_the_open_container_is_an_invalid_item() {
+    let (mut state, mut outbox) = with_open_chest();
+    state.world.apply(&crate::world::tests::create(
+        LOOSE,
+        crate::world::tests::stamps(1, 1),
+        Some(crate::world::tests::position(0xA9B4_0031, 7.0)),
+    ));
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(LOOSE, CHEST, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidItem);
+        let result = call::<calls::LootPut>(b, &put(0x9999, CHEST, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidItem);
+        let result = call::<calls::LootPut>(b, &put(CHEST, CHEST, 0, 3));
+        assert_eq!(result.status, ItemStatus::InvalidItem);
+    });
+    assert!(outbox.is_empty());
+}
+
+// The whole stack goes as the container window's drop does: a put into the
+// chest at that slot.
+#[test]
+fn a_whole_owned_stack_is_put_into_the_open_chest_at_its_slot() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 3));
+        assert_eq!(result.status, ItemStatus::Started);
+    });
+    assert_eq!(
+        sent(&mut outbox),
+        [ac_proto::inventory::build_put_item_in_container(
+            2, GEM, CHEST, 3
+        )]
+    );
+}
+
+// Part of a stack splits off into the chest at the slot.
+#[test]
+fn part_of_an_owned_stack_splits_into_the_open_chest() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 2, 3));
+        assert_eq!(result.status, ItemStatus::Started);
+    });
+    assert_eq!(
+        sent(&mut outbox),
+        [ac_proto::inventory::build_stackable_split_to_container(
+            2, GEM, CHEST, 3, 2
+        )]
+    );
+}
+
+// An item already in the chest moves to another slot of it.
+#[test]
+fn an_item_in_the_open_chest_is_reordered_within_it() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(RUBY, CHEST, 0, 1));
+        assert_eq!(result.status, ItemStatus::Started);
+    });
+    assert_eq!(
+        sent(&mut outbox),
+        [ac_proto::inventory::build_put_item_in_container(
+            2, RUBY, CHEST, 1
+        )]
+    );
+}
+
+// One request at a time: a second put while the first is in flight is
+// busy and sends nothing more.
+#[test]
+fn a_put_while_a_request_is_in_flight_is_busy() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let first = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 3));
+        assert_eq!(first.status, ItemStatus::Started);
+        let second = call::<calls::LootPut>(b, &put(RUBY, CHEST, 0, 1));
+        assert_eq!(second.status, ItemStatus::Busy);
+    });
+    assert_eq!(sent(&mut outbox).len(), 1);
+}
+
+#[test]
+fn a_put_of_more_than_the_stack_is_refused() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 6, 3));
+        assert_eq!(result.status, ItemStatus::Refused);
+        assert_eq!(result.notice.as_deref(), Some("Invalid stack quantity."));
+    });
+    assert!(outbox.is_empty());
+}
+
+// The open container's window takes only its own loose items for a
+// reorder: a pack in it, or an item inside such a pack, is not one.
+#[test]
+fn a_pack_in_the_open_chest_or_an_item_inside_it_is_an_invalid_item() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(PEARL, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::InvalidItem);
+        let result = call::<calls::LootPut>(b, &put(SACK, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::InvalidItem);
+    });
+    assert!(outbox.is_empty());
+}
+
+// The window refuses a pack dropped on the container's item list, in its
+// own words, and sends nothing.
+#[test]
+fn an_owned_pack_is_refused_as_the_window_refuses_it() {
+    const POUCH: u32 = 0x8000_0030;
+    let (mut state, mut outbox) = with_open_chest();
+    state.world.apply(&owned(POUCH, "Pouch", 0x200, |w| {
+        w.items_capacity = Some(8);
+        w.stack_size = None;
+    }));
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(POUCH, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::Refused);
+        assert_eq!(
+            result.notice.as_deref(),
+            Some("The Chest can fit no more containers!")
+        );
+    });
+    assert!(outbox.is_empty());
+}
+
+// A chest with no free item slot takes nothing more, but still lets its own
+// items be reordered.
+#[test]
+fn a_full_chest_refuses_a_new_item_but_takes_a_reorder() {
+    let (mut state, mut outbox) = open_chest_of(2);
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::Refused);
+        assert_eq!(
+            result.notice.as_deref(),
+            Some("The Chest is completely full!")
+        );
+    });
+    assert!(outbox.is_empty());
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(EMERALD, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::Started);
+    });
+    assert_eq!(
+        sent(&mut outbox),
+        [ac_proto::inventory::build_put_item_in_container(
+            2, EMERALD, CHEST, 0
+        )]
+    );
+}
+
+// An item staged in a trade goes nowhere; the notice names the stack as
+// the client does (a stack of five gems is "Gems").
+#[test]
+fn an_item_in_a_trade_is_refused() {
+    let (mut state, mut outbox) = with_open_chest();
+    state.world.set_trade_state(GEM, 1);
+    with_binding(&mut state, &mut outbox, |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::Refused);
+        assert_eq!(result.notice.as_deref(), Some("The Gems is being traded"));
+    });
+    assert!(outbox.is_empty());
+}
+
+// The window sends nothing for a drop that leaves an item where it is; a
+// put to the slot the item has (or past the end, for the last) is done
+// already.
+#[test]
+fn a_put_that_leaves_the_item_where_it_is_is_completed_and_sends_nothing() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let ruby = call::<calls::LootPut>(b, &put(RUBY, CHEST, 0, 0));
+        assert_eq!(ruby.status, ItemStatus::Completed);
+        let emerald = call::<calls::LootPut>(b, &put(EMERALD, CHEST, 0, 1));
+        assert_eq!(emerald.status, ItemStatus::Completed);
+        let past_the_end = call::<calls::LootPut>(b, &put(EMERALD, CHEST, 0, 7));
+        assert_eq!(past_the_end.status, ItemStatus::Completed);
+    });
+    assert!(outbox.is_empty());
+}
+
+// With the session's link down nothing can go out, and the put says so
+// rather than reporting a start.
+#[test]
+fn a_put_with_the_link_down_is_unavailable_and_sends_nothing() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        b.link.as_mut().unwrap().active = false;
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 3));
+        assert_eq!(result.status, ItemStatus::Unavailable);
+    });
+    assert!(outbox.is_empty());
+}
+
+// An item shown waiting at a slot holds the next put up until the server
+// answers it.
+#[test]
+fn a_put_while_an_item_waits_at_a_slot_is_busy() {
+    let (mut state, mut outbox) = with_open_chest();
+    with_binding(&mut state, &mut outbox, |b| {
+        let first = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 1));
+        assert_eq!(first.status, ItemStatus::Started);
+        assert!(b.state.inventory.pending_placement().is_some());
+        let second = call::<calls::LootPut>(b, &put(KIT, CHEST, 0, 0));
+        assert_eq!(second.status, ItemStatus::Busy);
+    });
+    assert_eq!(sent(&mut outbox).len(), 1);
+}
+
+// A weapon switch in flight (the worn axe being moved aside for the sword)
+// holds a put up.
+#[test]
+fn a_put_while_a_wield_is_in_flight_is_busy() {
+    const AXE: u32 = 0x8000_0004;
+    const MELEE: u32 = 0x0000_0001;
+    let (mut state, mut outbox) = with_open_chest();
+    state.world.apply(&owned(SWORD, "Sword", 0x1, |w| {
+        w.valid_locations = Some(MELEE);
+        w.combat_use = Some(1);
+        w.stack_size = None;
+    }));
+    state.world.apply(&owned(AXE, "Axe", 0x1, |w| {
+        w.valid_locations = Some(MELEE);
+        w.combat_use = Some(1);
+        w.stack_size = None;
+        w.container_id = None;
+        w.wielder_id = Some(PLAYER);
+        w.currently_wielded_location = Some(MELEE);
+    }));
+    state.world.drain_changes().for_each(drop);
+    at(&mut state, &mut outbox, Duration::from_secs(5), |b| {
+        let sword = EquipRequest {
+            object_id: SWORD,
+            location: 0,
+        };
+        assert_eq!(
+            call::<calls::EquipmentEquip>(b, &sword).status,
+            EquipmentStatus::Started
+        );
+        assert!(b.state.inventory.is_wield_busy());
+    });
+    outbox.drain().for_each(drop);
+    at(&mut state, &mut outbox, Duration::from_secs(6), |b| {
+        let result = call::<calls::LootPut>(b, &put(GEM, CHEST, 0, 0));
+        assert_eq!(result.status, ItemStatus::Busy);
+    });
+    assert!(outbox.is_empty());
+}
+
+// An item's container slot is its place in its container's list among its
+// own kind (loose items, or packs), whatever slot the server last named:
+// the number the game shows for it. Side-pack items arrive listed first
+// and described after, naming no slot.
+
+/// The character's description listing `inventory`, then `listings` (each
+/// a container and its contents as guid, container type pairs), then the
+/// items described.
+fn logged_in_with(
+    inventory: &[(u32, u32)],
+    listings: &[(u32, &[u32])],
+    items: &[ac_proto::Inbound<'static>],
+) -> SessionState {
+    use ac_proto::{GameEventType, Inbound};
+    let mut state = in_world();
+    let mut description = crate::world::tests::empty_description();
+    description.inventory = inventory
+        .iter()
+        .map(|&(guid, container_type)| ac_proto::InventoryEntry {
+            guid,
+            container_type,
+        })
+        .collect();
+    state.world.apply_player_description(&description);
+    for &(container, payload) in listings {
+        let mut words = vec![container, u32::try_from(payload.len() / 2).unwrap()];
+        words.extend_from_slice(payload);
+        let view = crate::world::tests::game_event(GameEventType::VIEW_CONTENTS, &words);
+        state.world.apply(&Inbound::parse(&view).unwrap());
+    }
+    for item in items {
+        state.world.apply(item);
+    }
+    state.world.drain_changes().for_each(drop);
+    state
+}
+
+/// The container slots a plugin reads for `ids` among the owned items.
+fn slots_seen(state: &mut SessionState, ids: &[u32]) -> Vec<i32> {
+    let mut outbox = Outbox::new();
+    with_binding(state, &mut outbox, |b| {
+        let items = call::<calls::ItemsOwned>(b, &());
+        ids.iter()
+            .map(|id| {
+                items
+                    .iter()
+                    .find(|i| i.object_id == *id)
+                    .unwrap()
+                    .container_slot
+            })
+            .collect()
+    })
+}
+
+const SIDE_PACK: u32 = 0x8000_0040;
+const INNER_PACK: u32 = 0x8000_0041;
+
+fn pack_in(guid: u32, container: u32) -> ac_proto::Inbound<'static> {
+    owned(guid, "Pack", 0x200, |w| {
+        w.container_id = Some(container);
+        w.items_capacity = Some(24);
+        w.stack_size = None;
+    })
+}
+
+fn gem_in(guid: u32, container: u32) -> ac_proto::Inbound<'static> {
+    owned(guid, "Gem", 0x800, |w| w.container_id = Some(container))
+}
+
+#[test]
+fn a_side_pack_item_listed_at_login_reports_its_place_in_the_pack() {
+    let mut state = logged_in_with(
+        &[(SIDE_PACK, 1)],
+        &[(SIDE_PACK, &[GEM, 0, INNER_PACK, 1, KIT, 0])],
+        &[
+            pack_in(SIDE_PACK, PLAYER),
+            gem_in(KIT, SIDE_PACK),
+            pack_in(INNER_PACK, SIDE_PACK),
+            gem_in(GEM, SIDE_PACK),
+        ],
+    );
+    // The pack between them is counted among the packs, not the items.
+    assert_eq!(slots_seen(&mut state, &[GEM, KIT, INNER_PACK]), [0, 1, 0]);
+}
+
+#[test]
+fn main_pack_items_report_the_slots_they_did_and_a_wielded_one_none() {
+    let mut state = logged_in_with(
+        &[(GEM, 0), (KIT, 0), (SIDE_PACK, 1)],
+        &[(SIDE_PACK, &[])],
+        &[
+            gem_in(KIT, PLAYER),
+            gem_in(GEM, PLAYER),
+            pack_in(SIDE_PACK, PLAYER),
+            owned(SWORD, "Sword", 0x1, |w| {
+                w.container_id = None;
+                w.wielder_id = Some(PLAYER);
+                w.valid_locations = Some(0x0010_0000);
+                w.currently_wielded_location = Some(0x0010_0000);
+                w.stack_size = None;
+            }),
+        ],
+    );
+    let stored: Vec<i32> = [GEM, KIT]
+        .iter()
+        .map(|&id| state.world.items().get(id).unwrap().container_slot)
+        .collect();
+    assert_eq!(stored, [0, 1]);
+    assert_eq!(slots_seen(&mut state, &[GEM, KIT]), stored);
+    // The pack is the first of the packs (the description's flat list put
+    // it third), and the sword is in no container.
+    assert_eq!(slots_seen(&mut state, &[SIDE_PACK, SWORD]), [0, -1]);
+}
+
+#[test]
+fn an_item_in_the_open_chest_reports_its_place_among_the_loose_items() {
+    let (mut state, mut outbox) = open_chest(24, true);
+    with_binding(&mut state, &mut outbox, |b| {
+        let contents = call::<calls::LootContents>(b, &());
+        let slot = |id: u32| {
+            contents
+                .iter()
+                .find(|i| i.object_id == id)
+                .unwrap()
+                .container_slot
+        };
+        assert_eq!(
+            [slot(RUBY), slot(EMERALD), slot(SACK), slot(PEARL)],
+            [0, 1, 0, 0]
+        );
+    });
+}

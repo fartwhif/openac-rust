@@ -1,9 +1,9 @@
 //! Putting an item into a container: whether the move is legal, which pack
 //! an item picked up goes into, and the notice when it cannot go anywhere.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use super::{ClientObject, ClientObjectTable, ItemType};
+use super::{ClientObject, ClientObjectTable, EquipMask, ItemType};
 
 /// Why an item may not go into a container.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +380,154 @@ pub fn item_list_drop_placement(
     Some(placement)
 }
 
+/// Whether an item window shows the object among a container's packs
+/// rather than its loose items: it says it is a container, or it holds
+/// items.
+#[must_use]
+pub fn is_pack(item: &ClientObject) -> bool {
+    item.container_type_hint != 0
+        || item.item_type.intersects(ItemType::CONTAINER)
+        || item.items_capacity > 0
+}
+
+/// A container's loose items (everything directly in it that is not a
+/// pack), in its order: what its item list shows, and what a placement in
+/// that list counts.
+#[must_use]
+pub fn loose_contents(objects: &ClientObjectTable, container_id: u32) -> Vec<u32> {
+    objects
+        .get_contents(container_id)
+        .iter()
+        .copied()
+        .filter(|&id| !objects.get(id).is_some_and(is_pack))
+        .collect()
+}
+
+/// An object's place in its container's contents list, counted among its
+/// own kind: a loose item among the loose items, a pack (or focus) among
+/// the packs, the split [`is_pack`] and [`loose_contents`] use. The game
+/// keeps the two kinds in separate lists and reads an item's place off
+/// its list, so this is the number it shows for the item, whatever slot
+/// the server last named. -1 when the object is in no container, is worn
+/// or wielded (the game takes it out of the list; the table may still name
+/// the wielder as its container) or its container's list does not hold
+/// it; 0 when its container has no list at all (never listed, or its view
+/// closed), as the game counts it. [`ContainerPlaces`] answers the same
+/// for many items with one walk of each list.
+#[must_use]
+pub fn place_in_container_list(objects: &ClientObjectTable, item_id: u32) -> i32 {
+    objects.get(item_id).map_or(-1, |item| {
+        place_by_rule(objects, item, |contents| {
+            let mut places = PlaceCounter::default();
+            contents
+                .iter()
+                .find_map(|&id| places.next(objects, id).filter(|_| id == item_id))
+        })
+    })
+}
+
+/// Worn or wielded: on the character, in no container's list.
+fn is_worn(item: &ClientObject) -> bool {
+    item.wielder_id != 0 || item.currently_equipped_location != EquipMask::NONE
+}
+
+/// The rule around the list: no container or worn is -1, a container with
+/// no list is 0, else `find` reads the place off the container's list.
+fn place_by_rule(
+    objects: &ClientObjectTable,
+    item: &ClientObject,
+    find: impl FnOnce(&[u32]) -> Option<i32>,
+) -> i32 {
+    if item.container_id == 0 || is_worn(item) {
+        return -1;
+    }
+    objects
+        .contents_list(item.container_id)
+        .map_or(0, |contents| find(contents).unwrap_or(-1))
+}
+
+/// Counts a contents list's members as one walks it, loose items and packs
+/// apart, skipping worn ones.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlaceCounter {
+    loose: i32,
+    packs: i32,
+}
+
+impl PlaceCounter {
+    /// The place of the list's next member, `id`; `None` for a worn one,
+    /// which takes no place.
+    pub fn next(&mut self, objects: &ClientObjectTable, id: u32) -> Option<i32> {
+        let member = objects.get(id);
+        if member.is_some_and(is_worn) {
+            return None;
+        }
+        let count = if member.is_some_and(is_pack) {
+            &mut self.packs
+        } else {
+            &mut self.loose
+        };
+        let place = *count;
+        *count = count.saturating_add(1);
+        Some(place)
+    }
+}
+
+/// Every listed object's place in its own container's list, from one walk
+/// of each list: [`place_in_container_list`] for a whole table at once.
+#[derive(Debug, Default)]
+pub struct ContainerPlaces {
+    places: BTreeMap<u32, i32>,
+}
+
+impl ContainerPlaces {
+    /// Walks every contents list once.
+    #[must_use]
+    pub fn of(objects: &ClientObjectTable) -> Self {
+        let mut places = BTreeMap::new();
+        for (container, contents) in objects.contents_lists() {
+            let mut counter = PlaceCounter::default();
+            for &id in contents {
+                if let Some(place) = counter.next(objects, id)
+                    && objects.get(id).is_some_and(|m| m.container_id == container)
+                {
+                    places.insert(id, place);
+                }
+            }
+        }
+        Self { places }
+    }
+
+    /// The item's place, as [`place_in_container_list`] gives it.
+    #[must_use]
+    pub fn place(&self, objects: &ClientObjectTable, item: &ClientObject) -> i32 {
+        place_by_rule(objects, item, |_| {
+            self.places.get(&item.object_id()).copied()
+        })
+    }
+}
+
+/// Whether sending the whole of the loose item at `source_index` (of
+/// `item_count`) to `placement`, the slot as sent, leaves it where it is:
+/// the drop an item list resolves to [`item_list_drop_placement`]'s `None`.
+/// The server takes the item out of its slot before inserting it, so the
+/// drop that sends `placement` is on that slot when it lies before the
+/// item, and on the next one otherwise.
+#[must_use]
+pub fn placement_leaves_item_in_place(
+    placement: i32,
+    item_count: usize,
+    source_index: usize,
+) -> bool {
+    let source = i32::try_from(source_index).unwrap_or(i32::MAX);
+    let drop_index = if placement < source {
+        placement
+    } else {
+        placement.saturating_add(1)
+    };
+    item_list_drop_placement(drop_index, item_count, Some(source_index), true).is_none()
+}
+
 #[cfg(test)]
 mod drop_placement_tests {
     //! Ported from OpenAC `tests/AcDream.Core.Tests/Items/ItemListDropPlacementTests.cs`.
@@ -418,6 +566,36 @@ mod drop_placement_tests {
     fn an_arrival_from_elsewhere_takes_the_hovered_slot() {
         for (drop, count, expected) in [(0, 3, 0), (2, 3, 2), (7, 3, 3), (0, 0, 0), (-1, 3, 0)] {
             assert_eq!(resolve(drop, count, None, true), Some(expected));
+        }
+    }
+
+    // A placement as sent leaves the item in place exactly when every drop
+    // that would send it is one the list resolves to nothing: its own slot,
+    // or past the end for the last item.
+    #[test]
+    fn a_placement_as_sent_leaves_the_item_in_place_only_at_its_own_slot() {
+        use super::placement_leaves_item_in_place as stays;
+        for (placement, count, source) in [(2, 4, 2), (0, 4, 0), (-1, 4, 0), (3, 4, 3), (9, 4, 3)] {
+            assert!(
+                stays(placement, count, source),
+                "{placement} {count} {source}"
+            );
+        }
+        for (placement, count, source) in [(1, 4, 2), (3, 4, 2), (0, 4, 3), (1, 4, 0), (9, 4, 2)] {
+            assert!(
+                !stays(placement, count, source),
+                "{placement} {count} {source}"
+            );
+            // The drop that sends it is resolved to that very placement.
+            let drop = if placement < i32::try_from(source).unwrap() {
+                placement
+            } else {
+                placement + 1
+            };
+            assert_eq!(
+                resolve(drop, count, Some(source), true),
+                Some(placement.clamp(0, i32::try_from(count).unwrap() - 1))
+            );
         }
     }
 }
@@ -876,5 +1054,186 @@ mod tests {
             PLAYER,
             true
         ));
+    }
+}
+
+#[cfg(test)]
+mod place_in_list_tests {
+    //! An item's place in its container's list, as the game counts it: its
+    //! index among its own kind (loose items, or packs) in that list.
+
+    use super::{ContainerPlaces, place_in_container_list};
+
+    /// The item's place, asserting the whole-table walk agrees with the
+    /// single lookup.
+    fn place(t: &ClientObjectTable, id: u32) -> i32 {
+        let single = place_in_container_list(t, id);
+        let walked = t
+            .get(id)
+            .map_or(-1, |item| ContainerPlaces::of(t).place(t, item));
+        assert_eq!(single, walked, "{id:#x}");
+        single
+    }
+    use crate::items::{
+        ClientObjectTable, ContainerContentEntry, EquipMask, ItemType, TableEvent, WeenieData,
+    };
+
+    const PLAYER: u32 = 0x5000_0001;
+    const PACK: u32 = 0x6000_0010;
+
+    fn entry(guid: u32, container_type: u32) -> ContainerContentEntry {
+        ContainerContentEntry {
+            guid,
+            container_type,
+        }
+    }
+
+    fn in_container(guid: u32, container: u32) -> WeenieData {
+        WeenieData {
+            guid,
+            name: Some("Gem".into()),
+            item_type: Some(ItemType::GEM),
+            container_id: Some(container),
+            ..WeenieData::default()
+        }
+    }
+
+    fn pack_in(guid: u32, container: u32) -> WeenieData {
+        WeenieData {
+            item_type: Some(ItemType::CONTAINER),
+            items_capacity: Some(24),
+            ..in_container(guid, container)
+        }
+    }
+
+    // The login shape: a side pack's listing, then each item's description.
+    // The descriptions name the pack but no slot, so the table keeps none;
+    // the place comes from the list.
+    #[test]
+    fn a_side_pack_item_listed_before_its_description_has_its_list_place() {
+        let mut t = ClientObjectTable::new();
+        let mut ev: Vec<TableEvent> = Vec::new();
+        t.initialize_inventory_manifest(PLAYER, &[entry(PACK, 1)], &mut ev);
+        t.replace_contents(PACK, &[entry(0xA01, 0), entry(0xA02, 0)], &mut ev);
+        t.ingest(&pack_in(PACK, PLAYER), &mut ev);
+        t.ingest(&in_container(0xA02, PACK), &mut ev);
+        t.ingest(&in_container(0xA01, PACK), &mut ev);
+        assert_eq!(t.get(0xA01).unwrap().container_slot, -1);
+        assert_eq!((place(&t, 0xA01), place(&t, 0xA02)), (0, 1));
+    }
+
+    // Packs and loose items are counted apart: a pack inside a pack is
+    // counted among the packs, and the items after it do not count it.
+    #[test]
+    fn a_pack_inside_a_pack_counts_among_the_packs() {
+        let mut t = ClientObjectTable::new();
+        let mut ev: Vec<TableEvent> = Vec::new();
+        t.replace_contents(
+            PACK,
+            &[
+                entry(0xA01, 0),
+                entry(0xB01, 1),
+                entry(0xA02, 0),
+                entry(0xB02, 1),
+            ],
+            &mut ev,
+        );
+        for guid in [0xA01, 0xA02] {
+            t.ingest(&in_container(guid, PACK), &mut ev);
+        }
+        for guid in [0xB01, 0xB02] {
+            t.ingest(&pack_in(guid, PACK), &mut ev);
+        }
+        assert_eq!((place(&t, 0xA01), place(&t, 0xA02)), (0, 1));
+        assert_eq!((place(&t, 0xB01), place(&t, 0xB02)), (0, 1));
+    }
+
+    // In no list: not in a container at all (wielded), or named in a
+    // container whose list no longer holds it.
+    #[test]
+    fn an_item_in_no_list_has_no_place() {
+        let mut t = ClientObjectTable::new();
+        let mut ev: Vec<TableEvent> = Vec::new();
+        t.ingest(
+            &WeenieData {
+                wielder_id: Some(PLAYER),
+                current_wielded_location: Some(EquipMask::MELEE_WEAPON),
+                ..in_container(0xA03, 0)
+            },
+            &mut ev,
+        );
+        assert_eq!(place(&t, 0xA03), -1);
+        t.ingest(&in_container(0xA04, 0), &mut ev);
+        t.move_item(0xA04, PACK, 0, EquipMask::NONE, None, &mut ev);
+        t.replace_contents(PACK, &[], &mut ev);
+        let kept = t.get(0xA04).unwrap();
+        assert_eq!((kept.container_id, kept.container_slot), (PACK, 0));
+        assert_eq!(place(&t, 0xA04), -1);
+        assert_eq!(place(&t, 0xDEAD), -1);
+    }
+
+    // A worn item is in no container's list, even where the table names
+    // the wielder as its container and lists it there; nor does it take a
+    // place from the items listed after it.
+    #[test]
+    fn a_worn_item_has_no_place_and_takes_none() {
+        let mut t = ClientObjectTable::new();
+        let mut ev: Vec<TableEvent> = Vec::new();
+        t.ingest(&in_container(0xA05, 0), &mut ev);
+        t.move_item(0xA05, PLAYER, 0, EquipMask::CHEST_WEAR, None, &mut ev);
+        t.ingest(&in_container(0xA01, PLAYER), &mut ev);
+        t.ingest(
+            &WeenieData {
+                wielder_id: Some(PLAYER),
+                ..in_container(0xA06, PLAYER)
+            },
+            &mut ev,
+        );
+        let listed = t.get_contents(PLAYER);
+        assert!(listed.contains(&0xA05) && listed.contains(&0xA06));
+        assert!(
+            listed.iter().position(|&id| id == 0xA05) < listed.iter().position(|&id| id == 0xA01)
+        );
+        assert_eq!((place(&t, 0xA05), place(&t, 0xA06)), (-1, -1));
+        assert_eq!(place(&t, 0xA01), 0);
+    }
+
+    // A container with no contents list at all (never listed, or its view
+    // closed, which drops the list) puts what names it at place 0, as the
+    // game does; only a list that does not hold the item gives -1.
+    #[test]
+    fn an_item_whose_container_has_no_list_is_at_place_zero() {
+        let mut t = ClientObjectTable::new();
+        let mut ev: Vec<TableEvent> = Vec::new();
+        t.replace_contents(PACK, &[entry(0xA01, 0), entry(0xA02, 0)], &mut ev);
+        t.ingest(&in_container(0xA01, PACK), &mut ev);
+        t.ingest(&in_container(0xA02, PACK), &mut ev);
+        assert_eq!(place(&t, 0xA02), 1);
+        t.stop_viewing_contents(PACK, &mut ev);
+        assert!(t.contents_list(PACK).is_none());
+        assert_eq!(t.get(0xA02).unwrap().container_id, PACK);
+        assert_eq!((place(&t, 0xA01), place(&t, 0xA02)), (0, 0));
+    }
+
+    // The main pack as the character description lists it (loose items
+    // first, then the packs): the loose items' places are the slots the
+    // table already keeps; the packs are counted among the packs.
+    #[test]
+    fn main_pack_items_keep_the_numbers_the_table_keeps() {
+        let mut t = ClientObjectTable::new();
+        let mut ev: Vec<TableEvent> = Vec::new();
+        t.initialize_inventory_manifest(
+            PLAYER,
+            &[entry(0xA01, 0), entry(0xA02, 0), entry(PACK, 1)],
+            &mut ev,
+        );
+        t.ingest(&in_container(0xA02, PLAYER), &mut ev);
+        t.ingest(&in_container(0xA01, PLAYER), &mut ev);
+        t.ingest(&pack_in(PACK, PLAYER), &mut ev);
+        for guid in [0xA01, 0xA02] {
+            assert_eq!(place(&t, guid), t.get(guid).unwrap().container_slot);
+        }
+        assert_eq!((place(&t, 0xA01), place(&t, 0xA02)), (0, 1));
+        assert_eq!(place(&t, PACK), 0);
     }
 }

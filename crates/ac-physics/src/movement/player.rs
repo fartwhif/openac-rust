@@ -15,7 +15,9 @@ use ac_motion::motion_command::{
     CROUCH, READY, SIDE_STEP_LEFT, SIDE_STEP_RIGHT, SITTING, SLEEPING, TURN_LEFT, TURN_RIGHT,
     WALK_BACKWARDS, WALK_FORWARD,
 };
-use ac_motion::move_to_math::{get_heading, heading_from_yaw, set_heading, yaw_from_heading};
+use ac_motion::move_to_math::{
+    EPSILON as MOVE_TO_EPSILON, get_heading, heading_from_yaw, set_heading, yaw_from_heading,
+};
 use ac_motion::{
     HoldKey, MotionDeltaFrame, MovementParameters, MovementType, RUN_ANIM_SPEED, RawMotionState,
     set_rotate,
@@ -341,6 +343,10 @@ pub struct PlayerMovementController {
     prev_run_held: bool,
     has_input_snapshot: bool,
     mouse_look_active: bool,
+    /// The mouse look is modern mouse turning's (the view owns the turn).
+    modern_mouse_look: bool,
+    /// Modern mouse turning: the compass heading (degrees) the view points at.
+    mouse_look_facing_target: Option<f32>,
     mouse_turn_sample_pending: bool,
     mouse_turn_adjustment: f32,
     active_input_turn_command: Option<u32>,
@@ -435,6 +441,8 @@ impl PlayerMovementController {
             prev_run_held: false,
             has_input_snapshot: false,
             mouse_look_active: false,
+            modern_mouse_look: false,
+            mouse_look_facing_target: None,
             mouse_turn_sample_pending: false,
             mouse_turn_adjustment: 0.0,
             active_input_turn_command: None,
@@ -883,18 +891,151 @@ impl PlayerMovementController {
 
     // ── mouse look ─────────────────────────────────────────────────────
 
-    /// Start mouse look (not in portal space, not twice).
-    pub fn begin_mouse_look(&mut self, env: &mut MovementEnv<'_>, input: MovementInput) -> bool {
+    /// Start mouse look (not in portal space, not twice); `modern` for
+    /// modern mouse turning, where the view, not the mouse's motion, owns
+    /// the turn and the turn keys keep turning.
+    pub fn begin_mouse_look(
+        &mut self,
+        env: &mut MovementEnv<'_>,
+        input: MovementInput,
+        modern: bool,
+    ) -> bool {
         if self.mouse_look_active || self.state != PlayerState::InWorld {
             return false;
         }
         self.sync_time();
         self.mouse_look_active = true;
+        self.modern_mouse_look = modern;
+        self.mouse_look_facing_target = None;
         self.take_control_from_server(env, Some(input));
         self.mouse_turn_sample_pending = false;
         self.mouse_turn_adjustment = 0.0;
         self.apply_mouse_look_toggle_movement(env, input, true);
         true
+    }
+
+    /// Modern mouse turning: the yaw (radians) the view points along. While
+    /// a modern mouse look is on and no turn key is held, the character
+    /// turns toward it with the ordinary turn motion at the full turn rate,
+    /// and stops on it. The view never waits on the character, and nothing
+    /// else sets the character's heading.
+    pub fn set_mouse_look_facing_target(&mut self, yaw: f32) {
+        if !self.mouse_look_active || !self.modern_mouse_look || !yaw.is_finite() {
+            return;
+        }
+        self.mouse_look_facing_target = Some(heading_from_yaw(yaw));
+    }
+
+    /// No modern facing turn is under way: the character faces the view's
+    /// target, or there is no modern mouse look (it ended, or a teleport or
+    /// reset cleared it).
+    #[must_use]
+    pub fn mouse_look_facing_settled(&self) -> bool {
+        let Some(target) = self.mouse_look_facing_target else {
+            return true;
+        };
+        !self.mouse_look_active
+            || !self.modern_mouse_look
+            || (!self.facing_turn_active() && self.facing_error(target).abs() <= MOVE_TO_EPSILON)
+    }
+
+    /// A modern mouse look is on.
+    #[must_use]
+    pub fn modern_mouse_look_active(&self) -> bool {
+        self.mouse_look_active && self.modern_mouse_look
+    }
+
+    /// A modern facing turn is under way: the view's target, not a key,
+    /// owns the turn.
+    fn facing_turn_active(&self) -> bool {
+        self.mouse_look_active
+            && self.modern_mouse_look
+            && self.active_input_turn_from_mouse
+            && self.active_input_turn_command.is_some()
+    }
+
+    /// Compass degrees from the facing to `target_heading`, in (-180, 180];
+    /// positive is a right turn (a right turn raises the compass heading).
+    fn facing_error(&self, target_heading: f32) -> f32 {
+        let mut error = (target_heading - get_heading(self.obj.body.orientation)) % 360.0;
+        if error > 180.0 {
+            error -= 360.0;
+        } else if error <= -180.0 {
+            error += 360.0;
+        }
+        error
+    }
+
+    /// How far the target still lies ahead along `turn`, degrees.
+    fn facing_ahead(turn: u32, error: f32) -> f32 {
+        if turn == TURN_RIGHT { error } else { -error }
+    }
+
+    /// The turn a modern mouse look wants this frame. A turn under way
+    /// keeps going while the target is on or ahead of the facing: it is
+    /// stopped at the next physics step boundary that finds the target not
+    /// ahead, so a drag that pauses for a frame or two does not stop and
+    /// restart it. A view swung back past the facing turns the other way.
+    /// One full-rate turn at a time, no speed changes: the turn motion is
+    /// never re-issued.
+    fn desired_facing_turn(
+        &mut self,
+        env: &mut MovementEnv<'_>,
+        input: MovementInput,
+    ) -> Option<u32> {
+        let target = self.mouse_look_facing_target?;
+        let error = self.facing_error(target);
+        if self.facing_turn_active()
+            && let Some(active) = self.active_input_turn_command
+            && Self::facing_ahead(active, error) >= -MOVE_TO_EPSILON
+        {
+            return Some(active);
+        }
+        if error.abs() <= MOVE_TO_EPSILON {
+            return None;
+        }
+        if self.controlled_by_server {
+            self.take_control_from_server(env, Some(input));
+        }
+        Some(if error > 0.0 { TURN_RIGHT } else { TURN_LEFT })
+    }
+
+    /// At a physics step boundary: a facing turn whose target is no longer
+    /// ahead stops before the step runs.
+    fn stop_facing_turn_if_on_target(&mut self, env: &mut MovementEnv<'_>) -> bool {
+        if !self.facing_turn_active() {
+            return false;
+        }
+        let (Some(target), Some(active)) = (
+            self.mouse_look_facing_target,
+            self.active_input_turn_command,
+        ) else {
+            return false;
+        };
+        if Self::facing_ahead(active, self.facing_error(target)) > MOVE_TO_EPSILON {
+            return false;
+        }
+        self.apply_input_turn(env, None, 1.0, true, false);
+        true
+    }
+
+    /// After a physics step turned the body: a facing turn that passed its
+    /// target lands on it, the way the game's own turn-to-heading finishes,
+    /// so the character never turns past where the view points.
+    fn land_facing_turn_on_target(&mut self) {
+        if !self.facing_turn_active() {
+            return;
+        }
+        let (Some(target), Some(active)) = (
+            self.mouse_look_facing_target,
+            self.active_input_turn_command,
+        ) else {
+            return;
+        };
+        let error = self.facing_error(target);
+        if Self::facing_ahead(active, error) < 0.0 && error.abs() < 90.0 {
+            self.obj.body.orientation = set_heading(target);
+        }
     }
 
     /// A filtered horizontal mouse movement while looking (negative turns
@@ -905,7 +1046,7 @@ impl PlayerMovementController {
         signed_adjustment: f32,
         input: MovementInput,
     ) {
-        if !self.mouse_look_active || !signed_adjustment.is_finite() {
+        if !self.mouse_look_active || self.modern_mouse_look || !signed_adjustment.is_finite() {
             return;
         }
         self.sync_time();
@@ -945,6 +1086,8 @@ impl PlayerMovementController {
         }
         self.sync_time();
         self.mouse_look_active = false;
+        self.modern_mouse_look = false;
+        self.mouse_look_facing_target = None;
         self.take_control_from_server(env, Some(input));
         self.mouse_turn_sample_pending = false;
         self.mouse_turn_adjustment = 0.0;
@@ -958,10 +1101,11 @@ impl PlayerMovementController {
         input: MovementInput,
         entering: bool,
     ) {
-        let (sidestep, use_run_hold) = Self::desired_input_sidestep(input, entering);
+        let (sidestep, use_run_hold) =
+            Self::desired_input_sidestep(input, entering && !self.modern_mouse_look);
         self.apply_input_sidestep(env, sidestep, use_run_hold, !entering);
 
-        let turn = if entering {
+        let turn = if entering && !self.modern_mouse_look {
             None
         } else if input.turn_right {
             Some(TURN_RIGHT)
@@ -1423,6 +1567,8 @@ impl PlayerMovementController {
         self.active_input_sidestep_command = None;
         self.active_input_sidestep_uses_run_hold = false;
         self.mouse_look_active = false;
+        self.modern_mouse_look = false;
+        self.mouse_look_facing_target = None;
         self.mouse_turn_sample_pending = false;
         self.mouse_turn_adjustment = 0.0;
         self.mouse_movement_event_candidate = false;
@@ -1834,8 +1980,10 @@ impl PlayerMovementController {
                 }
             }
 
-            let (desired_sidestep, sidestep_uses_run_hold) =
-                Self::desired_input_sidestep(input, self.mouse_look_active);
+            let (desired_sidestep, sidestep_uses_run_hold) = Self::desired_input_sidestep(
+                input,
+                self.mouse_look_active && !self.modern_mouse_look,
+            );
             if self.apply_input_sidestep(env, desired_sidestep, sidestep_uses_run_hold, false) {
                 motion_edge_fired = true;
             }
@@ -1848,7 +1996,9 @@ impl PlayerMovementController {
                 movement_event_requested = true;
             }
 
-            let mut desired_turn_command = if self.mouse_look_active {
+            let legacy_mouse_look = self.mouse_look_active && !self.modern_mouse_look;
+            let keyboard_owns_turn = input.turn_left != input.turn_right;
+            let mut desired_turn_command = if legacy_mouse_look {
                 None
             } else if input.turn_right {
                 Some(TURN_RIGHT)
@@ -1859,8 +2009,15 @@ impl PlayerMovementController {
             };
             let mut desired_turn_speed = 1.0;
             let mut desired_turn_from_mouse = false;
+            let mut facing_turn = false;
 
-            if self.mouse_look_active && self.mouse_turn_sample_pending {
+            if self.mouse_look_active && self.modern_mouse_look && !keyboard_owns_turn {
+                // Modern mouse turning: the turn keys are up, so the view's
+                // target owns the turn, as a steady full-rate mouse turn.
+                desired_turn_command = self.desired_facing_turn(env, input);
+                desired_turn_from_mouse = desired_turn_command.is_some();
+                facing_turn = true;
+            } else if legacy_mouse_look && self.mouse_turn_sample_pending {
                 let adjustment = self.mouse_turn_adjustment;
                 self.mouse_turn_sample_pending = false;
                 self.mouse_turn_adjustment = 0.0;
@@ -1874,7 +2031,7 @@ impl PlayerMovementController {
                         (adjustment.abs() * MOUSE_TURN_SPEED_SCALE).min(MOUSE_TURN_MAXIMUM_SPEED);
                     desired_turn_from_mouse = true;
                 }
-            } else if self.mouse_look_active && self.active_input_turn_from_mouse {
+            } else if legacy_mouse_look && self.active_input_turn_from_mouse {
                 desired_turn_command = self.active_input_turn_command;
                 desired_turn_speed = self.active_input_turn_speed;
                 desired_turn_from_mouse = true;
@@ -1888,6 +2045,11 @@ impl PlayerMovementController {
                 false,
             ) {
                 motion_edge_fired = true;
+                // A modern facing turn starts and stops the way a turn key
+                // does, so the server hears each edge at once.
+                if facing_turn {
+                    movement_event_requested = true;
+                }
             }
 
             if motion_edge_fired {
@@ -1972,6 +2134,10 @@ impl PlayerMovementController {
 
         for qi in 0..batch.count() {
             let tick_dt = batch.get_quantum(qi).unwrap_or(0.0);
+            if self.stop_facing_turn_if_on_target(env) {
+                motion_edge_fired = true;
+                movement_event_requested = true;
+            }
             let mut pm_delta = MotionDeltaFrame::default();
             let mut root = MotionDeltaFrame::default();
             if self.advance_root_motion(tick_dt, &mut root) {
@@ -2009,6 +2175,7 @@ impl PlayerMovementController {
             self.obj.body.is_fully_constrained =
                 self.obj.position_attached && self.obj.position.is_fully_constrained();
             Self::apply_position_manager_delta(&mut self.obj.body, &pm_delta);
+            self.land_facing_turn_on_target();
 
             self.obj.body.calc_acceleration();
             self.obj.body.update_physics_internal(tick_dt);

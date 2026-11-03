@@ -21,7 +21,7 @@ use ac_ui::panels::PanelOutput;
 use ac_ui::panels::items::{ItemsView, NameResolver};
 use ac_ui::panels::salvage::{self, SalvageController};
 use ac_ui::widgets::{ItemList, ItemSlot, Scrollbar};
-use ac_ui::{ElementId, MouseButton};
+use ac_ui::{ElementId, MouseButton, UiOutput};
 use common::items::*;
 use common::panels::*;
 use common::*;
@@ -607,6 +607,55 @@ fn a_drag_out_through_the_root_unstages_across_a_frame() {
     h.host.mouse_up(MouseButton::Left, x + 200, y + 300, 0);
     h.update();
     assert_eq!(h.count(), 0);
+}
+
+/// A staged item let go over the world says it came from the salvage
+/// window, so the world only unstages it and never drops it on the ground
+/// (issue #32).
+#[test]
+fn a_drag_out_over_the_world_comes_from_the_salvage_window() {
+    let mut h = harness();
+    h.item(1, 60, 0, PLAYER);
+    h.add(1);
+    h.host.take_outputs();
+    let (x, y) = h.cell_centre(0);
+    h.host.mouse_move(x, y);
+    h.host.mouse_down(MouseButton::Left, x, y, 0);
+    h.host.mouse_move(x + 200, y + 300);
+    h.host.mouse_up(MouseButton::Left, x + 200, y + 300, 0);
+    let released: Vec<ItemDragSource> = h
+        .host
+        .take_outputs()
+        .into_iter()
+        .filter_map(|o| match o {
+            UiOutput::DragReleasedOutsideUi { payload, .. } => {
+                payload.get::<ItemDragPayload>().map(|p| p.source_kind)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(released, [ItemDragSource::Salvage]);
+}
+
+/// An alias drop is refused everywhere, the salvage window included: a
+/// staged item dragged out and let go over the row again stays unstaged.
+#[test]
+fn a_staged_item_dropped_back_on_the_row_stays_unstaged() {
+    let mut h = harness();
+    h.item(1, 60, 0, PLAYER);
+    h.item(2, 60, 0, PLAYER);
+    h.add(1);
+    h.add(2);
+    let lifted = ItemDragPayload::new(1, ItemDragSource::Salvage, 1);
+    h.fire(1, kind::DRAG_BEGIN, Some(lifted.clone()));
+    h.update();
+    assert_eq!(h.staged(), [2]);
+    h.fire(0, kind::DRAG_ENTER, Some(lifted.clone()));
+    h.update();
+    assert_eq!(h.slot(0).drag_acceptance(), DragAcceptance::Reject);
+    h.fire(0, kind::DROP_RELEASED, Some(lifted));
+    h.update();
+    assert_eq!(h.staged(), [2]);
 }
 
 /// A frame with nothing changed keeps the row's cells (the same elements),

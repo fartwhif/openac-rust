@@ -1,7 +1,7 @@
 //! The key map's interface actions beyond the panel toggles and hotkeys of
 //! `status`: the page keys (friends, titles, map, house, the options pages,
 //! the journal pages) and the keys that answer with a line (help, abuse
-//! reporting, urgent assistance, the plugin shelf), as OpenAC's
+//! reporting, urgent assistance, the plugin dock), as OpenAC's
 //! `RetailUiRuntime.HandleInputAction` routes them.
 
 use super::social_panels::SocialPage;
@@ -22,7 +22,7 @@ use super::window::WindowUi;
 pub const HELP_UNAVAILABLE: &str =
     "In-game help is unavailable because the retail help plugin is not installed.";
 
-/// What the plugin shelf key answers while no plugin window is registered.
+/// What the plugin dock key answers while no plugin window is registered.
 pub const NO_PLUGIN_WINDOWS: &str = "No plugin windows are registered.";
 
 /// A page of the journal.
@@ -63,7 +63,7 @@ pub enum PageKey {
 pub enum MessageKey {
     /// F1: help.
     Help,
-    /// The plugin shelf (no plugin windows yet).
+    /// The plugin dock (no plugin windows yet).
     PluginManager,
     /// Report abuse.
     AbuseReporting,
@@ -112,7 +112,7 @@ impl WindowUi {
     /// Run a page key; false when its window is not mounted.
     pub fn run_page_key(&mut self, key: PageKey) -> bool {
         match key {
-            PageKey::Message(MessageKey::PluginManager) => self.toggle_plugin_shelf(),
+            PageKey::Message(MessageKey::PluginManager) => self.toggle_plugin_dock(),
             PageKey::Message(message) => {
                 self.client_line(&message_text(message));
                 true

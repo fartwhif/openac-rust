@@ -91,6 +91,11 @@ pub const SPELL_RANGE_TEXT_ID: u32 = 0x1000_0162;
 pub const SPELL_DISPLAY_TEXT_ID: u32 = 0x1000_0163;
 /// The spell's formula row.
 pub const SPELL_FORMULA_LIST_ID: u32 = 0x1000_032D;
+/// The authored cell each formula component is built from (this layout's
+/// element): its own image gives way to the component's icon.
+pub const SPELL_COMPONENT_TEMPLATE_ID: u32 = 0x1000_032E;
+/// The cell's overlay that marks a component the player does not carry.
+pub const SPELL_COMPONENT_MISSING_ID: u32 = 0x1000_0330;
 /// The creature page's portrait.
 pub const CREATURE_VIEWPORT_ID: u32 = 0x1000_0148;
 /// The creature page's nine attribute and vital rows.
@@ -1837,6 +1842,7 @@ impl AppraisalController {
         icon: Option<TextureRef>,
         magic_skill: u32,
         components: &[SpellExamineComponent],
+        templates: &mut dyn RowTemplates,
     ) {
         self.spell_id = spell.spell_id;
         set_text(ui, self.title, &spell.name);
@@ -1855,41 +1861,95 @@ impl AppraisalController {
             s.entry_id = spell.spell_id;
             s.icon = icon;
         }
-        self.rebuild_formula(ui, components);
+        self.rebuild_formula(ui, components, templates);
         self.show_page(ui, AppraisalPage::Spell);
     }
 
-    /// The formula row: one cell per component, centred on the authored
-    /// cell.
-    fn rebuild_formula(&mut self, ui: &mut UiRoot, components: &[SpellExamineComponent]) {
+    /// The player's items changed: the shown spell's description and
+    /// formula again, from `components` as they stand now (the text keeps
+    /// its scroll; title, lines and icon stay). Nothing unless the spell
+    /// page shows `spell`.
+    pub fn refresh_spell_components(
+        &mut self,
+        ui: &mut UiRoot,
+        spell: &SpellMetadata,
+        components: &[SpellExamineComponent],
+        templates: &mut dyn RowTemplates,
+    ) {
+        if self.page != AppraisalPage::Spell
+            || self.spell_id == 0
+            || spell.spell_id != self.spell_id
+        {
+            return;
+        }
+        let display = spell_display_text(spell, components);
+        if let Some(w) = ui.widget_mut::<Text>(self.spell_display) {
+            let color = w.default_color;
+            w.set_content(crate::widgets::TextContent::Wrapped(display));
+            w.default_color = color;
+        }
+        self.rebuild_formula(ui, components, templates);
+    }
+
+    /// The formula row: one authored cell per component, centred on the
+    /// authored row, each showing the component's icon, with the missing
+    /// overlay over a component the player does not carry. No cells when
+    /// the cell's template cannot be built.
+    fn rebuild_formula(
+        &mut self,
+        ui: &mut UiRoot,
+        components: &[SpellExamineComponent],
+        templates: &mut dyn RowTemplates,
+    ) {
+        self.clear_formula(ui);
+        if components.is_empty() {
+            return;
+        }
+        let mut cells = Vec::with_capacity(components.len());
+        for component in components {
+            let Some(cell) = templates.build_row(ui, LAYOUT_ID, SPELL_COMPONENT_TEMPLATE_ID) else {
+                for c in cells {
+                    ui.destroy(c);
+                }
+                return;
+            };
+            if let Some(d) = ui.widget_mut::<DatElement>(cell) {
+                d.runtime_image = Some(component.icon);
+            }
+            if let Some(missing) = ui.find_descendant(cell, SPELL_COMPONENT_MISSING_ID) {
+                ui.set_visible(missing, !component.owned);
+            }
+            cells.push(cell);
+        }
+        let width = self.formula_cell_width;
+        let n = components.len() as f32;
+        if let Some(e) = ui.element_mut(self.formula) {
+            e.left = self.formula_origin_x - width * 0.5 * (n - 1.0);
+            e.width = width * n;
+        }
+        ui.reset_anchor_capture(self.formula);
+        for (i, cell) in cells.into_iter().enumerate() {
+            if let Some(e) = ui.element_mut(cell) {
+                e.layout_policy = None;
+                e.left = i as f32 * width;
+                e.top = 0.0;
+            }
+            ui.set_anchors(cell, AnchorEdges::LEFT | AnchorEdges::TOP);
+            ui.add_child(self.formula, cell);
+            self.formula_cells.push(cell);
+        }
+    }
+
+    /// No formula cells; the row back at its authored place and width.
+    fn clear_formula(&mut self, ui: &mut UiRoot) {
         for c in self.formula_cells.drain(..) {
             ui.destroy(c);
         }
-        let cell = self.formula_cell_width;
-        let Some(height) = ui.element(self.formula).map(|e| e.height) else {
-            return;
-        };
-        let n = components.len().max(1) as f32;
         if let Some(e) = ui.element_mut(self.formula) {
-            e.left = self.formula_origin_x - cell * 0.5 * (n - 1.0);
-            e.width = cell * n;
+            e.left = self.formula_origin_x;
+            e.width = self.formula_cell_width;
         }
         ui.reset_anchor_capture(self.formula);
-        for (i, component) in components.iter().enumerate() {
-            let mut e = catalog_element(cell, height);
-            e.left = i as f32 * cell;
-            let id = ui.add(
-                self.formula,
-                e,
-                CatalogSlot {
-                    icon: component.icon,
-                    label: component.name.clone(),
-                    empty_sprite: 0,
-                    ..CatalogSlot::default()
-                },
-            );
-            self.formula_cells.push(id);
-        }
     }
 
     /// Forget everything shown (a new session).
@@ -1915,7 +1975,7 @@ impl AppraisalController {
             s.entry_id = 0;
             s.icon = None;
         }
-        self.rebuild_formula(ui, &[]);
+        self.clear_formula(ui);
         self.inscription.reset(ui);
         self.refresh_elapsed = 0.0;
         self.show_page(ui, AppraisalPage::Item);

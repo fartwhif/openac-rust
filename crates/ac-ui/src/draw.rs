@@ -2,12 +2,15 @@
 //! through (origin, clip and opacity stacks).
 //!
 //! The UI never touches a GPU. A frame is a [`DrawList`]: fills, textured
-//! quads, convex polygons and glyph runs in screen pixels, already clipped,
-//! in the order they must be painted. Textures are named, not uploaded: a
+//! quads, convex polygons, coloured triangles and glyph runs in screen
+//! pixels, already clipped, in the order they must be painted. Textures are named, not uploaded: a
 //! [`TextureRef::Surface`] is a dat render surface id the renderer decodes
 //! and caches.
 
-use crate::font::UiFont;
+use std::sync::Arc;
+
+use crate::font::{SharpFont, SharpFonts, UiFont};
+use crate::shapes::{self, CornerRadii, ShapeOutcome};
 
 /// A colour, straight (not premultiplied) alpha, components 0..=1.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -50,6 +53,18 @@ impl Color {
             f32::from(c.green) / 255.0,
             f32::from(c.blue) / 255.0,
             a,
+        )
+    }
+
+    /// The colour `t` of the way from `self` to `to`.
+    #[must_use]
+    pub fn lerp(self, to: Self, t: f32) -> Self {
+        let mix = |a: f32, b: f32| a + (b - a) * t;
+        Self::rgba(
+            mix(self.r, to.r),
+            mix(self.g, to.g),
+            mix(self.b, to.b),
+            mix(self.a, to.a),
         )
     }
 }
@@ -120,6 +135,35 @@ impl Vertex {
     }
 }
 
+/// A corner of an untextured triangle: screen position and its own colour,
+/// blended across the triangle.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ColorVertex {
+    /// X.
+    pub x: f32,
+    /// Y.
+    pub y: f32,
+    /// Colour (straight alpha).
+    pub color: Color,
+}
+
+impl ColorVertex {
+    /// A corner.
+    #[must_use]
+    pub const fn new(x: f32, y: f32, color: Color) -> Self {
+        Self { x, y, color }
+    }
+
+    /// True when every number in it is finite.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        let c = self.color;
+        [self.x, self.y, c.r, c.g, c.b, c.a]
+            .iter()
+            .all(|n| n.is_finite())
+    }
+}
+
 /// One drawing command, in screen pixels, already clipped.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DrawCmd {
@@ -156,6 +200,12 @@ pub enum DrawCmd {
         vertices: Vec<Vertex>,
         /// Colour or tint (opacity applied).
         color: Color,
+    },
+    /// Untextured triangles, three corners each, with a colour at every
+    /// corner (gradients, soft edges).
+    Triangles {
+        /// The corners (opacity applied).
+        vertices: Vec<ColorVertex>,
     },
     /// Glyphs of one pass of one string: same atlas, same tint, sampled
     /// nearest.
@@ -269,18 +319,56 @@ impl ClipRect {
         }
         let mut current = polygon.to_vec();
         for edge in [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom] {
-            let boundary = match edge {
-                Edge::Left => self.left,
-                Edge::Top => self.top,
-                Edge::Right => self.right,
-                Edge::Bottom => self.bottom,
-            };
-            current = clip_against(edge, boundary, &current);
+            current = clip_against(edge, self.boundary(edge), &current);
             if current.is_empty() {
                 return current;
             }
         }
         current
+    }
+
+    /// Append what is left of a triangle inside the clip to `out`, as
+    /// triangles: a corner made by a cut has the colour blended to match
+    /// where the cut fell, so a gradient or a soft edge keeps its look.
+    /// Most triangles are wholly inside or outside and need no cutting.
+    pub fn clip_triangle(&self, triangle: [ColorVertex; 3], out: &mut Vec<ColorVertex>) {
+        if self.is_empty() {
+            return;
+        }
+        let [a, b, c] = triangle;
+        if (a.x < self.left && b.x < self.left && c.x < self.left)
+            || (a.x > self.right && b.x > self.right && c.x > self.right)
+            || (a.y < self.top && b.y < self.top && c.y < self.top)
+            || (a.y > self.bottom && b.y > self.bottom && c.y > self.bottom)
+        {
+            return;
+        }
+        let inside = |v: &ColorVertex| {
+            v.x >= self.left && v.x <= self.right && v.y >= self.top && v.y <= self.bottom
+        };
+        if triangle.iter().all(inside) {
+            out.extend_from_slice(&triangle);
+            return;
+        }
+        let mut current = triangle.to_vec();
+        for edge in [Edge::Left, Edge::Top, Edge::Right, Edge::Bottom] {
+            current = clip_against(edge, self.boundary(edge), &current);
+            if current.is_empty() {
+                return;
+            }
+        }
+        for i in 1..current.len().saturating_sub(1) {
+            out.extend_from_slice(&[current[0], current[i], current[i + 1]]);
+        }
+    }
+
+    fn boundary(&self, edge: Edge) -> f32 {
+        match edge {
+            Edge::Left => self.left,
+            Edge::Top => self.top,
+            Edge::Right => self.right,
+            Edge::Bottom => self.bottom,
+        }
     }
 }
 
@@ -292,16 +380,55 @@ enum Edge {
     Bottom,
 }
 
-fn signed_distance(edge: Edge, boundary: f32, v: &Vertex) -> f32 {
-    match edge {
-        Edge::Left => v.x - boundary,
-        Edge::Top => v.y - boundary,
-        Edge::Right => boundary - v.x,
-        Edge::Bottom => boundary - v.y,
+/// A corner a clip edge can cut between: where it is, and what lies a share
+/// of the way to another.
+trait ClipCorner: Copy {
+    fn position(&self) -> (f32, f32);
+    fn toward(self, to: Self, t: f32) -> Self;
+}
+
+impl ClipCorner for Vertex {
+    fn position(&self) -> (f32, f32) {
+        (self.x, self.y)
+    }
+
+    fn toward(self, to: Self, t: f32) -> Self {
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        Vertex::new(
+            lerp(self.x, to.x),
+            lerp(self.y, to.y),
+            lerp(self.u, to.u),
+            lerp(self.v, to.v),
+        )
     }
 }
 
-fn clip_against(edge: Edge, boundary: f32, input: &[Vertex]) -> Vec<Vertex> {
+impl ClipCorner for ColorVertex {
+    fn position(&self) -> (f32, f32) {
+        (self.x, self.y)
+    }
+
+    fn toward(self, to: Self, t: f32) -> Self {
+        let lerp = |a: f32, b: f32| a + (b - a) * t;
+        ColorVertex::new(
+            lerp(self.x, to.x),
+            lerp(self.y, to.y),
+            self.color.lerp(to.color, t),
+        )
+    }
+}
+
+fn signed_distance<V: ClipCorner>(edge: Edge, boundary: f32, v: &V) -> f32 {
+    let (x, y) = v.position();
+    match edge {
+        Edge::Left => x - boundary,
+        Edge::Top => y - boundary,
+        Edge::Right => boundary - x,
+        Edge::Bottom => boundary - y,
+    }
+}
+
+fn clip_against<V: ClipCorner>(edge: Edge, boundary: f32, input: &[V]) -> Vec<V> {
     let n = input.len();
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..n {
@@ -323,7 +450,7 @@ fn clip_against(edge: Edge, boundary: f32, input: &[Vertex]) -> Vec<Vertex> {
     out
 }
 
-fn crossing(from: Vertex, to: Vertex, from_d: f32, to_d: f32) -> Vertex {
+fn crossing<V: ClipCorner>(from: V, to: V, from_d: f32, to_d: f32) -> V {
     let span = from_d - to_d;
     // The ends straddle the edge, so the span is non-zero except for the
     // degenerate case of both distances exactly zero.
@@ -332,13 +459,7 @@ fn crossing(from: Vertex, to: Vertex, from_d: f32, to_d: f32) -> Vertex {
     } else {
         0.0
     };
-    let lerp = |a: f32, b: f32| a + (b - a) * t;
-    Vertex::new(
-        lerp(from.x, to.x),
-        lerp(from.y, to.y),
-        lerp(from.u, to.u),
-        lerp(from.v, to.v),
-    )
+    from.toward(to, t)
 }
 
 /// Widgets draw through this: it keeps the origin, clip and opacity of the
@@ -356,6 +477,8 @@ pub struct RenderContext<'a> {
     alphas: Vec<f32>,
     sprite_sizes: &'a dyn SpriteSizes,
     media_seconds: f64,
+    device_pixel: f32,
+    sharp_fonts: Option<Arc<SharpFonts>>,
 }
 
 /// Pixel sizes of render surfaces, so widgets can tile UI art. `None` for an
@@ -373,6 +496,11 @@ impl SpriteSizes for NoSprites {
     fn sprite_size(&self, _file: u32) -> Option<(u32, u32)> {
         None
     }
+}
+
+/// `value` on a grid of `pixels` steps a unit, half up.
+fn snap_to_grid(value: f32, pixels: f32) -> f32 {
+    (value * pixels + 0.5).floor() / pixels
 }
 
 impl<'a> RenderContext<'a> {
@@ -394,7 +522,30 @@ impl<'a> RenderContext<'a> {
             alphas: Vec::new(),
             sprite_sizes,
             media_seconds: 0.0,
+            device_pixel: 1.0,
+            sharp_fonts: None,
         }
+    }
+
+    /// With how many framebuffer pixels one unit of this context covers, for
+    /// the width of a shape's soft edge. Anything but a positive number
+    /// counts as one.
+    #[must_use]
+    pub fn with_pixels_per_unit(mut self, pixels: f32) -> Self {
+        self.device_pixel = if pixels.is_finite() && pixels > 0.0 {
+            1.0 / pixels
+        } else {
+            1.0
+        };
+        self
+    }
+
+    /// With the sharper font bakes to draw from where this context has more
+    /// than one framebuffer pixel a unit.
+    #[must_use]
+    pub fn with_sharp_fonts(mut self, fonts: Option<Arc<SharpFonts>>) -> Self {
+        self.sharp_fonts = fonts;
+        self
     }
 
     /// With the UI media clock (seconds) animated media is sampled at.
@@ -729,6 +880,252 @@ impl<'a> RenderContext<'a> {
         });
     }
 
+    /// Local triangles, three corners each with its own colour, following
+    /// the origin, the opacity and the clip like every other primitive. A
+    /// triangle with anything but finite numbers in it is dropped, so what
+    /// reaches the GPU is always something it can draw.
+    pub fn triangles(&mut self, triangles: &[ColorVertex]) {
+        if self.current_clip_is_empty() {
+            return;
+        }
+        let mut vertices = Vec::with_capacity(triangles.len());
+        for t in triangles.chunks_exact(3) {
+            let placed = [self.place(t[0]), self.place(t[1]), self.place(t[2])];
+            if !placed.iter().all(ColorVertex::is_finite) {
+                continue;
+            }
+            match self.clip {
+                Some(clip) => clip.clip_triangle(placed, &mut vertices),
+                None => vertices.extend_from_slice(&placed),
+            }
+        }
+        if !vertices.is_empty() {
+            self.emit(DrawCmd::Triangles { vertices });
+        }
+    }
+
+    fn place(&self, v: ColorVertex) -> ColorVertex {
+        ColorVertex::new(
+            self.origin.0 + v.x,
+            self.origin.1 + v.y,
+            self.apply_alpha(v.color),
+        )
+    }
+
+    /// A rectangle with rounded corners and a smooth edge; zero radii give
+    /// square corners.
+    pub fn fill_rounded_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: CornerRadii,
+        color: Color,
+    ) {
+        let mut shape = Vec::new();
+        shapes::fill_rounded_rect((x, y, w, h), radii, color, self.device_pixel, &mut shape);
+        self.triangles(&shape);
+    }
+
+    /// A rounded rectangle's outline `thickness` wide, centred on the
+    /// outline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_rounded_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: CornerRadii,
+        color: Color,
+        thickness: f32,
+    ) {
+        let mut shape = Vec::new();
+        shapes::stroke_rounded_rect(
+            (x, y, w, h),
+            radii,
+            color,
+            thickness,
+            self.device_pixel,
+            &mut shape,
+        );
+        self.triangles(&shape);
+    }
+
+    /// An ellipse filling a local rectangle.
+    pub fn fill_ellipse(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        let mut shape = Vec::new();
+        shapes::fill_ellipse((x, y, w, h), color, self.device_pixel, &mut shape);
+        self.triangles(&shape);
+    }
+
+    /// The outline, `thickness` wide, of an ellipse filling a local
+    /// rectangle.
+    pub fn stroke_ellipse(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color, thickness: f32) {
+        let mut shape = Vec::new();
+        shapes::stroke_ellipse(
+            (x, y, w, h),
+            color,
+            thickness,
+            self.device_pixel,
+            &mut shape,
+        );
+        self.triangles(&shape);
+    }
+
+    /// A convex polygon with a colour at each corner and a smooth edge; what
+    /// it came to says why nothing was drawn.
+    pub fn fill_convex_polygon(&mut self, corners: &[ColorVertex]) -> ShapeOutcome {
+        let mut shape = Vec::new();
+        let outcome = shapes::fill_convex_polygon(corners, self.device_pixel, &mut shape);
+        self.triangles(&shape);
+        outcome
+    }
+
+    /// A straight segment `thickness` wide with smooth sides and square,
+    /// flush ends.
+    pub fn smooth_line(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        color: Color,
+        thickness: f32,
+    ) {
+        let (dx, dy) = (x1 - x0, y1 - y0);
+        let length = (dx * dx + dy * dy).sqrt();
+        if length.is_nan() || length <= 0.0 || thickness.is_nan() || thickness <= 0.0 {
+            return;
+        }
+        let nx = -dy / length * thickness * 0.5;
+        let ny = dx / length * thickness * 0.5;
+        self.fill_convex_polygon(&[
+            ColorVertex::new(x0 + nx, y0 + ny, color),
+            ColorVertex::new(x1 + nx, y1 + ny, color),
+            ColorVertex::new(x1 - nx, y1 - ny, color),
+            ColorVertex::new(x0 - nx, y0 - ny, color),
+        ]);
+    }
+
+    /// A rounded rectangle whose colour runs from `top` to `bottom`. Each
+    /// corner of the shape takes the colour at its height; the soft edge
+    /// keeps its own transparency.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_vertical_gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: CornerRadii,
+        top: Color,
+        bottom: Color,
+    ) {
+        self.fill_gradient((x, y, w, h), radii, top, bottom, |v| (v.y - y) / h);
+    }
+
+    /// A rounded rectangle whose colour runs from `left` to `right`. Each
+    /// corner of the shape takes the colour at its place across; the soft
+    /// edge keeps its own transparency.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fill_horizontal_gradient(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: CornerRadii,
+        left: Color,
+        right: Color,
+    ) {
+        self.fill_gradient((x, y, w, h), radii, left, right, |v| (v.x - x) / w);
+    }
+
+    /// A rounded rectangle whose corners each take the colour `along` says
+    /// they are from `start` to `end`.
+    fn fill_gradient(
+        &mut self,
+        rect: shapes::ShapeRect,
+        radii: CornerRadii,
+        start: Color,
+        end: Color,
+        along: impl Fn(&ColorVertex) -> f32,
+    ) {
+        let mut shape = Vec::new();
+        shapes::fill_rounded_rect(rect, radii, Color::WHITE, self.device_pixel, &mut shape);
+        for v in &mut shape {
+            let c = start.lerp(end, along(v).clamp(0.0, 1.0));
+            v.color = Color {
+                a: c.a * v.color.a,
+                ..c
+            };
+        }
+        self.triangles(&shape);
+    }
+
+    /// The soft shadow of an opaque rounded rectangle at (`x`, `y`), dropped
+    /// `drop` below it: `color` where it meets the rectangle, fading to
+    /// nothing `spread` further out. Only what the caster leaves showing is
+    /// drawn: the bands round the dropped rectangle, and the dropped rectangle
+    /// itself from where the caster's bottom corners start to round off. Drawn
+    /// with the clip lifted to the whole screen, because a shadow lies outside
+    /// the element that casts it. Anything but finite numbers draws nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn soft_shadow(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        drop: f32,
+        spread: f32,
+        color: Color,
+    ) {
+        const LAYERS: u32 = 6;
+        let numbers = [x, y, w, h, radius, drop, spread, color.a];
+        if !numbers.iter().all(|n| n.is_finite()) || color.a <= 0.0 {
+            return;
+        }
+        let layer = Color {
+            a: color.a / LAYERS as f32,
+            ..color
+        };
+        let radii = CornerRadii::all(radius);
+        let top = y + drop.max(0.0);
+        let rect = (x, top, w, h);
+        self.push_clip_unbounded();
+        let mut shape = Vec::new();
+        shapes::shadow_bands(
+            rect,
+            radii,
+            (spread, LAYERS),
+            layer,
+            self.device_pixel,
+            &mut shape,
+        );
+        self.triangles(&shape);
+
+        // Above the caster's bottom corners its straight sides cover the
+        // dropped rectangle edge to edge.
+        let shown = y + h - radius.clamp(0.0, (h * 0.5).max(0.0));
+        self.push_clip(x, shown, w, top + h - shown);
+        shape.clear();
+        shapes::shadow_core(
+            rect,
+            radii,
+            (spread, LAYERS),
+            layer,
+            self.device_pixel,
+            &mut shape,
+        );
+        self.triangles(&shape);
+        self.pop_clip();
+        self.pop_clip();
+    }
+
     /// Draw `text` with a dat font at local (`x`, `y`) (the line top):
     /// with `outline`, first the whole string's outline pass in
     /// `outline_color`, then the fill pass.
@@ -755,7 +1152,9 @@ impl<'a> RenderContext<'a> {
     /// One pass of [`RenderContext::string_dat`]: the fill, or the outline
     /// from the background atlas (inflated by the border pixels), or eight
     /// one-pixel offset copies of the fill when the font has no background.
-    /// Each glyph lands on a whole pixel; the baseline is snapped once.
+    /// Each glyph lands on a whole pixel; the baseline is snapped once. A fill
+    /// on a high-density display takes its glyph images from the font's sharper
+    /// bake when it has one, and the pen still moves by the font's own metrics.
     pub fn string_dat_pass(
         &mut self,
         font: &UiFont,
@@ -775,12 +1174,51 @@ impl<'a> RenderContext<'a> {
             (true, Some(bg)) => bg,
             _ => font.foreground,
         };
+        let sharp = if outline_pass {
+            None
+        } else {
+            self.sharp_font(font)
+        };
+        // The sharper glyphs sit on the framebuffer's pixels, so its baseline
+        // must too: a whole unit is half a pixel out at 1.5, and nearest
+        // sampling there would split every texel.
+        let grid = sharp
+            .as_ref()
+            .map_or(1.0, |s| s.scale.min(1.0 / self.device_pixel));
+        let sharp_base_y = snap_to_grid(base_y, grid);
         let mut quads = Vec::new();
+        let mut sharp_quads = Vec::new();
         let mut pen = origin_x;
         for c in text.chars() {
             let Some(g) = font.glyph(c) else {
                 continue;
             };
+            if let Some(s) = &sharp
+                && let Some(fine) = s.font.glyph(c)
+                && fine.width > 0
+                && fine.height > 0
+            {
+                let texel = 1.0 / s.scale;
+                let down = f32::from(fine.vertical_offset_before) * texel * grid;
+                let uv = atlas_uv(
+                    i32::from(fine.offset_x),
+                    i32::from(fine.offset_y),
+                    i32::from(fine.width),
+                    i32::from(fine.height),
+                    s.font.foreground.width,
+                    s.font.foreground.height,
+                );
+                self.push_glyph(
+                    &mut sharp_quads,
+                    snap_to_grid(pen + f32::from(fine.horizontal_offset_before) * texel, grid),
+                    sharp_base_y + down.round_ties_even() / grid,
+                    f32::from(fine.width) * texel,
+                    f32::from(fine.height) * texel,
+                    uv,
+                );
+                pen += crate::font::glyph_advance(g);
+                continue;
+            }
             let gx = (pen + f32::from(g.horizontal_offset_before) + 0.5).floor();
             let gy = base_y + f32::from(g.vertical_offset_before);
             let (gw, gh) = (f32::from(g.width), f32::from(g.height));
@@ -801,15 +1239,65 @@ impl<'a> RenderContext<'a> {
             }
             pen += crate::font::glyph_advance(g);
         }
-        if quads.is_empty() {
-            return;
-        }
         let tint = self.apply_alpha(tint);
-        self.emit(DrawCmd::Glyphs {
-            texture: texture.texture,
-            tint,
-            quads,
-        });
+        if !quads.is_empty() {
+            self.emit(DrawCmd::Glyphs {
+                texture: texture.texture,
+                tint,
+                quads,
+            });
+        }
+        if let Some(s) = sharp
+            && !sharp_quads.is_empty()
+        {
+            self.emit(DrawCmd::Glyphs {
+                texture: s.font.foreground.texture,
+                tint,
+                quads: sharp_quads,
+            });
+        }
+    }
+
+    /// The sharper bake to draw `font` from: none at one framebuffer pixel a
+    /// unit or less, where it would be no sharper.
+    fn sharp_font(&self, font: &UiFont) -> Option<SharpFont> {
+        if self.device_pixel >= 1.0 {
+            return None;
+        }
+        self.sharp_fonts.as_ref()?.get(&font.id).cloned()
+    }
+
+    /// Framebuffer pixels one unit of this context covers.
+    #[must_use]
+    pub fn pixels_per_unit(&self) -> f32 {
+        1.0 / self.device_pixel
+    }
+
+    /// One pass of glyphs a caller laid out: `(x, y, w, h, uv)` from this
+    /// context's origin, each snapped to a grid of `grid` cells a unit.
+    pub fn placed_glyphs(
+        &mut self,
+        texture: TextureRef,
+        tint: Color,
+        grid: f32,
+        glyphs: impl IntoIterator<Item = (f32, f32, f32, f32, (f32, f32, f32, f32))>,
+    ) {
+        let (ox, oy) = self.origin;
+        let mut quads = Vec::new();
+        for (x, y, w, h, uv) in glyphs {
+            if w > 0.0 && h > 0.0 {
+                let (x, y) = (snap_to_grid(ox + x, grid), snap_to_grid(oy + y, grid));
+                self.push_glyph(&mut quads, x, y, w, h, uv);
+            }
+        }
+        if !quads.is_empty() {
+            let tint = self.apply_alpha(tint);
+            self.emit(DrawCmd::Glyphs {
+                texture,
+                tint,
+                quads,
+            });
+        }
     }
 
     fn push_glyph(
@@ -1371,6 +1859,179 @@ mod tests {
         assert_eq!(seen.len(), 9);
     }
 
+    /// A sharper bake of font `font_id` at `scale`, with a texture of its own.
+    fn sharp_twin(
+        font_id: u32,
+        glyphs: &[ac_dat::objects::FontCharDesc],
+        scale: f32,
+    ) -> Arc<SharpFonts> {
+        let twin = UiFont::new(
+            font_id + 1,
+            Atlas {
+                texture: TextureRef::Runtime(22),
+                width: 128,
+                height: 128,
+            },
+            None,
+            32.0,
+            24.0,
+            glyphs.iter().copied(),
+            0,
+            0,
+        );
+        Arc::new(SharpFonts::from([(
+            font_id,
+            SharpFont {
+                font: Arc::new(twin),
+                scale,
+            },
+        )]))
+    }
+
+    fn sharp_ctx(
+        pixels: f32,
+        fonts: Arc<SharpFonts>,
+        f: impl FnOnce(&mut RenderContext<'_>),
+    ) -> DrawList {
+        let mut list = DrawList::default();
+        let mut ctx = RenderContext::new(&mut list, (800.0, 600.0), &NoSprites)
+            .with_pixels_per_unit(pixels)
+            .with_sharp_fonts(Some(fonts));
+        f(&mut ctx);
+        list
+    }
+
+    fn fill(c: &mut RenderContext<'_>, f: &UiFont, text: &str, x: f32, y: f32) {
+        c.string_dat(f, text, x, y, Color::WHITE, false, Color::BLACK);
+    }
+
+    #[test]
+    fn a_sharper_bake_draws_at_its_fraction_of_the_size_with_its_own_texture() {
+        let f = font(false, 0, &[glyph('A', (0, 0), (5, 8), 1, 2, 3)]);
+        let twin = sharp_twin(f.id, &[glyph('A', (10, 20), (10, 16), 2, 4, 6)], 2.0);
+        let width = f.measure_width("AA");
+        let list = sharp_ctx(2.0, twin, |c| fill(c, &f, "AA", 0.0, 0.0));
+        assert_eq!(f.measure_width("AA"), width);
+        assert_eq!(list.main.len(), 1);
+        let (texture, _, q) = glyphs(&list.main[0]);
+        assert_eq!(texture, TextureRef::Runtime(22));
+        // The image is half its texels' size; the pen moves by the font's own
+        // advance of 8, not the sharper bake's.
+        assert_eq!((q[0].x, q[0].y, q[0].w, q[0].h), (1.0, 3.0, 5.0, 8.0));
+        assert_eq!((q[1].x, q[1].y), (9.0, 3.0));
+        // Its texture coordinates are the sharper atlas's box.
+        assert_eq!(
+            (q[0].u0, q[0].v0, q[0].u1, q[0].v1),
+            (10.0 / 128.0, 20.0 / 128.0, 20.0 / 128.0, 36.0 / 128.0)
+        );
+    }
+
+    #[test]
+    fn at_one_framebuffer_pixel_a_unit_the_sharper_bake_is_not_used() {
+        let f = font(false, 0, &[glyph('A', (0, 0), (5, 8), 1, 2, 3)]);
+        let twin = sharp_twin(f.id, &[glyph('A', (10, 20), (10, 16), 2, 4, 6)], 2.0);
+        let plain = with_ctx(|c| fill(c, &f, "AA", 0.4, 2.5));
+        let list = sharp_ctx(1.0, twin, |c| fill(c, &f, "AA", 0.4, 2.5));
+        assert_eq!(list, plain);
+    }
+
+    #[test]
+    fn a_font_without_a_sharper_bake_draws_as_it_always_has() {
+        let f = font(false, 0, &[glyph('A', (0, 0), (5, 8), 1, 2, 3)]);
+        let twin = sharp_twin(f.id + 100, &[glyph('A', (10, 20), (10, 16), 2, 4, 6)], 2.0);
+        let plain = with_ctx(|c| fill(c, &f, "AA", 0.4, 2.5));
+        let list = sharp_ctx(2.0, twin, |c| fill(c, &f, "AA", 0.4, 2.5));
+        assert_eq!(list, plain);
+    }
+
+    /// At 1.5 pixels a unit a whole unit is half a pixel out, so every edge
+    /// must land on the finer grid or nearest sampling would split texels.
+    #[test]
+    fn at_one_and_a_half_each_texel_lands_on_one_framebuffer_pixel() {
+        let f = font(
+            false,
+            0,
+            &[
+                glyph('A', (0, 0), (5, 8), 1, 2, 3),
+                glyph('B', (0, 0), (5, 8), 1, 1, 4),
+            ],
+        );
+        let twin = sharp_twin(
+            f.id,
+            &[
+                glyph('A', (10, 20), (9, 12), 1, 3, 5),
+                glyph('B', (30, 20), (9, 12), 2, 2, 7),
+            ],
+            1.5,
+        );
+        let list = sharp_ctx(1.5, twin, |c| fill(c, &f, "ABAB", 3.3, 7.1));
+        let (_, _, q) = glyphs(&list.main[0]);
+        assert_eq!(q.len(), 4);
+        let on_grid = |v: f32| ((v * 1.5).round() - v * 1.5).abs() < 1e-3;
+        for g in q {
+            assert!(on_grid(g.x) && on_grid(g.y), "{g:?}");
+            assert!(on_grid(g.x + g.w) && on_grid(g.y + g.h), "{g:?}");
+            assert_eq!((g.w, g.h), (6.0, 8.0));
+        }
+    }
+
+    #[test]
+    fn a_glyph_the_sharper_bake_has_no_image_for_keeps_the_fonts_own() {
+        // A space has no image at any size; a glyph that did not fit the finer
+        // atlas keeps an empty record.
+        let f = font(
+            false,
+            0,
+            &[
+                glyph('A', (0, 0), (5, 8), 1, 2, 3),
+                glyph('C', (8, 0), (5, 8), 0, 0, 3),
+            ],
+        );
+        let twin = sharp_twin(
+            f.id,
+            &[
+                glyph('A', (10, 20), (10, 16), 2, 4, 6),
+                glyph('C', (0, 0), (0, 0), 0, 0, 0),
+            ],
+            2.0,
+        );
+        let list = sharp_ctx(2.0, twin, |c| fill(c, &f, "AC", 0.0, 0.0));
+        assert_eq!(list.main.len(), 2);
+        let (coarse, _, own) = glyphs(&list.main[0]);
+        assert_eq!(coarse, f.foreground.texture);
+        assert_eq!((own[0].x, own[0].w), (8.0, 5.0));
+        let (fine, _, sharp) = glyphs(&list.main[1]);
+        assert_eq!(fine, TextureRef::Runtime(22));
+        assert_eq!(sharp.len(), 1);
+    }
+
+    #[test]
+    fn an_outline_stays_in_the_fonts_own_glyphs() {
+        let f = font(true, 1, &[glyph('A', (4, 4), (5, 8), 1, 2, 3)]);
+        let twin = sharp_twin(f.id, &[glyph('A', (10, 20), (10, 16), 2, 4, 6)], 2.0);
+        let list = sharp_ctx(2.0, twin, |c| {
+            c.string_dat(&f, "A", 0.0, 0.0, Color::WHITE, true, Color::BLACK);
+        });
+        assert_eq!(list.main.len(), 2);
+        assert_eq!(glyphs(&list.main[0]).0, BG);
+        assert_eq!(glyphs(&list.main[1]).0, TextureRef::Runtime(22));
+    }
+
+    #[test]
+    fn a_sharper_glyph_is_cut_by_the_clip_and_faded_by_the_opacity() {
+        let f = font(false, 0, &[glyph('A', (0, 0), (10, 8), 0, 0, 0)]);
+        let twin = sharp_twin(f.id, &[glyph('A', (0, 0), (20, 16), 0, 0, 0)], 2.0);
+        let list = sharp_ctx(2.0, twin, |c| {
+            c.push_clip(0.0, 0.0, 4.0, 100.0);
+            c.push_alpha(0.5);
+            fill(c, &f, "A", 0.0, 0.0);
+        });
+        let (_, tint, q) = glyphs(&list.main[0]);
+        assert_eq!(tint.a, 0.5);
+        assert_eq!(q[0].w, 4.0);
+        assert_eq!(q[0].u1, 8.0 / 128.0);
+    }
+
     #[test]
     fn glyphs_snap_to_whole_pixels_from_a_snapped_baseline() {
         let f = font(false, 0, &[glyph('A', (0, 0), (5, 8), 1, 0, 4)]);
@@ -1379,6 +2040,317 @@ mod tests {
         let q = glyphs(&list.main[0]).2;
         assert_eq!((q[0].x, q[0].y), (1.0, 7.0));
         assert_eq!((q[1].x, q[1].y), (7.0, 7.0));
+    }
+
+    const RED: Color = Color::rgba(1.0, 0.0, 0.0, 1.0);
+    const BLUE: Color = Color::rgba(0.0, 0.0, 1.0, 1.0);
+    const PURPLE: Color = Color::rgba(0.5, 0.0, 0.5, 1.0);
+
+    fn cv(x: f32, y: f32, color: Color) -> ColorVertex {
+        ColorVertex::new(x, y, color)
+    }
+
+    fn cut(clip: ClipRect, triangle: [ColorVertex; 3]) -> Vec<ColorVertex> {
+        let mut out = Vec::new();
+        clip.clip_triangle(triangle, &mut out);
+        out
+    }
+
+    fn assert_near(actual: ColorVertex, expected: ColorVertex) {
+        let c = (actual.color, expected.color);
+        let far = [
+            actual.x - expected.x,
+            actual.y - expected.y,
+            c.0.r - c.1.r,
+            c.0.g - c.1.g,
+            c.0.b - c.1.b,
+            c.0.a - c.1.a,
+        ]
+        .iter()
+        .any(|d| d.abs() > 1e-4);
+        assert!(!far, "{actual:?} is not {expected:?}");
+    }
+
+    #[test]
+    fn a_triangle_wholly_inside_the_clip_comes_back_unchanged() {
+        let t = [cv(1.0, 1.0, RED), cv(9.0, 1.0, BLUE), cv(1.0, 9.0, RED)];
+        assert_eq!(cut(ClipRect::new(0.0, 0.0, 10.0, 10.0), t), t);
+    }
+
+    #[test]
+    fn a_triangle_wholly_outside_or_an_empty_clip_leaves_nothing() {
+        let outside = [cv(20.0, 1.0, RED), cv(29.0, 1.0, BLUE), cv(20.0, 9.0, RED)];
+        assert!(cut(ClipRect::new(0.0, 0.0, 10.0, 10.0), outside).is_empty());
+        let inside = [cv(1.0, 1.0, RED), cv(2.0, 1.0, RED), cv(1.0, 2.0, RED)];
+        assert!(cut(ClipRect::new(0.0, 0.0, 0.0, 10.0), inside).is_empty());
+    }
+
+    #[test]
+    fn a_cut_gains_corners_on_the_edge_with_the_colour_blended() {
+        let out = cut(
+            ClipRect::new(0.0, 0.0, 10.0, 100.0),
+            [cv(0.0, 0.0, RED), cv(20.0, 0.0, BLUE), cv(0.0, 20.0, RED)],
+        );
+        // Four corners left, as two triangles from the first.
+        assert_eq!(out.len(), 6);
+        let expected = [
+            cv(0.0, 0.0, RED),
+            cv(10.0, 0.0, PURPLE),
+            cv(10.0, 10.0, PURPLE),
+            cv(0.0, 0.0, RED),
+            cv(10.0, 10.0, PURPLE),
+            cv(0.0, 20.0, RED),
+        ];
+        for (actual, expected) in out.iter().zip(expected) {
+            assert_near(*actual, expected);
+        }
+    }
+
+    #[test]
+    fn a_triangle_cut_on_every_edge_has_seven_corners_all_inside() {
+        let out = cut(
+            ClipRect::new(0.0, 0.0, 20.0, 20.0),
+            [cv(-5.0, -5.0, RED), cv(25.0, 5.0, BLUE), cv(5.0, 25.0, RED)],
+        );
+        // Seven corners make five triangles.
+        assert_eq!(out.len(), 15);
+        for v in out {
+            assert!((-1e-4..=20.0 + 1e-4).contains(&v.x), "{v:?}");
+            assert!((-1e-4..=20.0 + 1e-4).contains(&v.y), "{v:?}");
+        }
+    }
+
+    fn triangle() -> [ColorVertex; 3] {
+        [cv(0.0, 0.0, RED), cv(20.0, 0.0, BLUE), cv(0.0, 20.0, RED)]
+    }
+
+    fn triangles(list: &DrawList) -> &[ColorVertex] {
+        match &list.main[0] {
+            DrawCmd::Triangles { vertices } => vertices,
+            other => panic!("not triangles: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triangles_move_with_the_origin_and_fade_with_the_opacity() {
+        let list = with_ctx(|c| {
+            c.push_transform(10.0, 20.0);
+            c.push_alpha(0.5);
+            c.triangles(&triangle());
+        });
+        let v = triangles(&list);
+        assert_eq!(v.len(), 3);
+        assert_eq!((v[0].x, v[0].y), (10.0, 20.0));
+        assert_eq!((v[1].x, v[1].y), (30.0, 20.0));
+        assert_eq!((v[0].color.a, v[1].color.a, v[2].color.a), (0.5, 0.5, 0.5));
+    }
+
+    #[test]
+    fn a_clip_cuts_triangles_and_blends_the_colour_at_the_cut() {
+        let list = with_ctx(|c| {
+            c.push_clip(0.0, 0.0, 10.0, 100.0);
+            c.triangles(&triangle());
+        });
+        let v = triangles(&list);
+        assert_eq!(v.len(), 6);
+        for p in v {
+            assert!(p.x <= 10.0 + 1e-4);
+            if (p.x - 10.0).abs() < 1e-4 {
+                assert!((p.color.r - 0.5).abs() < 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn a_triangle_that_is_not_all_numbers_is_dropped_and_the_rest_are_kept() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut bad_position = triangle();
+            bad_position[1].x = bad;
+            let mut bad_colour = triangle();
+            bad_colour[2].color.g = bad;
+            for broken in [bad_position, bad_colour] {
+                let list = with_ctx(|c| {
+                    c.triangles(&[broken, triangle()].concat());
+                });
+                assert_eq!(triangles(&list), triangle());
+                let clipped = with_ctx(|c| {
+                    c.push_clip(0.0, 0.0, 100.0, 100.0);
+                    c.triangles(&[broken, triangle()].concat());
+                });
+                assert_eq!(triangles(&clipped), triangle());
+            }
+        }
+    }
+
+    #[test]
+    fn triangles_outside_the_clip_or_under_an_empty_one_draw_nothing() {
+        let list = with_ctx(|c| {
+            c.push_clip(50.0, 50.0, 10.0, 10.0);
+            c.triangles(&triangle());
+            c.pop_clip();
+            c.push_clip(0.0, 0.0, 0.0, 10.0);
+            c.triangles(&triangle());
+        });
+        assert!(list.main.is_empty());
+    }
+
+    #[test]
+    fn a_shape_moves_with_the_origin_and_is_cut_by_the_clip() {
+        let list = with_ctx(|c| {
+            c.push_transform(100.0, 100.0);
+            c.push_clip(0.0, 0.0, 10.0, 40.0);
+            c.fill_rounded_rect(0.0, 0.0, 20.0, 20.0, CornerRadii::all(4.0), RED);
+        });
+        for v in triangles(&list) {
+            assert!(v.x >= 99.5 && v.x <= 110.0 + 1e-4, "{v:?}");
+            assert!(v.y >= 99.5 && v.y <= 120.5, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn a_shapes_soft_edge_is_one_device_pixel_wide() {
+        let rim = |pixels: f32| {
+            let mut list = DrawList::default();
+            let mut c = RenderContext::new(&mut list, (800.0, 600.0), &NoSprites)
+                .with_pixels_per_unit(pixels);
+            c.fill_rounded_rect(10.0, 10.0, 20.0, 20.0, CornerRadii::default(), RED);
+            triangles(&list)
+                .iter()
+                .map(|v| v.x)
+                .fold(f32::MAX, f32::min)
+        };
+        assert_eq!(rim(1.0), 9.5);
+        assert_eq!(rim(2.0), 9.75);
+        // A scale that means nothing counts as one.
+        assert_eq!(rim(0.0), 9.5);
+        assert_eq!(rim(f32::NAN), 9.5);
+    }
+
+    #[test]
+    fn a_polygon_says_what_it_came_to_and_draws_only_when_it_drew() {
+        let list = with_ctx(|c| {
+            let line = [cv(0.0, 0.0, RED), cv(10.0, 0.0, RED), cv(20.0, 0.0, RED)];
+            assert_eq!(c.fill_convex_polygon(&line), ShapeOutcome::Nothing);
+            assert_eq!(
+                c.fill_convex_polygon(&line[..2]),
+                ShapeOutcome::TooFewPoints
+            );
+        });
+        assert!(list.main.is_empty());
+        let list = with_ctx(|c| {
+            assert_eq!(c.fill_convex_polygon(&triangle()), ShapeOutcome::Drawn);
+        });
+        assert_eq!(list.main.len(), 1);
+    }
+
+    #[test]
+    fn a_smooth_line_has_soft_sides_round_its_thickness() {
+        let list = with_ctx(|c| c.smooth_line(10.0, 20.0, 110.0, 20.0, RED, 4.0));
+        let ys: Vec<f32> = triangles(&list).iter().map(|v| v.y).collect();
+        assert_eq!(ys.iter().copied().fold(f32::MAX, f32::min), 17.5);
+        assert_eq!(ys.iter().copied().fold(f32::MIN, f32::max), 22.5);
+        let list = with_ctx(|c| {
+            c.smooth_line(5.0, 5.0, 5.0, 5.0, RED, 3.0);
+            c.smooth_line(0.0, 0.0, 50.0, 0.0, RED, 0.0);
+        });
+        assert!(list.main.is_empty());
+    }
+
+    #[test]
+    fn a_gradient_takes_the_colour_at_its_height_and_keeps_its_soft_edge() {
+        let list = with_ctx(|c| {
+            c.fill_vertical_gradient(0.0, 100.0, 50.0, 100.0, CornerRadii::default(), RED, BLUE);
+        });
+        let v = triangles(&list);
+        let solid_top = v
+            .iter()
+            .find(|p| p.y == 100.5 && p.color.a == 1.0)
+            .expect("the solid ring's top");
+        assert!((solid_top.color.r - 0.995).abs() < 1e-4);
+        let solid_bottom = v
+            .iter()
+            .find(|p| p.y == 199.5 && p.color.a == 1.0)
+            .expect("the solid ring's bottom");
+        assert!((solid_bottom.color.b - 0.995).abs() < 1e-4);
+        // The rim beyond the shape holds the end colour, faded out.
+        let rim = v.iter().find(|p| p.y == 99.5).expect("the top rim");
+        assert_eq!(rim.color, Color { a: 0.0, ..RED });
+    }
+
+    #[test]
+    fn a_horizontal_gradient_takes_the_colour_at_its_place_and_keeps_its_soft_edge() {
+        let list = with_ctx(|c| {
+            c.fill_horizontal_gradient(100.0, 0.0, 100.0, 50.0, CornerRadii::default(), RED, BLUE);
+        });
+        let v = triangles(&list);
+        let solid_left = v
+            .iter()
+            .find(|p| p.x == 100.5 && p.color.a == 1.0)
+            .expect("the solid ring's left");
+        assert!((solid_left.color.r - 0.995).abs() < 1e-4);
+        let solid_right = v
+            .iter()
+            .find(|p| p.x == 199.5 && p.color.a == 1.0)
+            .expect("the solid ring's right");
+        assert!((solid_right.color.b - 0.995).abs() < 1e-4);
+        // The rim beyond the shape holds the end colour, faded out.
+        let rim = v.iter().find(|p| p.x == 99.5).expect("the left rim");
+        assert_eq!(rim.color, Color { a: 0.0, ..RED });
+        let rim = v.iter().find(|p| p.x == 200.5).expect("the right rim");
+        assert_eq!(rim.color, Color { a: 0.0, ..BLUE });
+    }
+
+    /// Rounded corners keep to the line between the two colours, and a shape
+    /// with no width draws nothing rather than dividing by it.
+    #[test]
+    fn a_horizontal_gradient_follows_rounded_corners_and_ignores_an_empty_shape() {
+        let list = with_ctx(|c| {
+            c.fill_horizontal_gradient(0.0, 0.0, 100.0, 50.0, CornerRadii::all(10.0), RED, BLUE);
+        });
+        for p in triangles(&list) {
+            let t = (p.x / 100.0).clamp(0.0, 1.0);
+            assert!((p.color.b - t).abs() < 1e-4, "{p:?}");
+            assert!((p.color.r - (1.0 - t)).abs() < 1e-4, "{p:?}");
+        }
+        let empty = with_ctx(|c| {
+            c.fill_horizontal_gradient(0.0, 0.0, 0.0, 50.0, CornerRadii::default(), RED, BLUE);
+        });
+        assert!(empty.main.is_empty());
+    }
+
+    #[test]
+    fn a_shadow_escapes_the_clip_and_leaves_the_stacks_as_they_were() {
+        let black = Color::rgba(0.0, 0.0, 0.0, 0.5);
+        let mut list = DrawList::default();
+        let mut c = RenderContext::new(&mut list, (800.0, 600.0), &NoSprites);
+        c.push_clip(100.0, 100.0, 40.0, 40.0);
+        let before = c.depths();
+        c.soft_shadow(100.0, 100.0, 40.0, 40.0, 6.0, 4.0, 14.0, black);
+        assert_eq!(c.depths(), before);
+        let reach = list.commands().flat_map(|cmd| match cmd {
+            DrawCmd::Triangles { vertices } => vertices.iter().map(|v| v.x).collect(),
+            _ => Vec::new(),
+        });
+        assert!(reach.fold(f32::MAX, f32::min) < 100.0);
+        // The bands, then the strip of the dropped rectangle showing below
+        // the caster.
+        assert_eq!(list.main.len(), 2);
+        let DrawCmd::Triangles { vertices } = &list.main[1] else {
+            panic!("the strip is triangles");
+        };
+        for v in vertices {
+            assert!(v.y >= 134.0 - 1e-3 && v.y <= 144.0 + 1e-3, "{v:?}");
+            assert!(v.x >= 100.0 - 1e-3 && v.x <= 140.0 + 1e-3, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn a_shadow_with_no_colour_draws_nothing() {
+        let list = with_ctx(|c| {
+            c.soft_shadow(0.0, 0.0, 10.0, 10.0, 2.0, 2.0, 4.0, Color::TRANSPARENT);
+            c.soft_shadow(0.0, 0.0, 10.0, 10.0, 2.0, 2.0, 0.0, Color::BLACK);
+        });
+        assert!(list.main.is_empty());
     }
 
     #[test]

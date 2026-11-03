@@ -18,6 +18,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
+use winit::monitor::MonitorHandle;
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::audio::{PlayerPlace, WindowAudio};
@@ -32,12 +33,15 @@ use crate::gpu_timer::GpuTimer;
 use crate::input::InputState;
 use crate::lifetime::OrderedTeardown;
 use crate::pacing::DisplayPacing;
+use crate::platform::HostOs;
 use crate::portal_space::PortalCue;
-use crate::profiler::{FrameProfiler, FrameRateTitle, FrameStage, TitleFacts, format_title};
+use crate::profiler::{FrameProfiler, FrameRateTitle, FrameStage};
 use crate::renderer::{WorldRenderer, WorldSettings, WorldStats};
 use crate::scene::{SceneEffect, SceneSource};
+use crate::title::{TitleFacts, TitleStats, TitleSubject, format_title};
 use crate::ui::input::{self as ui_input, Routed, WorldInput};
 use crate::ui::{UiBatch, UiRenderer, WindowUi};
+use crate::ui_scale::UiScale;
 use crate::{RenderError, WindowSpec};
 use ac_core::sky::EnvironmentEffect;
 use ac_runtime::session::SessionCommand;
@@ -134,27 +138,49 @@ struct OpenFrame {
     reconfigure_after: bool,
 }
 
+/// A size `monitor` reports in pixels (its own, one of its modes'), in
+/// the unit the window's size and the resolution picks are counted in
+/// (points on macOS, as OpenAC's window library lists modes there).
+fn in_window_unit(monitor: &MonitorHandle, pixels: (i32, i32)) -> (i32, i32) {
+    match crate::display_mode::size_unit(HostOs::current()) {
+        crate::display_mode::SizeUnit::Pixels => pixels,
+        unit @ crate::display_mode::SizeUnit::Points => {
+            let side = |p: i32| u32::try_from(p).unwrap_or(0);
+            let (w, h) =
+                unit.from_pixels((side(pixels.0), side(pixels.1)), || monitor.scale_factor());
+            (i32::try_from(w).unwrap_or(0), i32::try_from(h).unwrap_or(0))
+        }
+    }
+}
+
+/// `monitor`'s size, in the window's size unit.
+fn desktop_of(monitor: &MonitorHandle) -> Option<(i32, i32)> {
+    crate::platform::monitor_size(monitor).map(|size| in_window_unit(monitor, size))
+}
+
 /// The fullscreen modes offered for the monitor `window` is on: the
 /// monitor's curated modes, else the standard sizes (OpenAC
 /// `DisplayModeCatalog.Resolutions ?? AvailableResolutions`).
 fn fullscreen_modes_of(window: &Window) -> Vec<String> {
     use ac_ui::panels::options::resolutions::{AVAILABLE_RESOLUTIONS, curate};
     let monitor = window.current_monitor();
-    let size = |s: PhysicalSize<u32>| {
-        (
-            i32::try_from(s.width).unwrap_or(0),
-            i32::try_from(s.height).unwrap_or(0),
+    let size = |monitor: &MonitorHandle, s: PhysicalSize<u32>| {
+        in_window_unit(
+            monitor,
+            (
+                i32::try_from(s.width).unwrap_or(0),
+                i32::try_from(s.height).unwrap_or(0),
+            ),
         )
     };
     let curated = monitor
         .as_ref()
-        .and_then(crate::platform::monitor_size)
+        .and_then(desktop_of)
         .filter(|(w, h)| *w > 0 && *h > 0)
         .map(|desktop| {
             let modes: Vec<(i32, i32)> = monitor
                 .iter()
-                .flat_map(winit::monitor::MonitorHandle::video_modes)
-                .map(|m| size(m.size()))
+                .flat_map(|monitor| monitor.video_modes().map(|m| size(monitor, m.size())))
                 .collect();
             curate(&modes, desktop)
         })
@@ -172,16 +198,20 @@ fn fullscreen_modes_of(window: &Window) -> Vec<String> {
 /// The resolutions the display menu offers for the monitor `window` is on.
 fn resolution_choices_of(window: &Window) -> Vec<String> {
     let monitor = window.current_monitor();
-    let desktop = monitor.as_ref().and_then(crate::platform::monitor_size);
+    let desktop = monitor.as_ref().and_then(desktop_of);
     let modes: Vec<(i32, i32)> = monitor
         .iter()
-        .flat_map(winit::monitor::MonitorHandle::video_modes)
-        .map(|m| {
-            let s = m.size();
-            (
-                i32::try_from(s.width).unwrap_or(0),
-                i32::try_from(s.height).unwrap_or(0),
-            )
+        .flat_map(|monitor| {
+            monitor.video_modes().map(|m| {
+                let s = m.size();
+                in_window_unit(
+                    monitor,
+                    (
+                        i32::try_from(s.width).unwrap_or(0),
+                        i32::try_from(s.height).unwrap_or(0),
+                    ),
+                )
+            })
         })
         .collect();
     crate::ui::options::resolution_choices(&modes, desktop)
@@ -265,6 +295,7 @@ pub(crate) struct AttachedWindow {
     clear_color: wgpu::Color,
     adapter: AdapterSummary,
     frames_presented: u64,
+    /// The title the window shows (set again only when it changes).
     title: String,
     scene: Option<Box<SceneSource>>,
     world_failure_reported: bool,
@@ -294,6 +325,12 @@ pub(crate) struct AttachedWindow {
     modifiers: ModifiersState,
     /// The last cursor position, for drags.
     cursor: Option<(f64, f64)>,
+    /// Framebuffer pixels per UI unit as the window's monitor has it,
+    /// before the player's UI Scale (see [`Self::ui_scale`]).
+    platform_scale: UiScale,
+    /// The UI Scale option in force, percent: it follows the settings once
+    /// a change settles (not while its slider is dragged).
+    ui_scale_percent: i32,
     /// Where this window publishes what a crash report wants.
     facts: SharedFacts,
     last_world: WorldOutcome,
@@ -356,10 +393,22 @@ impl AttachedWindow {
         options: &GraphicsOptions,
         settings: &ac_host::settings::PlayerSettings,
     ) -> Result<Self, RenderError> {
+        // The size picked is in points on macOS (the UI's unit there), in
+        // pixels elsewhere; the drawing surface follows in pixels.
         let attributes = Window::default_attributes()
             .with_title(spec.title.clone())
-            .with_inner_size(PhysicalSize::new(spec.width, spec.height));
+            .with_active(true)
+            .with_inner_size(
+                crate::display_mode::size_unit(HostOs::current()).request(spec.width, spec.height),
+            );
         let window = Arc::new(event_loop.create_window(attributes)?);
+        // A window opened onto a running session (the console's or the
+        // launcher's switch to graphical) comes to the front with the
+        // keyboard, though this process was not the one in front. A
+        // compositor may refuse (Wayland grants focus only to a request it
+        // handed a token for; some X11 window managers prevent focus
+        // stealing): the window then opens behind, as it would without this.
+        window.focus_window();
         // Fullscreen is a mode switch to the chosen resolution, as later
         // (on Wayland the compositor's fullscreen at the monitor's mode).
         let mut display_lines = Vec::new();
@@ -462,9 +511,15 @@ impl AttachedWindow {
         // The retail UI reads its layouts, fonts and art from the dats; a
         // window without dats draws no UI.
         let choices = resolution_choices_of(&window);
+        let platform_scale = UiScale::for_window(HostOs::current(), window.scale_factor());
         let ui = world.and_then(|world| {
             let built = world.content.ui_dats().and_then(|dats| {
-                WindowUi::build_with(dats, (config.width, config.height), settings, choices)
+                WindowUi::build_with(
+                    dats,
+                    platform_scale.ui_size((config.width, config.height)),
+                    settings,
+                    choices,
+                )
             });
             match built {
                 Ok(mut ui) => {
@@ -583,6 +638,8 @@ impl AttachedWindow {
             gameplay_tick: None,
             modifiers: ModifiersState::empty(),
             cursor: None,
+            platform_scale,
+            ui_scale_percent: settings.display.ui_scale_percent,
             facts: options.facts.clone(),
             last_world: WorldOutcome::default(),
             frame_index: 0,
@@ -623,7 +680,7 @@ impl AttachedWindow {
     fn apply_camera_tuning(&mut self) {
         let tuning = ChaseTuning::from(&self.settings.camera);
         if let Some(world) = self.world.as_mut() {
-            world.cameras_mut().chase.tuning = tuning;
+            world.cameras_mut().chase.set_tuning(tuning);
         }
     }
 
@@ -687,6 +744,11 @@ impl AttachedWindow {
                     }
                     if o.fullscreen != n.fullscreen || o.resolution != n.resolution {
                         self.apply_window_mode(n);
+                    }
+                    // The UI takes its new size on its next frame, and the
+                    // windows are placed again on it as after a resize.
+                    if persist {
+                        self.ui_scale_percent = n.ui_scale_percent;
                     }
                     if let Some(world) = self.world.as_mut() {
                         world.apply_display(
@@ -826,6 +888,8 @@ impl AttachedWindow {
 
     /// The window moved or changed scale: it may be on another monitor.
     pub(crate) fn monitor_changed(&mut self) {
+        // The UI follows on its next frame (its size comes from the scale).
+        self.platform_scale = UiScale::for_window(HostOs::current(), self.window.scale_factor());
         let policy = self
             .pacing
             .set_monitor_refresh(monitor_refresh_hz(&self.window));
@@ -1053,19 +1117,40 @@ impl AttachedWindow {
         self.notices.extend(notices);
     }
 
-    fn title_facts(&self) -> TitleFacts {
-        let objects = self.scene.as_ref().map_or(0, |s| s.scene().len());
+    /// The title for the last refresh interval's frame rate and `world`,
+    /// the last frame's landblocks.
+    fn window_title(&self, fps: f64, mean_ms: f64, world: &WorldOutcome) -> String {
+        let scene = self.scene.as_deref().map(SceneSource::scene);
+        let subject = TitleSubject::of(scene);
+        if subject == TitleSubject::BeforeWorld {
+            return crate::title::product();
+        }
         let stats = self
             .world
             .as_ref()
             .map(WorldRenderer::stats)
             .unwrap_or_default();
-        TitleFacts {
-            visible_landblocks: stats.landblocks_drawn,
-            total_landblocks: stats.landblocks,
-            objects,
-            drawn_objects: stats.objects_drawn,
-        }
+        let placed_server_objects =
+            scene.map_or(0, |s| s.objects().filter(|o| o.position.is_some()).count());
+        let facts = TitleFacts {
+            visible_landblocks: world.visible_landblocks,
+            total_landblocks: world.total_landblocks,
+            objects: self.world.as_ref().map_or(0, WorldRenderer::loaded_objects)
+                + placed_server_objects,
+            animated: stats.animated_objects,
+            calendar: self
+                .world
+                .as_ref()
+                .and_then(|w| w.calendar_date(scene, Instant::now())),
+        };
+        format_title(
+            subject,
+            &TitleStats {
+                fps,
+                mean_ms,
+                facts,
+            },
+        )
     }
 
     /// Record the world (or a clear) into `target`.
@@ -1434,6 +1519,9 @@ impl FramePhases for AttachedWindow {
         if let Some(timer) = self.gpu_timer.as_mut() {
             timer.submitted();
         }
+        if let Some(world) = self.world.as_mut() {
+            world.icon_probes_submitted();
+        }
         self.window.pre_present_notify();
         self.queue.present(frame.texture);
         self.frames_presented += 1;
@@ -1476,11 +1564,11 @@ impl FramePhases for AttachedWindow {
     fn publish(&mut self, input: &FrameInput, outcome: &FrameOutcome) -> Result<(), RenderError> {
         self.after_automation_frame(outcome);
         if let Some((fps, mean_ms)) = self.title_rate.frame(input.delta_seconds) {
-            let mut facts = self.title_facts();
-            facts.visible_landblocks = outcome.world.visible_landblocks;
-            facts.total_landblocks = outcome.world.total_landblocks;
-            self.window
-                .set_title(&format_title(&self.title, fps, mean_ms, facts));
+            let title = self.window_title(fps, mean_ms, &outcome.world);
+            if title != self.title {
+                self.window.set_title(&title);
+                self.title = title;
+            }
             self.publish_facts();
         }
         Ok(())
@@ -1775,7 +1863,9 @@ impl AttachedWindow {
     /// Returns the window's size afterwards.
     fn follow_fullscreen(&mut self) -> PhysicalSize<u32> {
         let mut lines = Vec::new();
-        let (width, height) = crate::display_mode::follow_resize(
+        // The window's size in its own unit (points on macOS); the
+        // drawing surface reads it again in pixels below.
+        let _ = crate::display_mode::follow_resize(
             &mut self.fullscreen_awaiting,
             &mut crate::display_mode::WinitDisplay(&self.window),
             &mut crate::display_mode::WinitDisplay(&self.window),
@@ -1783,7 +1873,7 @@ impl AttachedWindow {
         );
         self.screen_saver.follow(&self.window, &mut lines);
         self.notices.extend(lines);
-        PhysicalSize::new(width, height)
+        self.window.inner_size()
     }
 
     /// The event loop is ending: let go of the screen while the window's
@@ -2179,6 +2269,10 @@ impl AttachedWindow {
     /// The modifier keys changed.
     pub(crate) fn modifiers_changed(&mut self, modifiers: ModifiersState) {
         self.modifiers = modifiers;
+        if let Some(ui) = self.ui.as_mut() {
+            ui.host_mut()
+                .set_modifiers(crate::ui::keys::ui_modifiers(modifiers));
+        }
     }
 
     /// The world's keys, after the UI: presses only when the UI let them
@@ -2289,7 +2383,7 @@ impl AttachedWindow {
     /// world's.
     pub(crate) fn mouse_button(&mut self, button: MouseButton, pressed: bool) {
         let index = button_index(button);
-        let (x, y) = self.cursor_pixel();
+        let (x, y) = self.cursor_ui();
         let held: &[u16] = if pressed { &[index] } else { &[] };
         let flags = ui_input::mouse_flags(held, crate::ui::keys::ui_modifiers(self.modifiers));
         let mouse_look = self.cursor_held();
@@ -2308,9 +2402,11 @@ impl AttachedWindow {
                 pressed,
             }),
         };
-        if let Some(WorldInput::Button { button, pressed }) = world {
+        let world = world_button(world, index, pressed, self.input.is_button_held(index));
+        if let Some((button, pressed, ui_took_it)) = world {
             self.input.button(button, pressed);
-            let state = self.device_state();
+            let mut state = self.device_state();
+            state.want_mouse |= ui_took_it;
             let now = self.gameplay_now();
             let now_ms = u64::try_from(self.input_clock.elapsed().as_millis()).unwrap_or(u64::MAX);
             let mut out = Vec::new();
@@ -2328,10 +2424,10 @@ impl AttachedWindow {
         }
     }
 
-    /// The cursor is held by the window (fly camera or mouse look): the UI
-    /// gets no pointer input.
+    /// The cursor is held by the window (fly camera, mouse look or a modern
+    /// mouse turning drag): the UI gets no pointer input.
     fn cursor_held(&self) -> bool {
-        self.input.mouse_look() || self.gameplay.mouse_look_active()
+        self.input.mouse_look() || self.gameplay.holds_cursor()
     }
 
     /// The wheel turned `notches` (positive away from the user) and
@@ -2466,16 +2562,14 @@ impl AttachedWindow {
         };
         let drops = ui.take_world_drops();
         for (payload, x, y) in drops {
-            let picked = self.pick_object(x as f32, y as f32);
+            let picked = self.pick_at_ui(x, y);
             let amount = self
                 .ui
                 .as_mut()
                 .map_or(0, |ui| ui.drag_amount(payload.obj_id));
-            let from_shortcut_bar =
-                payload.source_kind == ac_ui::event::ItemDragSource::ShortcutBar;
             let outcome = crate::world_click::WorldClicks::drop_item(
                 payload.obj_id,
-                from_shortcut_bar,
+                payload.source_kind,
                 picked.map(|(guid, _)| guid),
                 amount,
             );
@@ -2484,16 +2578,15 @@ impl AttachedWindow {
     }
 
     /// Lift what is under each world drag's press point, if anything lifts
-    /// (your own character out of combat lifts your main pack).
+    /// (out of combat a loose item lifts itself, your own character your
+    /// main pack).
     fn start_world_drags(&mut self) {
         let starts = match self.ui.as_mut() {
             Some(ui) => ui.take_world_drag_starts(),
             None => return,
         };
         for (x, y) in starts {
-            let hit = self
-                .pick_object(x as f32, y as f32)
-                .map_or(0, |(guid, _)| guid);
+            let hit = self.pick_at_ui(x, y).map_or(0, |(guid, _)| guid);
             if let Some(ui) = self.ui.as_mut() {
                 ui.begin_world_drag(hit);
             }
@@ -2527,9 +2620,32 @@ impl AttachedWindow {
         )
     }
 
-    /// The cursor as whole window pixels.
-    fn cursor_pixel(&self) -> (i32, i32) {
-        self.cursor.map_or((0, 0), |(x, y)| (x as i32, y as i32))
+    /// [`Self::pick_object`] at a position the UI reports in its own units
+    /// (points on macOS), which the world picks in pixels.
+    fn pick_at_ui(&mut self, x: i32, y: i32) -> Option<(u32, u32)> {
+        let (x, y) = self.ui_scale().window_point(x, y);
+        self.pick_object(x, y)
+    }
+
+    /// Framebuffer pixels per UI unit now: the monitor's, times the
+    /// player's UI Scale while in the game (the pre-game screens fill the
+    /// window on their own canvas and keep the monitor's).
+    fn ui_scale(&self) -> UiScale {
+        match self.ui.as_ref() {
+            Some(ui) if !ui.pregame_active() => {
+                self.platform_scale.with_user_percent(self.ui_scale_percent)
+            }
+            _ => self.platform_scale,
+        }
+    }
+
+    /// The cursor in whole UI units (the world picks in pixels).
+    fn cursor_ui(&self) -> (i32, i32) {
+        let scale = self.ui_scale();
+        self.cursor.map_or((0, 0), |(x, y)| {
+            let (x, y) = scale.ui_point(x, y);
+            (x as i32, y as i32)
+        })
     }
 
     /// Act on what the UI asked for besides the world's part (session
@@ -2588,6 +2704,8 @@ impl AttachedWindow {
     /// Feed the UI from the scene, draw it, and upload what it draws; its
     /// requests go to the session.
     fn prepare_ui(&mut self) {
+        let scale = self.ui_scale();
+        let framebuffer = (self.config.width, self.config.height);
         let (Some(ui), Some(renderer)) = (self.ui.as_mut(), self.ui_renderer.as_mut()) else {
             return;
         };
@@ -2604,7 +2722,8 @@ impl AttachedWindow {
             }
             // The 3-D viewports that show: drawn by the world renderer,
             // their textures handed to the UI before it draws.
-            let (requests, controls) = ui.viewport_requests(source.scene());
+            let (requests, controls) =
+                ui.viewport_requests(source.scene(), scale.pixels_per_unit());
             let flashes = ui.take_figure_flashes();
             if let Some(world) = self.world.as_mut() {
                 for (whole_figure, part_mask) in flashes {
@@ -2627,16 +2746,17 @@ impl AttachedWindow {
                 ui.show_viewports(&outcomes);
             }
         }
-        let size = (self.config.width, self.config.height);
+        // The UI, its overlays included, is laid out and drawn in UI units.
+        let size = scale.ui_size(framebuffer);
         // The overlays project with the camera the world was last drawn
-        // with.
+        // with, onto the framebuffer in units.
         let (camera, target) = match (self.world.as_ref(), self.scene.as_deref()) {
             (Some(world), Some(source)) => crate::ui::overlays::world_view(
                 world,
                 source.scene(),
                 ui.dats(),
                 &ui.facts().objects,
-                size,
+                scale.overlay_viewport(framebuffer),
             ),
             _ => (None, None),
         };
@@ -2652,14 +2772,22 @@ impl AttachedWindow {
             self.world.as_ref(),
             self.scene.as_deref().map(SceneSource::scene),
         );
-        // The plugins' world lines are drawn in the world pass, with its
-        // depth (OpenAC `PluginWorldLineRenderer`).
+        // The plugins' world lines, triangles and ground shapes are drawn in
+        // the world pass, with its depth (lines as in OpenAC
+        // `PluginWorldLineRenderer`).
         if let Some(world) = self.world.as_mut() {
             world.set_plugin_lines(&self.device, &self.queue, ui.plugin_world_lines());
+            world.set_plugin_triangles(
+                &self.device,
+                &self.queue,
+                ui.plugin_world_triangles(),
+                ui.plugin_world_shapes(),
+            );
+            world.set_icon_probes(&self.device, &self.queue, ui.plugin_icon_probes());
         }
         // The object under the pointer (the world tooltip and the cursor's
         // "found" forms); none while the window holds the cursor.
-        let held = self.input.mouse_look() || self.gameplay.mouse_look_active();
+        let held = self.input.mouse_look() || self.gameplay.holds_cursor();
         let hover = match (self.cursor, self.world.as_mut()) {
             (Some((x, y)), Some(world)) if !held => {
                 let scene = self.scene.as_deref().map(SceneSource::scene);
@@ -2677,9 +2805,17 @@ impl AttachedWindow {
             let (fps, multiplier) = world.level_of_detail();
             ui.set_level_of_detail(fps, multiplier);
         }
+        ui.set_pixels_per_unit(scale.pixels_per_unit());
         let list = ui.frame(Instant::now(), size);
-        let batch = UiBatch::build(&list);
-        renderer.prepare(&self.device, &self.queue, &batch, size, &mut ui.surfaces());
+        // Drawn in framebuffer pixels, on the whole-pixel grid.
+        let batch = UiBatch::build_scaled(&list, scale.pixels_per_unit());
+        renderer.prepare(
+            &self.device,
+            &self.queue,
+            &batch,
+            framebuffer,
+            &mut ui.surfaces(),
+        );
         for id in renderer.take_missing() {
             self.notices.push(format!(
                 "ui: render surface {id:#010x} is not in the dats; drawn as magenta"
@@ -2696,11 +2832,12 @@ impl AttachedWindow {
     pub(crate) fn cursor_moved(&mut self, x: f64, y: f64) {
         let previous = self.cursor.replace((x, y));
         let mouse_look = self.cursor_held();
+        let (ui_x, ui_y) = self.ui_scale().ui_point(x, y);
         let routed = match self.ui.as_mut() {
             Some(ui) if self.input.is_accepting() => Some(ui_input::moved::<KeyCode>(
                 ui.host_mut(),
-                x as i32,
-                y as i32,
+                ui_x as i32,
+                ui_y as i32,
                 mouse_look,
             )),
             _ => None,
@@ -2891,7 +3028,9 @@ impl AttachedWindow {
 
 /// The object `world` drew under pixel (`x`, `y`), kept only while the
 /// scene still holds that incarnation of it (a stale frame never picks a
-/// newer object reusing the id): its id and local id.
+/// newer object reusing the id) and it is not hidden from the UI: its id
+/// and local id. A hidden object nearest the pointer finds nothing; it
+/// does not let the pick through to what is behind it.
 fn pick_eligible(
     world: &mut WorldRenderer,
     scene: Option<&crate::scene::Scene>,
@@ -2899,10 +3038,26 @@ fn pick_eligible(
     y: f32,
 ) -> Option<(u32, u32)> {
     let hit = world.pick(x, y, 0)?;
-    scene?
-        .object_by_guid(hit.guid)
-        .filter(|o| o.key.local_id == hit.local_id)
-        .map(|_| (hit.guid, hit.local_id))
+    found_in_scene(scene?, hit.guid, hit.local_id)
+}
+
+/// What a pick that hit object `guid` drawn as `local_id` finds in `scene`:
+/// that object, while the scene still holds that incarnation of it and it
+/// is not hidden from the UI; else nothing.
+fn found_in_scene(scene: &crate::scene::Scene, guid: u32, local_id: u32) -> Option<(u32, u32)> {
+    scene
+        .object_by_guid(guid)
+        .filter(|o| o.key.local_id == local_id)
+        .filter(|o| picks_as_found(o.radar.public_weenie_bitfield))
+        .map(|_| (guid, local_id))
+}
+
+/// Whether an object with public description bits `bitfield` is found when
+/// picked: not when its UI-hidden bit is set. The game marks traps and
+/// similar scenery that way so the player cannot select, use or name them
+/// under the pointer, and the pick then finds nothing at all.
+fn picks_as_found(bitfield: u32) -> bool {
+    bitfield & ac_core::items::PublicWeenieFlags::UI_HIDDEN.bits() == 0
 }
 
 /// A mouse button as a small number for the held-button set.
@@ -2914,6 +3069,26 @@ fn button_index(button: MouseButton) -> u16 {
         MouseButton::Back => 3,
         MouseButton::Forward => 4,
         MouseButton::Other(n) => n.saturating_add(5),
+    }
+}
+
+/// What a mouse button change (`button` going down or up) does to the
+/// world, given what the UI passed on (`world`) and whether the world holds
+/// that button (`world_held`): (button, pressed, the UI took it). A release
+/// the UI kept whose press went to the world (a drag lifted off the world
+/// and let go over a window or the world) still lets the world's button
+/// go, as one the UI took, so it is no click; otherwise the world would go
+/// on thinking the button held (the orbit camera kept turning).
+fn world_button<K>(
+    world: Option<WorldInput<K>>,
+    button: u16,
+    pressed: bool,
+    world_held: bool,
+) -> Option<(u16, bool, bool)> {
+    match world {
+        Some(WorldInput::Button { button, pressed }) => Some((button, pressed, false)),
+        _ if !pressed && world_held => Some((button, false, true)),
+        _ => None,
     }
 }
 
@@ -3162,11 +3337,105 @@ fn revealed_selection(selected: Option<u32>, shown: impl Fn(u32) -> bool) -> Opt
 mod tests {
     use super::{
         NO_IMAGE_RETRY, SURFACE_DRAWING, SURFACE_OCCLUDED, SURFACE_TIMED_OUT, Screenshots,
-        SurfaceNotes, block_on, framebuffer_resize, redraw_after, retail_screenshot_path,
-        revealed_selection,
+        SurfaceNotes, block_on, found_in_scene, framebuffer_resize, picks_as_found, redraw_after,
+        retail_screenshot_path, revealed_selection, world_button,
     };
     use crate::frame::FrameOutcome;
+    use crate::ui::input::WorldInput;
     use std::time::Duration;
+
+    #[test]
+    fn an_object_hidden_from_the_ui_is_never_found_under_the_pointer() {
+        use ac_core::items::PublicWeenieFlags;
+        assert!(picks_as_found(PublicWeenieFlags::NONE.bits()));
+        assert!(picks_as_found(
+            (PublicWeenieFlags::STUCK | PublicWeenieFlags::ATTACKABLE).bits()
+        ));
+        assert!(!picks_as_found(PublicWeenieFlags::UI_HIDDEN.bits()));
+        assert!(!picks_as_found(
+            (PublicWeenieFlags::STUCK | PublicWeenieFlags::UI_HIDDEN).bits()
+        ));
+    }
+
+    #[test]
+    fn a_pick_on_an_object_hidden_from_the_ui_finds_nothing_in_the_scene() {
+        use crate::scene::Scene;
+        use ac_core::items::PublicWeenieFlags;
+        use ac_runtime::session::PresentationEvent;
+        use ac_runtime::world::{ObjectKey, ObjectView, RadarFacts, WorldSnapshot};
+        let view = |local_id: u32, guid: u32, bitfield: PublicWeenieFlags| ObjectView {
+            key: ObjectKey {
+                local_id,
+                incarnation: 1,
+            },
+            guid,
+            name: None,
+            setup_id: None,
+            position: None,
+            parent: None,
+            placement: None,
+            rest_placement: 0,
+            scale: None,
+            translucency: None,
+            state: 0,
+            velocity: None,
+            model: ac_proto::ModelData::default(),
+            motion_table_id: None,
+            sound_table_id: None,
+            radar: RadarFacts {
+                public_weenie_bitfield: bitfield.bits(),
+                ..RadarFacts::default()
+            },
+            motion: None,
+            effects: ac_runtime::world::EffectFacts::default(),
+            step_blend: None,
+        };
+        const LIFESTONE: u32 = 0x7000_0001;
+        const ACID: u32 = 0x7000_0002;
+        let mut scene = Scene::default();
+        scene.apply(PresentationEvent::Snapshot(WorldSnapshot {
+            player_guid: None,
+            objects: vec![
+                view(1, LIFESTONE, PublicWeenieFlags::LIFESTONE),
+                view(
+                    2,
+                    ACID,
+                    PublicWeenieFlags::STUCK | PublicWeenieFlags::UI_HIDDEN,
+                ),
+            ],
+        }));
+        assert_eq!(found_in_scene(&scene, LIFESTONE, 1), Some((LIFESTONE, 1)));
+        // A stale frame's hit on an id the scene now holds as another
+        // incarnation finds nothing.
+        assert_eq!(found_in_scene(&scene, LIFESTONE, 9), None);
+        assert_eq!(found_in_scene(&scene, ACID, 2), None);
+    }
+
+    #[test]
+    fn a_release_the_ui_kept_still_lets_go_of_a_button_the_world_holds() {
+        // GitHub #45: a drag lifted off the world ends with the release on
+        // the UI's side; the world went on thinking the left button held,
+        // and the orbit camera kept turning until the next click.
+        let passed = Some(WorldInput::<()>::Button {
+            button: 0,
+            pressed: false,
+        });
+        assert_eq!(
+            world_button(passed, 0, false, true),
+            Some((0, false, false))
+        );
+        assert_eq!(
+            world_button::<()>(None, 0, false, true),
+            Some((0, false, true))
+        );
+        // Nothing for the world when it did not hold it, or for a press.
+        assert_eq!(world_button::<()>(None, 0, false, false), None);
+        assert_eq!(world_button::<()>(None, 0, true, true), None);
+        assert_eq!(
+            world_button(Some(WorldInput::<()>::Moved), 0, true, true),
+            None
+        );
+    }
 
     #[test]
     fn a_frame_without_an_image_is_tried_again_after_a_wait_never_at_once() {

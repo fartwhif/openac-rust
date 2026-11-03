@@ -88,8 +88,6 @@ pub enum SelectionCycleDirection {
 /// How much a metre of height counts for in the cycle's ordering, against a
 /// metre across the ground.
 pub const SELECTION_HEIGHT_WEIGHT: f32 = 1.2;
-/// The server's "do not show this at all" bit.
-const NEVER_SHOW_FLAG: u32 = 0x8000_0000;
 /// How far the radar reaches outside, metres.
 const OUTDOOR_RADAR_METERS: f32 = 75.0;
 /// How far the radar reaches inside a building, metres.
@@ -222,7 +220,7 @@ fn matches_kind(
     let flags = item.public_weenie_bitfield.map_or(0, |f| f.bits());
     if item.container_id != 0
         || physics_state & PhysicsState::CLOAKED.bits() != 0
-        || flags & NEVER_SHOW_FLAG != 0
+        || flags & PublicWeenieFlags::UI_HIDDEN.bits() != 0
     {
         return false;
     }
@@ -599,6 +597,52 @@ mod tests {
         assert_eq!(
             closest(&world, SelectionCycleKind::Monster, &facts),
             Some(HOSTILE)
+        );
+    }
+
+    #[test]
+    fn no_key_lands_on_an_object_hidden_from_the_ui() {
+        // A trap hidden from the UI (bit 0x80 of the description) is never
+        // a candidate, whatever the key; the top bit of the field is no
+        // such mark.
+        const TRAP: u32 = 0x7000_0070;
+        const MARKED: u32 = 0x7000_0071;
+        let mut world = staged_without_drudge();
+        let hidden = PublicWeenieFlags::ATTACKABLE | PublicWeenieFlags::UI_HIDDEN;
+        place(
+            &mut world,
+            TRAP,
+            11.0,
+            thing(ItemType::CREATURE, hidden, Some(SHOW_ALWAYS)),
+        );
+        {
+            let is_attackable = attackable_creature(&world);
+            let facts = CycleFacts {
+                is_attackable: &is_attackable,
+                ..CycleFacts::none()
+            };
+            for kind in [SelectionCycleKind::CompassItem, SelectionCycleKind::Monster] {
+                assert_eq!(closest(&world, kind, &facts), None, "{kind:?}");
+            }
+        }
+        place(
+            &mut world,
+            MARKED,
+            12.0,
+            thing(
+                ItemType::CREATURE,
+                PublicWeenieFlags::ATTACKABLE | PublicWeenieFlags(0x8000_0000),
+                Some(SHOW_ALWAYS),
+            ),
+        );
+        let is_attackable = attackable_creature(&world);
+        let facts = CycleFacts {
+            is_attackable: &is_attackable,
+            ..CycleFacts::none()
+        };
+        assert_eq!(
+            closest(&world, SelectionCycleKind::Monster, &facts),
+            Some(MARKED)
         );
     }
 

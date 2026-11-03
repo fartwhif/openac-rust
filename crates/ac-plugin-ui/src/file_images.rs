@@ -9,7 +9,26 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::icon::PluginIcon;
 use crate::images::DecodedImage;
+
+/// `path` with `.light` or `.dark` put before the file's extension, or after
+/// the name when it has none: the version of an image a light or a dark
+/// theme draws when it is there. None when the file is already a version,
+/// whichever its letter case.
+#[must_use]
+pub fn variant_path(path: &str, light: bool) -> Option<String> {
+    let name_start = path.rfind(['/', '\\']).map_or(0, |at| at + 1);
+    let dot = path[name_start..]
+        .rfind('.')
+        .map_or(path.len(), |at| name_start + at);
+    let stem = path[name_start..dot].to_ascii_lowercase();
+    if stem.ends_with(".light") || stem.ends_with(".dark") {
+        return None;
+    }
+    let variant = if light { "light" } else { "dark" };
+    Some(format!("{}.{variant}{}", &path[..dot], &path[dot..]))
+}
 
 /// An image file a plugin ships, read, decoded and given its smaller
 /// levels. `path` is the path as the reader spells it (one spelling per
@@ -102,10 +121,57 @@ pub trait FileImageLoader: fmt::Debug + Send + Sync {
     /// be used comes back with the reason.
     fn load(&self, directory: &Path, path: &str) -> FileImageRead;
 
+    /// Whether `path` in plugin folder `directory` is a file that could be
+    /// read: how a light or dark version is looked for, so a missing one is
+    /// skipped without a report. A reader that cannot tell has none.
+    fn has_file(&self, directory: &Path, path: &str) -> bool {
+        let _ = (directory, path);
+        false
+    }
+
+    /// Reads `path` in plugin folder `directory` as a window's dock icon, at
+    /// once: it follows the rules of a plugin's `icon.png`, so it is small.
+    /// None when there is no such file (a reader that cannot tell has none).
+    ///
+    /// # Errors
+    /// Why a file that is there cannot be used.
+    fn read_dock_icon(&self, directory: &Path, path: &str) -> Result<Option<PluginIcon>, String> {
+        let _ = (directory, path);
+        Ok(None)
+    }
+
     /// Whether `image` is still what is on disk: its file's version now is
     /// the one it was read from. One whose file cannot be looked at is not,
     /// and is read again, which says why.
     fn is_current(&self, _image: &FileImage) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_goes_before_the_extension() {
+        for (path, light, expected) in [
+            ("icons/sword.png", true, Some("icons/sword.light.png")),
+            (
+                "icons/a.b/sword.png",
+                false,
+                Some("icons/a.b/sword.dark.png"),
+            ),
+            (
+                r"icons\a.b\sword.png",
+                true,
+                Some(r"icons\a.b\sword.light.png"),
+            ),
+            ("sword", true, Some("sword.light")),
+            ("icons/sword.light.png", true, None),
+            ("icons/sword.dark.png", true, None),
+            ("icons/sword.LIGHT.png", false, None),
+        ] {
+            assert_eq!(variant_path(path, light).as_deref(), expected, "{path}");
+        }
     }
 }

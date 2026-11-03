@@ -256,6 +256,33 @@ pub fn plan_shortcut_drop(
     mutations
 }
 
+/// The changes a drop of `dropped_object_id` on `target_slot` makes when
+/// that object may not have a shortcut: nothing is added, but the target's
+/// shortcut still makes way, to the first empty slot to the right of it
+/// (wrapping round, the target itself last), unless it was the dropped
+/// object's own. Nothing for a slot list of the wrong size or an
+/// out-of-range target.
+#[must_use]
+pub fn plan_refused_shortcut_drop(
+    slots: &[Option<ShortcutEntry>],
+    target_slot: i32,
+    dropped_object_id: u32,
+) -> Vec<ShortcutMutation> {
+    let (Some(mut state), Some(target)) = (copy_slots(slots), slot_index(target_slot)) else {
+        return Vec::new();
+    };
+    let mut mutations = Vec::with_capacity(2);
+    let displaced = visible(state[target]);
+    remove_visible_at(&mut state, target, &mut mutations);
+    if let Some(entry) = displaced
+        && entry.object_id != dropped_object_id
+        && let Some(empty) = first_empty_to_right(&state, target)
+    {
+        add(&mut state, entry.with_index(empty as i32), &mut mutations);
+    }
+    mutations
+}
+
 /// The changes when a whole stack merges into another: the old object's
 /// shortcut is re-pointed at the new object in its own slot, and any
 /// shortcut the new object already had is dropped.
@@ -379,6 +406,32 @@ mod tests {
             entry(11, 0xA001, 0),
         );
         assert_eq!(plan, vec![Add(entry(4, 0xA001, 0))]);
+    }
+
+    #[test]
+    fn a_refused_drop_adds_nothing_but_the_target_still_makes_way_to_the_right() {
+        // GitHub #45: the target's shortcut makes way before the dropped
+        // object is judged, so a refused object leaves the target empty.
+        assert_eq!(plan_refused_shortcut_drop(&empty(), 4, 0xA001), vec![]);
+        let mut slots = empty();
+        slots[5] = Some(entry(5, 0xB001, 0x1122_3344));
+        assert_eq!(
+            plan_refused_shortcut_drop(&slots, 5, 0xA001),
+            vec![Remove(5), Add(entry(6, 0xB001, 0x1122_3344))]
+        );
+        // Its own shortcut is only taken off.
+        assert_eq!(
+            plan_refused_shortcut_drop(&slots, 5, 0xB001),
+            vec![Remove(5)]
+        );
+        // With every other slot full it wraps round to the target itself.
+        let mut slots = full();
+        slots[5] = Some(entry(5, 0xB001, 0));
+        assert_eq!(
+            plan_refused_shortcut_drop(&slots, 5, 0xA001),
+            vec![Remove(5), Add(entry(5, 0xB001, 0))]
+        );
+        assert_eq!(plan_refused_shortcut_drop(&slots, 18, 0xA001), vec![]);
     }
 
     #[test]

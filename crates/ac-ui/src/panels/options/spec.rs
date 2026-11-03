@@ -294,6 +294,9 @@ pub enum ConfigRow {
         range_low: Option<&'static str>,
         /// High end caption (`None`: the number).
         range_high: Option<&'static str>,
+        /// When set, the caption shows the value after the label, with
+        /// this after the number ("UI Scale (150%)").
+        value_suffix: Option<&'static str>,
     },
     /// An OpenAC-only menu of named choices.
     ExplicitMenu {
@@ -452,6 +455,9 @@ const fn trio(
     }
 }
 
+/// The interface-scale row's caption.
+pub const UI_SCALE_LABEL: &str = "UI Scale";
+
 const fn display(field: DisplayField) -> OptionKey {
     OptionKey::Display(field)
 }
@@ -466,6 +472,26 @@ const fn camera(field: CameraField) -> OptionKey {
 
 const fn mixer(field: MixerField) -> OptionKey {
     OptionKey::Mixer(field)
+}
+
+/// The caption of the modern mouse turning option.
+pub const MODERN_MOUSE_TURNING_LABEL: &str = "Modern Mouse Turning";
+/// The caption of its both-buttons-run option.
+pub const BOTH_MOUSE_BUTTONS_RUN_FORWARD_LABEL: &str = "Both Mouse Buttons Run Forward";
+
+/// A row the settings make unavailable now: Use Mouse Turning while modern
+/// mouse turning is on (modern turning replaces it), and Both Mouse
+/// Buttons Run Forward while it is off (it needs it). Shown grey; a click
+/// changes nothing.
+#[must_use]
+pub fn unavailable(key: OptionKey, settings: &ac_host::settings::PlayerSettings) -> bool {
+    match key {
+        OptionKey::Camera(CameraField::UseMouseTurning) => settings.camera.modern_mouse_turning,
+        OptionKey::Camera(CameraField::BothMouseButtonsRunForward) => {
+            !settings.camera.modern_mouse_turning
+        }
+        _ => false,
+    }
 }
 
 const fn explicit_toggle(
@@ -544,6 +570,7 @@ pub fn config_rows() -> Vec<ConfigRow> {
             dimmed_by_retail_mixer: true,
             range_low: None,
             range_high: None,
+            value_suffix: None,
         },
         ConfigRow::ExplicitToggle {
             label: "Priority",
@@ -564,6 +591,7 @@ pub fn config_rows() -> Vec<ConfigRow> {
             dimmed_by_retail_mixer: true,
             range_low: Some("Off"),
             range_high: Some("8"),
+            value_suffix: None,
         },
         Separator,
         Header("ID_Camera_CameraSection"),
@@ -672,8 +700,22 @@ pub fn config_rows() -> Vec<ConfigRow> {
             "Potato Mode",
             def.potato_mode,
             display(DisplayField::PotatoMode),
-            "Everything at its cheapest, for running many clients on one machine: full detail only in the nearest landblocks, landscape draw distance 3, no anti-aliasing, plain texture filtering, no building detail textures, the plain render pack, retail particle range, and compact video-memory pools. Your other settings are kept and come back when this is off. Texture detail, anti-aliasing and the memory pools change at the next start.",
+            "Everything at its cheapest, for running many clients on one machine: full detail only in the nearest landblocks, landscape draw distance 3, no anti-aliasing, the lowest texture detail, plain texture filtering, no building detail textures, the plain render pack and retail particle range. Your other settings are kept and come back when this is off. It applies at once: the world's textures are made again at the new detail and replace the old ones over the next moments.",
         ),
+        ConfigRow::ExplicitSlider {
+            label: UI_SCALE_LABEL,
+            min: f64::from(ac_host::settings::UI_SCALE_MIN_PERCENT),
+            max: f64::from(ac_host::settings::UI_SCALE_MAX_PERCENT),
+            step: f64::from(ac_host::settings::UI_SCALE_STEP_PERCENT),
+            integer: true,
+            default: f64::from(def.ui_scale_percent),
+            target: display(DisplayField::UiScale),
+            tooltip: "How large the in-game windows, text and controls are drawn, all together; the world is not scaled. It applies when you let go of the slider. The login and character screens always fill the window.",
+            dimmed_by_retail_mixer: false,
+            range_low: Some("50%"),
+            range_high: Some("300%"),
+            value_suffix: Some("%"),
+        },
         explicit_toggle(
             "UI Only",
             def.ui_only,
@@ -726,6 +768,14 @@ pub fn config_rows() -> Vec<ConfigRow> {
             display(DisplayField::BuildingDetailTextures),
             false,
         ),
+        // The game's strings keep this row's caption and help, though the
+        // game itself never offered it.
+        toggle(
+            "ID_Graphics_LandscapeDetailTextures",
+            def.landscape_detail_textures,
+            display(DisplayField::LandscapeDetailTextures),
+            false,
+        ),
         toggle(
             "ID_Graphics_MultiPassAlpha",
             false,
@@ -734,6 +784,12 @@ pub fn config_rows() -> Vec<ConfigRow> {
         ),
         Separator,
         Header("ID_Input_InputSection"),
+        explicit_toggle(
+            MODERN_MOUSE_TURNING_LABEL,
+            false,
+            camera(CameraField::ModernMouseTurning),
+            "Hold the right mouse button over the world and drag: the view turns around your character, and your character turns to face it at its normal turn speed. The turn keys still turn your character. Replaces Use Mouse Turning while on.",
+        ),
         slider(
             template::SIMPLE_SLIDER,
             "ID_Input_MouseLookSensitivity",
@@ -756,6 +812,12 @@ pub fn config_rows() -> Vec<ConfigRow> {
             false,
             camera(CameraField::UseMouseTurning),
             true,
+        ),
+        explicit_toggle(
+            BOTH_MOUSE_BUTTONS_RUN_FORWARD_LABEL,
+            false,
+            camera(CameraField::BothMouseButtonsRunForward),
+            "With Modern Mouse Turning on: hold both mouse buttons, pressed over the world, to run forward. Letting go of either stops; the back-up key cancels it.",
         ),
         Separator,
         Header("ID_UI_UISection"),
@@ -876,6 +938,7 @@ fn atmospheric_rows() -> Vec<ConfigRow> {
                 dimmed_by_retail_mixer: false,
                 range_low: None,
                 range_high: None,
+                value_suffix: None,
             },
             SettingKind::Choice => ConfigRow::ExplicitMenu {
                 label: s.display_name,
@@ -1102,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn the_configuration_page_has_39_option_rows_in_48_list_items() {
+    fn the_configuration_page_has_40_option_rows_in_49_list_items() {
         let all = config_rows();
         // The Graphics Enhancements section follows the game's rows.
         let enhancements = all
@@ -1110,8 +1173,26 @@ mod tests {
             .position(|r| matches!(r, ConfigRow::ExplicitHeader(_)))
             .expect("the enhancements section");
         let rows = &all[..enhancements];
-        assert_eq!(option_rows(rows), 39);
-        assert_eq!(rows.len(), 48);
+        // The 39, the UI scale row, the landscape detail textures row (the
+        // game has its caption but never offered it), and OpenAC's two
+        // modern mouse turning rows, last of the explicit toggles (they sit
+        // in the input section).
+        let modern: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ConfigRow::ExplicitToggle { label, .. } => Some(*label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            modern[modern.len() - 2..],
+            [
+                MODERN_MOUSE_TURNING_LABEL,
+                BOTH_MOUSE_BUTTONS_RUN_FORWARD_LABEL
+            ]
+        );
+        assert_eq!(option_rows(rows), 39 + 1 + 1 + 2);
+        assert_eq!(rows.len(), 48 + 1 + 1 + 2);
         let headers = rows
             .iter()
             .filter(|r| matches!(r, ConfigRow::Header(_)))

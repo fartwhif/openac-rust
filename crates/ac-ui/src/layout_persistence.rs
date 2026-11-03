@@ -31,6 +31,11 @@ pub struct WindowState {
     pub persisted_top: Option<f32>,
     /// The height to save instead of the current one.
     pub persisted_height: Option<f32>,
+    /// The left edge to save instead of the current one (a peeking dock's
+    /// closed place).
+    pub persisted_left: Option<f32>,
+    /// The width to save instead of the current one.
+    pub persisted_width: Option<f32>,
     /// The visibility to save instead of the current one.
     pub requested_visible: Option<bool>,
 }
@@ -164,7 +169,7 @@ pub mod window_names {
     pub const VITALS: &str = "vitals";
     /// The side-by-side vitals.
     pub const SIDE_VITALS: &str = "side-vitals";
-    /// The plugin shelf.
+    /// The plugin dock.
     pub const PLUGIN_SHELF: &str = "plugin-shelf";
 }
 
@@ -280,9 +285,9 @@ pub fn capture(host: &UiHost, name: &str) -> Option<UiWindowLayout> {
     let e = host.root.element(handle.frame)?;
     let state = host.capture_window_state(name);
     Some(UiWindowLayout {
-        x: e.left,
+        x: state.persisted_left.unwrap_or(e.left),
         y: state.persisted_top.unwrap_or(e.top),
-        width: e.width,
+        width: state.persisted_width.unwrap_or(e.width),
         height: state.persisted_height.unwrap_or(e.height),
         visible: state.requested_visible.unwrap_or(e.visible()),
         collapsed: state.collapsed,
@@ -304,13 +309,16 @@ fn authored_geometry(host: &UiHost, name: &str, current: UiWindowLayout) -> UiWi
 }
 
 /// Size and place window `name` as `layout` says (within its limits and
-/// the screen), restore its state, and show or hide it when asked.
+/// the screen), restore its state, and show or hide it when asked. `spot`
+/// says where the saved place puts a window of a given size, for a window
+/// its own state resizes.
 fn apply(
     host: &mut UiHost,
     name: &str,
     layout: &UiWindowLayout,
     screen: (i32, i32),
     restore_visibility: bool,
+    spot: &dyn Fn(f32, f32) -> (f32, f32),
 ) {
     let Some(frame) = host.root.window(name).map(|w| w.frame) else {
         return;
@@ -350,9 +358,24 @@ fn apply(
             maximized: layout.maximized,
             persisted_top: Some(y),
             persisted_height: Some(h),
+            persisted_left: Some(x),
+            persisted_width: Some(w),
             requested_visible: Some(layout.visible),
         },
     );
+    // A window whose state changes its size (a dock restored closed is only
+    // its tile) was kept on the screen at the size it had before; it goes
+    // where its saved place puts it at its new size. A maximized window
+    // places itself.
+    if !layout.maximized
+        && let Some((now_w, now_h)) = host.root.element(frame).map(|e| (e.width, e.height))
+        && (now_w, now_h) != (w, h)
+    {
+        let (sx, sy) = spot(now_w, now_h);
+        let x = clamp(finite_or(sx, x), 0.0, (screen.0 as f32 - now_w).max(0.0));
+        let y = clamp(finite_or(sy, y), 0.0, (screen.1 as f32 - now_h).max(0.0));
+        host.root.move_window(name, x, y);
+    }
     if restore_visibility {
         if layout.visible {
             host.root.show_window(name);
@@ -387,7 +410,11 @@ fn apply_placement(
         e.height
     };
     let layout = project(placement, screen.0, screen.1, width, height);
-    apply(host, name, &layout, screen, restore_visibility);
+    let spot = |w: f32, h: f32| {
+        let at = project(placement, screen.0, screen.1, w, h);
+        (at.x, at.y)
+    };
+    apply(host, name, &layout, screen, restore_visibility, &spot);
 }
 
 fn with_current_state(
@@ -870,6 +897,7 @@ impl LayoutPersistence {
                 &layout,
                 screen,
                 !self.state_managed.contains(&name),
+                &|_, _| (layout.x, layout.y),
             );
             if let Some(c) = capture(host, &name) {
                 self.placements.insert(

@@ -506,7 +506,12 @@ pub(super) fn build_set(
                     color::MarkupColor::new(font, &node.element, b.emit.clone()),
                 )
             }
-            Markup::Expander { open, onchange, .. } => {
+            Markup::Expander {
+                open,
+                onchange,
+                framed,
+                ..
+            } => {
                 e.click_through = true;
                 let h = node.rect.h;
                 // In flex without a w: start at the content width, so the
@@ -534,7 +539,7 @@ pub(super) fn build_set(
                 );
                 content_element.click_through = true;
                 let content = ui.insert(content_element, transparent_panel());
-                let expander = fold::MarkupExpander::new(
+                let mut expander = fold::MarkupExpander::new(
                     header,
                     content,
                     *open,
@@ -543,6 +548,7 @@ pub(super) fn build_set(
                     onchange.clone(),
                     b.emit.clone(),
                 );
+                expander.framed = *framed;
                 let id = ui.add(parent, e, expander);
                 ui.add_child(id, header);
                 ui.add_child(id, content);

@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use ac_dat::DatCollection;
 use ac_runtime::session::SessionCommand;
+use ac_ui::plugin::dock::{self, PluginDock};
 use ac_ui::pregame::chargen::catalog::DatChargenCatalog;
 use ac_ui::pregame::chargen::swatch::DatSwatchTextures;
 use ac_ui::pregame::{PreGameAssets, PreGameScreens};
@@ -105,6 +106,9 @@ impl WindowUi {
         {
             layouts.set_gameplay_active(&mut self.host, false);
         }
+        // The dock shows itself when it has windows to offer, so it is told.
+        self.host
+            .with_controller::<PluginDock, _>(dock::WINDOW, |c, _| c.set_covered(active));
         let root = &mut self.host.root;
         if active {
             let shown: Vec<(String, ElementId)> = root

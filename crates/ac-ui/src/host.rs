@@ -399,6 +399,11 @@ impl UiHost {
 
     // ── Input ───────────────────────────────────────────────────────────
 
+    /// The modifier keys now held.
+    pub fn set_modifiers(&mut self, modifiers: Modifiers) {
+        self.root.set_modifiers(modifiers);
+    }
+
     /// Pointer moved to window (`x`, `y`).
     pub fn mouse_move(&mut self, x: i32, y: i32) {
         self.root.on_mouse_move(x, y);

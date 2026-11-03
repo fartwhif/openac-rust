@@ -248,12 +248,13 @@ impl DisplayPrefs {
         options.audio.mixer = ac_render::audio::mixer_options_of(&self.player.mixer);
     }
 
-    /// A window spec titled `title`, sized from the resolution setting
-    /// (1280 x 720 when it does not read as `WxH`).
-    pub fn window_spec(&self, title: String) -> ac_render::WindowSpec {
+    /// A window spec sized from the resolution setting (1280 x 720 when it
+    /// does not read as `WxH`). It opens titled with the program and its
+    /// version; the window then names the character its session plays.
+    pub fn window_spec(&self) -> ac_render::WindowSpec {
         let (width, height) = self.settings.resolution_size().unwrap_or((1280, 720));
         ac_render::WindowSpec {
-            title,
+            title: ac_render::title::product(),
             width,
             height,
             clear_color: ac_render::Color {

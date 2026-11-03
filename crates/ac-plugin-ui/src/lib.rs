@@ -18,7 +18,9 @@ pub mod color;
 pub mod control_state;
 pub mod file_images;
 pub mod flex;
+pub mod fonts;
 pub mod hotkeys;
+pub mod icon;
 pub mod images;
 pub mod list;
 pub mod list_view;
@@ -36,16 +38,18 @@ pub use file_images::{FileImage, FileImageLoader, FileImageRead, FileImageResult
 pub use images::{DecodedImage, ImageBudget};
 pub use markup::{MarkupDocument, MarkupError, parse};
 pub use model::{
-    ActionValue, CanvasAnchor, CanvasDescriptor, CanvasView, ClientWindow, ClientWindowAction,
-    Color8, DialogView, ImageSource, ImageView, MapPoint, PaintCmd, PaintRect, PanelDescriptor,
-    PanelView, PluginIcon, PointerEvent, PointerKind, ProjectileSample, UiChange, UiEvent, UiInput,
-    UiOwner, WorldLabel, WorldLine, canvas_origin, window_name,
+    ActionValue, CanvasAnchor, CanvasDescriptor, CanvasPlace, CanvasView, ClientWindow,
+    ClientWindowAction, Color8, DialogView, GroundShape, GroundShapeKind, ImageSource, ImageView,
+    MapPoint, MarkerAnchor, PaintCmd, PaintRect, PanelDescriptor, PanelView, PluginIcon,
+    PointerEvent, PointerKind, ProjectileSample, UiChange, UiEvent, UiInput, UiOwner, WindowIcon,
+    WorldIcon, WorldIconEntry, WorldLabel, WorldLine, WorldTriangle, canvas_origin, window_name,
 };
 pub use state::{
-    DEFAULT_DIALOG_BUTTONS, MAXIMUM_CANVASES, MAXIMUM_DIALOG_BUTTONS, MAXIMUM_LABEL_TEXT,
-    MAXIMUM_LABELS, MAXIMUM_LINES_PER_LAYER, MAXIMUM_PAINT_COMMANDS, MAXIMUM_PROJECTILE_SAMPLES,
-    MAXIMUM_STEP_MS, PluginUi, RELEASE_AFTER_MS, RELEASE_CHECK_INTERVAL_MS, TextMetrics,
-    UiResources,
+    DEFAULT_DIALOG_BUTTONS, MAXIMUM_CANVASES, MAXIMUM_DIALOG_BUTTONS, MAXIMUM_ICON_SIZE,
+    MAXIMUM_ICONS, MAXIMUM_LABEL_TEXT, MAXIMUM_LABELS, MAXIMUM_LINES_PER_LAYER,
+    MAXIMUM_PAINT_COMMANDS, MAXIMUM_PROJECTILE_SAMPLES, MAXIMUM_SHAPE_RADIUS, MAXIMUM_SHAPES,
+    MAXIMUM_STEP_MS, MAXIMUM_TRIANGLES, MINIMUM_ICON_SIZE, MINIMUM_SHAPE_RADIUS, PluginUi,
+    RELEASE_AFTER_MS, RELEASE_CHECK_INTERVAL_MS, TextMetrics, UiResources,
 };
 pub use theme::{ThemeKind, ThemePalette};
 pub use value::{BindingKind, BindingSchema, ItemRecord, Rgba, UiValue};

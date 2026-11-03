@@ -40,6 +40,8 @@ pub enum CameraField {
     AlignToSlope,
     InvertMouseLookYAxis,
     UseMouseTurning,
+    ModernMouseTurning,
+    BothMouseButtonsRunForward,
 }
 
 /// A display setting.
@@ -57,6 +59,7 @@ pub enum DisplayField {
     KeepDistantBuildings,
     Quality,
     PotatoMode,
+    UiScale,
     UiOnly,
     UiOnlyWhenUnfocused,
     LandscapeTextureDetail,
@@ -64,6 +67,7 @@ pub enum DisplayField {
     TextureFiltering,
     LandscapeDrawDistance,
     BuildingDetailTextures,
+    LandscapeDetailTextures,
     MultiPassAlpha,
 }
 
@@ -234,6 +238,10 @@ impl LiveValues {
                     CameraField::AlignToSlope => Bool(c.align_to_slope),
                     CameraField::InvertMouseLookYAxis => Bool(c.invert_mouse_look_y_axis),
                     CameraField::UseMouseTurning => Bool(c.use_mouse_turning),
+                    CameraField::ModernMouseTurning => Bool(c.modern_mouse_turning),
+                    CameraField::BothMouseButtonsRunForward => {
+                        Bool(c.both_mouse_buttons_run_forward)
+                    }
                 }
             }
             OptionKey::Display(f) => {
@@ -250,6 +258,7 @@ impl LiveValues {
                     DisplayField::KeepDistantBuildings => Bool(d.keep_distant_buildings),
                     DisplayField::Quality => Text(quality_name(d.quality).to_owned()),
                     DisplayField::PotatoMode => Bool(d.potato_mode),
+                    DisplayField::UiScale => Float(d.ui_scale_percent as f32),
                     DisplayField::UiOnly => Bool(d.ui_only),
                     DisplayField::UiOnlyWhenUnfocused => Bool(d.ui_only_when_unfocused),
                     DisplayField::LandscapeTextureDetail => Int(d.landscape_texture_detail),
@@ -257,6 +266,7 @@ impl LiveValues {
                     DisplayField::TextureFiltering => Int(d.texture_filtering),
                     DisplayField::LandscapeDrawDistance => Int(d.landscape_draw_distance),
                     DisplayField::BuildingDetailTextures => Bool(d.building_detail_textures),
+                    DisplayField::LandscapeDetailTextures => Bool(d.landscape_detail_textures),
                     DisplayField::MultiPassAlpha => Bool(d.multi_pass_alpha),
                 }
             }
@@ -328,6 +338,10 @@ impl LiveValues {
                         c.invert_mouse_look_y_axis = *x;
                     }
                     (CameraField::UseMouseTurning, Bool(x)) => c.use_mouse_turning = *x,
+                    (CameraField::ModernMouseTurning, Bool(x)) => c.modern_mouse_turning = *x,
+                    (CameraField::BothMouseButtonsRunForward, Bool(x)) => {
+                        c.both_mouse_buttons_run_forward = *x;
+                    }
                     _ => return None,
                 }
                 Some(Section::Camera)
@@ -348,6 +362,9 @@ impl LiveValues {
                     }
                     (DisplayField::Quality, Text(x)) => d.quality = quality_by_name(x)?,
                     (DisplayField::PotatoMode, Bool(x)) => d.potato_mode = *x,
+                    (DisplayField::UiScale, Float(x)) => {
+                        d.ui_scale_percent = ac_host::settings::ui_scale_percent(x.round() as i32);
+                    }
                     (DisplayField::UiOnly, Bool(x)) => d.ui_only = *x,
                     (DisplayField::UiOnlyWhenUnfocused, Bool(x)) => d.ui_only_when_unfocused = *x,
                     (DisplayField::LandscapeTextureDetail, Int(x)) => {
@@ -362,6 +379,9 @@ impl LiveValues {
                     }
                     (DisplayField::BuildingDetailTextures, Bool(x)) => {
                         d.building_detail_textures = *x;
+                    }
+                    (DisplayField::LandscapeDetailTextures, Bool(x)) => {
+                        d.landscape_detail_textures = *x;
                     }
                     (DisplayField::MultiPassAlpha, Bool(x)) => d.multi_pass_alpha = *x,
                     _ => return None,

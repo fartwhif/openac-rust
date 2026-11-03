@@ -19,7 +19,9 @@ use super::{
     ClientArmorProfile, ClientObject, ClientWeaponProfile, EquipMask, HouseRestrictionRecord,
     ItemType, ObjectIdentity, PropertyBundle, PublicWeenieFlags, WeenieData, pk_status,
 };
-use crate::properties::{PropertyDataId, PropertyFloat, PropertyInstanceId, PropertyInt};
+use crate::properties::{
+    PropertyBool, PropertyDataId, PropertyFloat, PropertyInstanceId, PropertyInt,
+};
 
 /// One entry of a contents list: the object and its container type (0 an
 /// item, 1 a pack, 2 a spell focus).
@@ -1326,7 +1328,9 @@ impl ClientObjectTable {
     /// Records one object-id property update. Placement has its own
     /// messages, so this stores the value, and a house's owner (which a
     /// purchase or an abandon announces this way) also moves the owner the
-    /// entry gate reads; 0 means no owner.
+    /// entry gate reads; 0 means no owner. The monarch (which swearing or
+    /// breaking allegiance announces this way) moves the object's monarch,
+    /// the one its description carries; 0 means none.
     pub fn update_instance_id_property(
         &mut self,
         item_id: u32,
@@ -1340,19 +1344,28 @@ impl ClientObjectTable {
         server_showed_object(item);
         item.properties.instance_ids.insert(property_id, value);
         let mut authority_changes = 0;
-        if PropertyInstanceId(property_id) == PropertyInstanceId::HOUSE_OWNER {
-            let owner = (value != 0).then_some(value);
-            if item.house_owner_id != owner {
-                item.house_owner_id = owner;
-                authority_changes = 1;
-            }
+        let id = (value != 0).then_some(value);
+        if PropertyInstanceId(property_id) == PropertyInstanceId::HOUSE_OWNER
+            && item.house_owner_id != id
+        {
+            item.house_owner_id = id;
+            authority_changes = 1;
+        }
+        if PropertyInstanceId(property_id) == PropertyInstanceId::MONARCH && item.monarch_id != id {
+            item.monarch_id = id;
+            authority_changes = 1;
         }
         self.mutation_revision = self.mutation_revision.wrapping_add(authority_changes);
         self.emit_updated(item_id, events);
         true
     }
 
-    /// Records one true/false property update.
+    /// Records one true/false property update. Some of these are also a bit
+    /// of the public description, which is what everything else reads
+    /// (whether the object can be picked or shown on the radar, whether a
+    /// container can be opened and how many slots its window shows), so the
+    /// bit moves with the bool. Locked is the inverse of openable: a key or
+    /// a lockpick unlocking a chest makes it openable.
     pub fn update_bool_property(
         &mut self,
         item_id: u32,
@@ -1363,7 +1376,13 @@ impl ClientObjectTable {
         let Some(item) = self.objects.get_mut(&item_id) else {
             return false;
         };
+        server_showed_object(item);
         item.properties.bools.insert(property_id, value);
+        if let Some((bit, inverted)) = description_bit_of(PropertyBool(property_id)) {
+            let mut bitfield = item.public_weenie_bitfield.unwrap_or_default();
+            bitfield.set(bit, value != inverted);
+            item.public_weenie_bitfield = Some(bitfield);
+        }
         self.emit_updated(item_id, events);
         true
     }
@@ -1470,6 +1489,30 @@ impl ClientObjectTable {
             self.apply_server_move(guid, placement, hint, events);
         }
         self.identity_of(guid)
+    }
+
+    /// A re-sent description of an object the client holds (a revealed
+    /// Aetheria, a tinkered or tailored item). The game deletes the object
+    /// and creates it again: deleting takes it out of its container's
+    /// list, so the container the new description names has no place for
+    /// it and puts it first among its own kind (items or packs). A
+    /// re-sent item therefore lands in its pack's top-left slot. A
+    /// description that names no container leaves the object where it is.
+    pub fn ingest_recreated(
+        &mut self,
+        data: &WeenieData,
+        events: &mut Vec<TableEvent>,
+    ) -> ObjectIdentity {
+        let identity = self.ingest(data, events);
+        if let Some(container_id) = data.container_id.filter(|&id| id != 0) {
+            self.apply_server_move(
+                data.guid,
+                ClientObjectPlacement::in_container(container_id, 0),
+                None,
+                events,
+            );
+        }
+        identity
     }
 
     /// Records an object's membership from the character description: its
@@ -1839,6 +1882,22 @@ fn server_showed_object(item: &mut ClientObject) -> bool {
     }
     item.last_appraisal_unsuccessful = false;
     true
+}
+
+/// The public description bit a true/false property stands for, if any,
+/// and whether the bit is set when the property is false.
+fn description_bit_of(property: PropertyBool) -> Option<(PublicWeenieFlags, bool)> {
+    match property {
+        PropertyBool::STUCK => Some((PublicWeenieFlags::STUCK, false)),
+        PropertyBool::LOCKED => Some((PublicWeenieFlags::OPENABLE, true)),
+        PropertyBool::INSCRIBABLE => Some((PublicWeenieFlags::INSCRIBABLE, false)),
+        PropertyBool::UI_HIDDEN => Some((PublicWeenieFlags::UI_HIDDEN, false)),
+        PropertyBool::IGNORE_HOUSE_BARRIERS => {
+            Some((PublicWeenieFlags::IMMUNE_CELL_RESTRICTIONS, false))
+        }
+        PropertyBool::HIDDEN_ADMIN => Some((PublicWeenieFlags::HIDDEN_ADMIN, false)),
+        _ => None,
+    }
 }
 
 /// Merges a property bundle; the pack capacities it carries (an

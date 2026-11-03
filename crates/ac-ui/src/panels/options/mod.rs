@@ -226,6 +226,9 @@ enum Widget {
         max: f64,
         /// Step and whole numbers, for OpenAC's number sliders.
         snap: Option<(f64, bool)>,
+        /// A caption that shows the value: the text, its label and what
+        /// follows the number.
+        value_caption: Option<(ElementId, &'static str, &'static str)>,
     },
     Menu {
         menu: ElementId,
@@ -336,6 +339,16 @@ fn normalized(value: f64, min: f64, max: f64) -> f32 {
     }
 }
 
+/// True while the player drags `widget`'s slider thumb.
+fn slider_dragging(ui: &UiRoot, widget: &Widget) -> bool {
+    match widget {
+        Widget::Slider { slider, .. } => ui
+            .widget::<Scrollbar>(*slider)
+            .is_some_and(Scrollbar::is_dragging),
+        _ => false,
+    }
+}
+
 fn show(ui: &mut UiRoot, widget: &Widget, value: &OptionValue) {
     match (widget, value) {
         (Widget::Checkbox(b), OptionValue::Bool(v)) => {
@@ -348,6 +361,7 @@ fn show(ui: &mut UiRoot, widget: &Widget, value: &OptionValue) {
                 min,
                 max,
                 snap: s,
+                value_caption,
             },
             OptionValue::Float(v),
         ) => {
@@ -357,6 +371,14 @@ fn show(ui: &mut UiRoot, widget: &Widget, value: &OptionValue) {
             };
             let n = normalized(v, *min, *max);
             ui.with::<Scrollbar, _>(*slider, |s, _| s.set_scalar_position(n));
+            if let Some((text, label, suffix)) = value_caption {
+                let number = if matches!(s, Some((_, true))) {
+                    format!("{}", v.round() as i64)
+                } else {
+                    format!("{v}")
+                };
+                set_text(ui, *text, &format!("{label} ({number}{suffix})"), None);
+            }
         }
         (
             Widget::Menu {
@@ -428,13 +450,7 @@ impl RowHost for Host<'_> {
                 {
                     self.links.push((j, OptionValue::Float(partner_value)));
                 }
-                let dragging = match binding.widget {
-                    Widget::Slider { slider, .. } => self
-                        .ui
-                        .widget::<Scrollbar>(slider)
-                        .is_some_and(Scrollbar::is_dragging),
-                    _ => false,
-                };
+                let dragging = slider_dragging(self.ui, &binding.widget);
                 emit(
                     self.ui,
                     OptionsOutput::Changed {
@@ -459,12 +475,16 @@ impl RowHost for Host<'_> {
                     _ => value.clone(),
                 };
                 show(self.ui, &binding.widget, &value);
+                // The interface scale moves the slider under the pointer, so
+                // it settles (applies and saves) only when the drag ends.
+                let settled = key != OptionKey::Display(DisplayField::UiScale)
+                    || !slider_dragging(self.ui, &binding.widget);
                 if let Some(section) = self.live.write(key, &value) {
                     emit(
                         self.ui,
                         OptionsOutput::Changed {
                             section,
-                            persist: true,
+                            persist: settled,
                         },
                     );
                 }
@@ -1118,6 +1138,7 @@ impl OptionsWindowController {
                         min: 0.0,
                         max: 1.0,
                         snap: None,
+                        value_caption: None,
                     };
                     show(b.ui, &widget, &OptionValue::Float(initial));
                     bound.push((
@@ -1230,6 +1251,7 @@ impl OptionsWindowController {
                                     min: f64::from(min),
                                     max: f64::from(max),
                                     snap: None,
+                                    value_caption: None,
                                 },
                                 OptionValue::Float(default),
                                 None,
@@ -1282,6 +1304,7 @@ impl OptionsWindowController {
                                 min: 0.0,
                                 max: 1.0,
                                 snap: None,
+                                value_caption: None,
                             },
                             OptionValue::Float(slider_default),
                             None,
@@ -1389,6 +1412,7 @@ impl OptionsWindowController {
                         dimmed_by_retail_mixer,
                         range_low,
                         range_high,
+                        value_suffix,
                     } => {
                         let number = |v: f64| {
                             if integer {
@@ -1417,6 +1441,9 @@ impl OptionsWindowController {
                                     min,
                                     max,
                                     snap: Some((step, integer)),
+                                    value_caption: caption
+                                        .zip(value_suffix)
+                                        .map(|(text, suffix)| (text, label, suffix)),
                                 },
                                 OptionValue::Float(default),
                                 caption.filter(|_| dimmed_by_retail_mixer),
@@ -1478,6 +1505,17 @@ impl OptionsWindowController {
             Color::WHITE
         };
         for binding in &self.pages[OptionsPage::Configuration.index()].rows {
+            // Both Mouse Buttons Run Forward needs modern mouse turning.
+            if binding.key == OptionKey::Camera(CameraField::BothMouseButtonsRunForward)
+                && let Widget::Checkbox(checkbox) = binding.widget
+            {
+                let color = if spec::unavailable(binding.key, &self.live.settings) {
+                    STORE_ONLY_CAPTION_COLOR
+                } else {
+                    Color::WHITE
+                };
+                ui.with::<Button, _>(checkbox, |b, _| b.label_color = color);
+            }
             let Some(caption) = binding.dimmed_caption else {
                 continue;
             };
@@ -1775,17 +1813,20 @@ impl PanelController for OptionsWindowController {
             return false;
         };
         if matches!(message, ElementMessage::DragCompleted) {
-            // An opacity slider settles: save what the drag left.
-            if matches!(
-                self.pages[page].rows.get(row).map(|b| b.key),
-                Some(OptionKey::Chat(
-                    ChatField::DefaultOpacity | ChatField::ActiveOpacity
-                ))
-            ) {
+            // An opacity or interface-scale slider settles: apply and save
+            // what the drag left.
+            let section = match self.pages[page].rows.get(row).map(|b| b.key) {
+                Some(OptionKey::Chat(ChatField::DefaultOpacity | ChatField::ActiveOpacity)) => {
+                    Some(Section::Chat)
+                }
+                Some(OptionKey::Display(DisplayField::UiScale)) => Some(Section::Display),
+                _ => None,
+            };
+            if let Some(section) = section {
                 emit(
                     ui,
                     OptionsOutput::Changed {
-                        section: Section::Chat,
+                        section,
                         persist: true,
                     },
                 );
@@ -1795,6 +1836,16 @@ impl PanelController for OptionsWindowController {
         let Some(value) = self.row_value(ui, page, row, message) else {
             return false;
         };
+        // A row the settings make unavailable keeps its value: the widget
+        // that flipped itself shows it again.
+        if let Some(binding) = self.pages[page].rows.get(row)
+            && spec::unavailable(binding.key, &self.live.settings)
+        {
+            if let Some(current) = self.pages[page].model.current(row).cloned() {
+                show(ui, &binding.widget, &current);
+            }
+            return true;
+        }
         self.with_page(ui, page, |m, h| m.set_current(row, value, h));
         true
     }

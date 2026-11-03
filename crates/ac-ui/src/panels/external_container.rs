@@ -11,7 +11,8 @@
 //! at once; drags and drops are resolved at the next update.
 
 use ac_core::items::placement::{
-    evaluate_container_placement, item_list_drop_placement, placement_rejection_text,
+    evaluate_container_placement, item_list_drop_placement, loose_contents,
+    placement_rejection_text,
 };
 use ac_core::items::{ClientObject, PlacementRejection, PublicWeenieFlags};
 use ac_runtime::inventory::{ItemCommand, ObjectRef, PendingPlacement, REQUEST_BUSY};
@@ -526,7 +527,7 @@ impl ExternalContainerController {
         p: &ItemDragPayload,
         view: &ItemsView<'_>,
     ) -> DragAcceptance {
-        if p.source_kind == ItemDragSource::ShortcutBar {
+        if p.source_kind.is_alias() {
             return DragAcceptance::None;
         }
         if list != self.contents || self.open_container == 0 {
@@ -546,7 +547,7 @@ impl ExternalContainerController {
         p: &ItemDragPayload,
         view: &ItemsView<'_>,
     ) {
-        if p.source_kind == ItemDragSource::ShortcutBar || self.open_container == 0 {
+        if p.source_kind.is_alias() || self.open_container == 0 {
             return;
         }
         if let Some(r) = self.evaluate_drop(p.obj_id, view) {
@@ -596,13 +597,7 @@ impl ExternalContainerController {
         target_index: i32,
         whole_stack: bool,
     ) -> Option<i32> {
-        let listed: Vec<u32> = view
-            .objects
-            .get_contents(self.open_container)
-            .iter()
-            .copied()
-            .filter(|&g| !is_container(view.get(g)))
-            .collect();
+        let listed = loose_contents(view.objects, self.open_container);
         let source = listed.iter().position(|&g| g == item);
         // An empty cell is past the last item.
         let drop_index = if target_item != 0 {

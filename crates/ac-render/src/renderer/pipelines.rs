@@ -224,7 +224,7 @@ pub fn terrain_pipeline(
         4 => Uint8x4,
         5 => Uint8x4,
     ];
-    let offset_attributes = wgpu::vertex_attr_array![6 => Float32x3];
+    let offset_attributes = wgpu::vertex_attr_array![6 => Float32x3, 7 => Uint32];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("terrain"),
         layout: Some(&layout),
@@ -443,6 +443,96 @@ pub fn world_line_pipeline(
                 format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+/// The plugins' world triangles: alpha blended, both faces, tested against
+/// the world's depth without writing it, so they never hide each other.
+pub fn world_triangle_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    globals: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    triangle_pipeline(
+        device,
+        format,
+        samples,
+        globals,
+        Some(wgpu::BlendState::ALPHA_BLENDING),
+        wgpu::ColorWrites::ALL,
+    )
+}
+
+/// The invisible probes of the icons hidden behind the world: the world
+/// triangles' vertices and depth test, writing nothing.
+pub fn icon_probe_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    globals: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    triangle_pipeline(
+        device,
+        format,
+        samples,
+        globals,
+        None,
+        wgpu::ColorWrites::empty(),
+    )
+}
+
+fn triangle_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    globals: &wgpu::BindGroupLayout,
+    blend: Option<wgpu::BlendState>,
+    write_mask: wgpu::ColorWrites,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("world triangle"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/world_triangle.wgsl").into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("world triangle"),
+        bind_group_layouts: &[Some(globals)],
+        immediate_size: 0,
+    });
+    let attributes = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("world triangle"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: size_of::<crate::world_triangles::WorldTriangleVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &attributes,
+            })],
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(depth_state(false, wgpu::CompareFunction::LessEqual)),
+        multisample: multisample(samples, false),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend,
+                write_mask,
             })],
         }),
         multiview_mask: None,

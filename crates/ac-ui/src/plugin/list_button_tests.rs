@@ -471,7 +471,7 @@ fn a_caption_wider_than_its_button_is_cut_at_the_buttons_edges() {
     // CaptionWiderThanItsButton_IsCutAtTheButtonEdges: the cell x 50..100;
     // a 20-wide button at x 65..85; the caption is far wider.
     let font = Arc::new(
-        crate::bundled_font::bake(16.0)
+        crate::bundled_font::bake(16.0, crate::bundled_font::Weight::Regular)
             .unwrap()
             .create_font(TextureRef::Runtime(1)),
     );

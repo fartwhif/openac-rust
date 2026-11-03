@@ -28,7 +28,7 @@ impl UiOwner {
     }
 }
 
-/// A plugin's `icon.png`, decoded: the image its shelf buttons show ahead
+/// A plugin's `icon.png`, decoded: the image its dock slots show ahead
 /// of a render surface or initials.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PluginIcon {
@@ -38,6 +38,33 @@ pub struct PluginIcon {
     pub height: u32,
     /// Four bytes per pixel, red first, top row first.
     pub rgba: Arc<Vec<u8>>,
+}
+
+/// What a plugin's folder holds for the dock icon one of its windows names.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WindowIcon {
+    /// The file as named.
+    pub named: Option<PluginIcon>,
+    /// Its version for a light theme.
+    pub light: Option<PluginIcon>,
+    /// Its version for every other theme.
+    pub dark: Option<PluginIcon>,
+}
+
+impl WindowIcon {
+    /// The picture for a dock in a light theme or not: its version when there
+    /// is one, else the named file.
+    #[must_use]
+    pub fn for_theme(&self, light: bool) -> Option<&PluginIcon> {
+        let version = if light { &self.light } else { &self.dark };
+        version.as_ref().or(self.named.as_ref())
+    }
+
+    /// Nothing there could be used.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.named.is_none() && self.light.is_none() && self.dark.is_none()
+    }
 }
 
 impl std::fmt::Debug for PluginIcon {
@@ -59,19 +86,22 @@ pub struct PanelDescriptor {
     pub window_id: String,
     /// The caption.
     pub title: String,
-    /// Initials on the shelf button when there is no icon.
+    /// Initials on the dock slot when there is no icon.
     pub icon_text: Option<String>,
-    /// The shelf button's icon (a full image id or a bare index; 0: none).
+    /// The dock slot's icon (a full image id or a bare index; 0: none).
     pub icon_surface_id: u32,
     /// Open as soon as it is registered.
     pub start_visible: bool,
-    /// Gets a button on the plugin shelf.
+    /// Gets a button on the plugin dock.
     pub show_in_side_panel: bool,
+    /// The window's own dock icon: a `.png` in the plugin's folder, by a path
+    /// relative to it.
+    pub icon_file: Option<String>,
 }
 
 impl PanelDescriptor {
     /// A descriptor with OpenAC's defaults: no icon, open at once, on the
-    /// shelf.
+    /// dock.
     #[must_use]
     pub fn new(window_id: impl Into<String>, title: impl Into<String>) -> Self {
         Self {
@@ -81,6 +111,7 @@ impl PanelDescriptor {
             icon_surface_id: 0,
             start_visible: true,
             show_in_side_panel: true,
+            icon_file: None,
         }
     }
 }
@@ -94,7 +125,7 @@ pub struct PanelView {
     pub id: u32,
     /// Its plugin.
     pub owner: UiOwner,
-    /// Its identity and shelf button.
+    /// Its identity and dock slot.
     pub descriptor: PanelDescriptor,
     /// Its markup, parsed.
     pub document: Arc<MarkupDocument>,
@@ -108,8 +139,11 @@ pub struct PanelView {
     /// The player's (or the plugin's) show or close request.
     pub requested_visible: bool,
     /// Its plugin's `icon.png`, when the plugin's folder has one that
-    /// decodes: the shelf button shows it ahead of the descriptor's icon.
+    /// decodes: the dock slot shows it ahead of the descriptor's icon.
     pub file_icon: Option<PluginIcon>,
+    /// The file its descriptor names, when any of it could be used: the dock
+    /// slot shows it ahead of the plugin's `icon.png`.
+    pub window_icon: Option<WindowIcon>,
 }
 
 impl PanelView {
@@ -265,6 +299,9 @@ pub enum PaintCmd {
         color: Color8,
         /// A dark outline around the glyphs.
         outline: bool,
+        /// One of the plugin's fonts ([`crate::fonts`]); 0: the interface
+        /// font. A font it no longer holds draws nothing.
+        font: u32,
     },
     /// An image stretched over a rectangle (a released image draws
     /// nothing).
@@ -453,6 +490,17 @@ pub enum PointerKind {
     Cancelled,
 }
 
+/// Where the window had a canvas when the pointer did something on it: the
+/// window follows the plugin's moves a moment late. There is no default: a
+/// place the window did not measure is `None`, never a zero-sized layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CanvasPlace {
+    /// Its top-left corner on the layer.
+    pub origin: (f32, f32),
+    /// The layer's size.
+    pub layer: (f32, f32),
+}
+
 /// One pointer event on a canvas, in its own pixels (OpenAC
 /// `PluginPointerEvent`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -547,6 +595,130 @@ pub struct WorldLine {
     pub follow_terrain: bool,
     /// Thickness, metres.
     pub width_metres: f32,
+}
+
+/// A filled triangle in the world, flat between its corners, see-through by
+/// its colours' alpha, drawn from both sides and unlit. It does not follow
+/// the ground.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldTriangle {
+    /// The corners.
+    pub corners: [MapPoint; 3],
+    /// Each corner's colour, `0xRRGGBBAA`, blended across the face.
+    pub colors_rgba: [u32; 3],
+}
+
+/// What a world marker is pinned to.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum MarkerAnchor {
+    /// Nothing: a marker pinned to nothing is dropped.
+    #[default]
+    None,
+    /// An object, by the id the server gave it. While the client does not
+    /// hold it the marker is not drawn, and it comes back when it does.
+    Object(u32),
+    /// A fixed position.
+    Position {
+        /// Where.
+        point: MapPoint,
+        /// The position is on the landscape, not inside a building or
+        /// dungeon.
+        is_outdoor: bool,
+    },
+}
+
+impl MarkerAnchor {
+    /// Whether it pins something: an object with an id, or a position whose
+    /// coordinates are all finite.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::None => false,
+            Self::Object(id) => *id != 0,
+            Self::Position { point, .. } => {
+                point.east_west.is_finite()
+                    && point.north_south.is_finite()
+                    && point.elevation.is_finite()
+            }
+        }
+    }
+}
+
+/// An image hung in the world at a constant size on the screen. It is drawn
+/// after the world, like a label, so walls and hills do not hide it unless
+/// it asks with `hidden_by_world`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldIcon {
+    /// Over an object, the client lays its icons out in rows above its head
+    /// and its labels; at a position, the icon is centred on it.
+    pub anchor: MarkerAnchor,
+    /// The plugin's own image.
+    pub image: u32,
+    /// The side of the square the image is fitted into, interface points.
+    pub size: f32,
+    /// Multiplied into the image, `0xRRGGBBAA`.
+    pub tint_rgba: u32,
+    /// A thin frame around the image, `0xRRGGBBAA`.
+    pub border_rgba: Option<u32>,
+    /// Shown up to this many metres away, fading over the last fifth.
+    pub max_range: f32,
+    /// The whole icon goes while walls, doors, hills or anything else in the
+    /// world stands between the camera and its anchor.
+    pub hidden_by_world: bool,
+}
+
+/// An icon with the plugin it belongs to, whose images are the only ones
+/// its image is looked up in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorldIconEntry {
+    /// The plugin.
+    pub owner: String,
+    /// The icon, already checked and with its size in range.
+    pub icon: WorldIcon,
+}
+
+/// What form a ground shape takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroundShapeKind {
+    /// Nothing: a shape of no kind is dropped.
+    #[default]
+    None,
+    /// A band all the way round the anchor, from the radius less the width
+    /// out to the radius.
+    Ring,
+    /// A circle around the anchor, filled from its centre.
+    Disc,
+    /// Part of a circle: a wedge filled from the centre, or a band like a
+    /// ring's.
+    Arc,
+}
+
+/// A shape lying on the ground around an anchor: a ring under a target, a
+/// disc over an area, a wedge in front of a creature. Drawn in the world,
+/// so walls and hills hide it, and outdoors it follows the slope of the
+/// land.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GroundShape {
+    /// Around an object's feet, following it, or around a fixed position.
+    pub anchor: MarkerAnchor,
+    /// What form it takes.
+    pub kind: GroundShapeKind,
+    /// The outer radius, metres.
+    pub radius: f32,
+    /// How wide a ring's or unfilled arc's band is, metres, inward from the
+    /// radius.
+    pub width: f32,
+    /// Where an arc starts, as a compass bearing in degrees (0 north, 90
+    /// east); with `faces_object`, from the way the object faces.
+    pub start_degrees: f32,
+    /// How far round an arc goes, clockwise from its start, degrees.
+    pub sweep_degrees: f32,
+    /// An arc filled from the centre, a wedge, rather than a band.
+    pub filled: bool,
+    /// An arc over an object turns with it.
+    pub faces_object: bool,
+    /// Its colour, `0xRRGGBBAA`; the alpha is how opaque it is.
+    pub color_rgba: u32,
 }
 
 /// One step of a simulated projectile flight, for drawing (OpenAC
@@ -818,6 +990,12 @@ pub enum UiChange {
     Labels(Arc<Vec<WorldLabel>>),
     /// Every plugin's world lines, merged.
     Lines(Arc<Vec<WorldLine>>),
+    /// Every plugin's world triangles, merged.
+    Triangles(Arc<Vec<WorldTriangle>>),
+    /// Every plugin's world icons, merged.
+    Icons(Arc<Vec<WorldIconEntry>>),
+    /// Every plugin's ground shapes, merged.
+    Shapes(Arc<Vec<GroundShape>>),
     /// Projectile markers to show for a moment.
     ProjectileDebug(Arc<Vec<ProjectileSample>>),
     /// A plugin asks the window to show, hide or toggle a client window.
@@ -830,6 +1008,15 @@ pub enum UiChange {
     /// The bound plugin hotkeys, in registration order (all of them, each
     /// time the table changes).
     Hotkeys(Arc<Vec<crate::hotkeys::BoundHotkey>>),
+    /// A plugin holds a font, or its sharper bake changed.
+    FontAdded(Box<crate::fonts::FontView>),
+    /// A plugin let go of a font.
+    FontRemoved {
+        /// The plugin.
+        owner: String,
+        /// The handle.
+        handle: u32,
+    },
     /// A plugin asked the player a question (or a snapshot carries one).
     DialogAdded(Box<DialogView>),
     /// A dialog was answered or withdrawn: it goes.
@@ -884,7 +1071,7 @@ pub enum UiInput {
         value: ActionValue,
     },
     /// The player opened (`true`) or closed (`false`) a plugin window
-    /// (shelf button, close or minimize button).
+    /// (dock slot, close or minimize button).
     PanelShown {
         /// The panel.
         panel: u32,
@@ -897,6 +1084,10 @@ pub enum UiInput {
         canvas: u32,
         /// What happened.
         event: PointerEvent,
+        /// Where the window had the canvas when it happened; `None` when
+        /// that is not known (input a test or script sends), and the event
+        /// is heard as sent.
+        place: Option<CanvasPlace>,
     },
     /// Which client windows the window has, and which are shown (bit sets
     /// by [`ClientWindow::bit`]); sent at attach and whenever they change.
@@ -937,6 +1128,9 @@ pub enum UiInput {
         /// The paths, as its markup gives them.
         paths: Vec<String>,
     },
+    /// How many framebuffer pixels a unit the window's display has, sent when
+    /// it changes.
+    DisplayDensity(f32),
     /// The player answered a dialog (the button's index).
     DialogAnswered {
         /// The dialog.
@@ -964,6 +1158,8 @@ pub enum UiEvent {
         canvas: u32,
         /// What happened.
         event: PointerEvent,
+        /// Where the window had the canvas when it happened, if known.
+        place: Option<CanvasPlace>,
     },
     /// One of its hotkeys was pressed (its own id).
     Hotkey(String),

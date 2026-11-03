@@ -23,6 +23,9 @@ pub struct RadarFacts {
     pub radar_behavior: Option<u8>,
     /// Its own blip colour (0: none).
     pub radar_blip_color: u8,
+    /// Its allegiance's monarch (0: none); the radar draws an object that
+    /// shares the player's monarch as a square.
+    pub monarch_id: u32,
 }
 
 impl RadarFacts {
@@ -32,6 +35,7 @@ impl RadarFacts {
             public_weenie_bitfield: item.public_weenie_bitfield.map_or(0, |f| f.bits()),
             radar_behavior: item.radar_behavior,
             radar_blip_color: item.radar_blip_color.unwrap_or(0),
+            monarch_id: item.monarch_id().unwrap_or(0),
         })
     }
 }

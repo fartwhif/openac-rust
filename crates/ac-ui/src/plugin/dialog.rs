@@ -11,7 +11,10 @@ use std::sync::Arc;
 use ac_plugin_ui::{DialogView, UiInput};
 
 use super::fold::{MENU_BACKGROUND, MENU_BORDER, MENU_HIGHLIGHT, MENU_TEXT};
+use super::style;
+use super::widgets::ButtonLook;
 use super::{Palette, PluginOutbox};
+use crate::bundled_font::ModernFonts;
 use crate::draw::{Color, RenderContext};
 use crate::event::{Key, UiEvent, kind};
 use crate::font::UiFont;
@@ -68,10 +71,19 @@ pub fn wrap_words(text: &str, width: f32, measure: impl Fn(&str) -> f32) -> Vec<
     lines
 }
 
+/// A part of a dialog the pointer can be over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    Close,
+    Button(usize),
+}
+
 /// A plugin dialog drawn with primitives (OpenAC `UiDrawnPluginDialog`): a
 /// title bar with a close button, the wrapped message and a centred row of
 /// buttons, the first marked as the default. Enter picks the first button
-/// and Escape the last; a press anywhere on it gives it the keyboard.
+/// and Escape the last; a press anywhere on it gives it the keyboard. Under
+/// a theme it is a rounded, shadowed window with a ghost close X, and its
+/// heading is in the title weight.
 #[derive(Debug)]
 pub struct PluginDialogBox {
     /// The dialog's handle.
@@ -79,12 +91,24 @@ pub struct PluginDialogBox {
     /// The owner window's theme, when it has one.
     pub palette: Option<Palette>,
     title: String,
+    message: String,
     lines: Vec<String>,
     buttons: Vec<(String, f32, f32)>,
     font: Option<Arc<UiFont>>,
+    title_font: Option<Arc<UiFont>>,
     line_height: f32,
+    pointer: Option<(f32, f32)>,
+    pressed: Option<Part>,
     answered: bool,
     outbox: PluginOutbox,
+}
+
+fn same_font(a: Option<&Arc<UiFont>>, b: Option<&Arc<UiFont>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 impl PluginDialogBox {
@@ -95,54 +119,105 @@ impl PluginDialogBox {
         font: Option<Arc<UiFont>>,
         outbox: PluginOutbox,
     ) -> (Self, f32, f32) {
-        let f = font.as_ref();
-        let widths: Vec<f32> = dialog
+        let mut this = Self {
+            handle: dialog.handle,
+            palette: None,
+            title: dialog.title.clone(),
+            message: dialog.message.clone(),
+            lines: Vec::new(),
+            buttons: dialog
+                .buttons
+                .iter()
+                .map(|b| (b.clone(), 0.0, 0.0))
+                .collect(),
+            font: font.clone(),
+            title_font: font,
+            line_height: 14.0,
+            pointer: None,
+            pressed: None,
+            answered: false,
+            outbox,
+        };
+        let (width, height) = this.lay_out();
+        (this, width, height)
+    }
+
+    /// Wraps the message and places the buttons in the fonts in force; the
+    /// box's size.
+    fn lay_out(&mut self) -> (f32, f32) {
+        let f = self.font.as_ref();
+        let widths: Vec<f32> = self
             .buttons
             .iter()
-            .map(|b| BUTTON_MIN_WIDTH.max(measure(f, b).ceil() + 2.0 * BUTTON_TEXT_PAD))
+            .map(|(b, _, _)| BUTTON_MIN_WIDTH.max(measure(f, b).ceil() + 2.0 * BUTTON_TEXT_PAD))
             .collect();
         let row = widths.iter().sum::<f32>() + BUTTON_GAP * (widths.len().saturating_sub(1)) as f32;
-        let width = BOX_MIN_WIDTH
-            .max(row + 2.0 * PAD)
-            .max(measure(f, &dialog.title).ceil() + 2.0 * PAD + CLOSE_SIZE + 4.0);
-        let lines = if dialog.message.is_empty() {
+        let width = BOX_MIN_WIDTH.max(row + 2.0 * PAD).max(
+            measure(self.title_font.as_ref(), &self.title).ceil() + 2.0 * PAD + CLOSE_SIZE + 4.0,
+        );
+        self.lines = if self.message.is_empty() {
             Vec::new()
         } else {
-            wrap_words(&dialog.message, width - 2.0 * PAD, |s| measure(f, s))
+            wrap_words(&self.message, width - 2.0 * PAD, |s| measure(f, s))
         };
-        let line_height = f.map_or(14.0, |f| f.line_height);
-        let message = lines.len() as f32 * line_height;
+        self.line_height = f.map_or(14.0, |f| f.line_height);
+        let message = self.lines.len() as f32 * self.line_height;
         let height = TITLE_HEIGHT
             + PAD
             + if message > 0.0 { message + PAD } else { 0.0 }
             + BUTTON_HEIGHT
             + PAD;
         let mut x = ((width - row) * 0.5).round();
-        let buttons = dialog
-            .buttons
+        for (button, w) in self.buttons.iter_mut().zip(&widths) {
+            (button.1, button.2) = (x, *w);
+            x += w + BUTTON_GAP;
+        }
+        (width, height)
+    }
+
+    /// The fonts to draw in, and the size they make the box when they differ
+    /// from the fonts it has.
+    pub fn set_fonts(
+        &mut self,
+        font: Option<Arc<UiFont>>,
+        title_font: Option<Arc<UiFont>>,
+    ) -> Option<(f32, f32)> {
+        if same_font(self.font.as_ref(), font.as_ref())
+            && same_font(self.title_font.as_ref(), title_font.as_ref())
+        {
+            return None;
+        }
+        self.font = font;
+        self.title_font = title_font;
+        Some(self.lay_out())
+    }
+
+    /// The part at a local point.
+    fn part_at(&self, w: f32, h: f32, x: f32, y: f32) -> Option<Part> {
+        let close_x = w - CLOSE_SIZE - 2.0;
+        let close_y = ((TITLE_HEIGHT - CLOSE_SIZE) * 0.5).round();
+        if x >= close_x && x < close_x + CLOSE_SIZE && y >= close_y && y < close_y + CLOSE_SIZE {
+            return Some(Part::Close);
+        }
+        let top = h - PAD - BUTTON_HEIGHT;
+        if y < top || y >= top + BUTTON_HEIGHT {
+            return None;
+        }
+        self.buttons
             .iter()
-            .zip(&widths)
-            .map(|(caption, w)| {
-                let b = (caption.clone(), x, *w);
-                x += w + BUTTON_GAP;
-                b
-            })
-            .collect();
-        (
-            Self {
-                handle: dialog.handle,
-                palette: None,
-                title: dialog.title.clone(),
-                lines,
-                buttons,
-                font,
-                line_height,
-                answered: false,
-                outbox,
-            },
-            width,
-            height,
-        )
+            .position(|(_, bx, bw)| x >= *bx && x < bx + bw)
+            .map(Part::Button)
+    }
+
+    /// The look a part shows: pressed only while the pointer is still over
+    /// the part it went down on.
+    fn look(&self, part: Part, w: f32, h: f32) -> ButtonLook {
+        let over = self.pointer.and_then(|(x, y)| self.part_at(w, h, x, y)) == Some(part);
+        match self.pressed {
+            Some(pressed) if pressed == part && over => ButtonLook::Pressed,
+            _ if over => ButtonLook::Hovered,
+            _ => ButtonLook::Normal,
+        }
     }
 
     fn cancel(&self) -> i32 {
@@ -162,19 +237,11 @@ impl PluginDialogBox {
     /// The button at a local point (the close button is the last), or −1.
     #[must_use]
     pub fn button_at(&self, w: f32, h: f32, x: f32, y: f32) -> i32 {
-        let close_x = w - CLOSE_SIZE - 2.0;
-        let close_y = ((TITLE_HEIGHT - CLOSE_SIZE) * 0.5).round();
-        if x >= close_x && x < close_x + CLOSE_SIZE && y >= close_y && y < close_y + CLOSE_SIZE {
-            return self.cancel();
+        match self.part_at(w, h, x, y) {
+            Some(Part::Close) => self.cancel(),
+            Some(Part::Button(i)) => i as i32,
+            None => -1,
         }
-        let top = h - PAD - BUTTON_HEIGHT;
-        if y < top || y >= top + BUTTON_HEIGHT {
-            return -1;
-        }
-        self.buttons
-            .iter()
-            .position(|(_, bx, bw)| x >= *bx && x < bx + bw)
-            .map_or(-1, |i| i as i32)
     }
 }
 
@@ -182,6 +249,18 @@ impl Widget for PluginDialogBox {
     fn on_event(&mut self, ui: &mut UiRoot, me: ElementId, e: &UiEvent) -> bool {
         if e.target != Some(me) {
             return false;
+        }
+        let (dw, dh) = ui.element(me).map_or((0.0, 0.0), |e| (e.width, e.height));
+        let at = (e.data1 as f32, e.data2 as f32);
+        match e.kind {
+            kind::HOVER_ENTER | kind::MOUSE_MOVE => self.pointer = Some(at),
+            kind::HOVER_LEAVE => self.pointer = None,
+            kind::MOUSE_DOWN => {
+                self.pointer = Some(at);
+                self.pressed = self.part_at(dw, dh, at.0, at.1);
+            }
+            kind::MOUSE_UP | kind::CAPTURE_CHANGED => self.pressed = None,
+            _ => {}
         }
         match e.kind {
             kind::KEY_DOWN => match e.key {
@@ -220,72 +299,90 @@ impl Widget for PluginDialogBox {
         true
     }
 
+    fn receives_hover_mouse_move(&self) -> bool {
+        self.palette.is_some()
+    }
+
     fn draw(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut RenderContext<'_>) {
         let (w, h) = ui.element(me).map_or((0.0, 0.0), |e| (e.width, e.height));
         let p = self.palette.as_ref();
         let text = p.map_or(MENU_TEXT, |p| p.text);
         let outline = p.is_none();
-        rc.fill(0.0, 0.0, w, h, p.map_or(MENU_BACKGROUND, |p| p.background));
-        rc.fill(
-            0.0,
-            0.0,
-            w,
-            TITLE_HEIGHT,
-            p.map_or(MENU_HIGHLIGHT, |p| p.field),
-        );
-        let caption =
-            |rc: &mut RenderContext<'_>, s: &str, x: f32, y: f32, h: f32, color: Color| {
-                if let Some(font) = &self.font {
-                    let top = y + ((h - font.line_height) * 0.5).floor();
-                    rc.string_dat(
-                        font,
-                        s,
-                        x,
-                        top,
-                        color,
-                        outline,
-                        crate::draw::DEFAULT_OUTLINE_COLOR,
-                    );
-                }
-            };
-        caption(rc, &self.title, PAD, 0.0, TITLE_HEIGHT, text);
+        if let Some(p) = p {
+            style::window_shadow(rc, w, h);
+            let radius = style::WINDOW_RADIUS;
+            style::surface(rc, 0.0, 0.0, w, h, radius, p.background, p.border);
+            style::header(rc, p, w, TITLE_HEIGHT);
+        } else {
+            rc.fill(0.0, 0.0, w, h, MENU_BACKGROUND);
+            rc.fill(0.0, 0.0, w, TITLE_HEIGHT, MENU_HIGHLIGHT);
+        }
+        let caption = |rc: &mut RenderContext<'_>,
+                       font: Option<&Arc<UiFont>>,
+                       s: &str,
+                       (x, y): (f32, f32),
+                       h: f32,
+                       color: Color| {
+            if let Some(font) = font {
+                let top = y + ((h - font.line_height) * 0.5).floor();
+                rc.string_dat(
+                    font,
+                    s,
+                    x,
+                    top,
+                    color,
+                    outline,
+                    crate::draw::DEFAULT_OUTLINE_COLOR,
+                );
+            }
+        };
+        let font = self.font.as_ref();
+        let title_font = self.title_font.as_ref();
+        caption(rc, title_font, &self.title, (PAD, 0.0), TITLE_HEIGHT, text);
         let mut y = TITLE_HEIGHT + PAD;
         for line in &self.lines {
-            caption(rc, line, PAD, y, self.line_height, text);
+            caption(rc, font, line, (PAD, y), self.line_height, text);
             y += self.line_height;
         }
-        let border = p.map_or(MENU_BORDER, |p| p.border);
-        let face = p.map_or(CLASSIC_BUTTON, |p| p.field);
         let top = h - PAD - BUTTON_HEIGHT;
         for (i, (label, x, bw)) in self.buttons.iter().enumerate() {
-            rc.fill(*x, top, *bw, BUTTON_HEIGHT, face);
-            let edge = if i == 0 {
-                p.map_or(CLASSIC_DEFAULT_BORDER, |p| p.accent)
+            if let Some(p) = p {
+                let edge = if i == 0 { p.accent } else { p.border };
+                let look = self.look(Part::Button(i), w, h);
+                style::button(rc, p, (*x, top, *bw, BUTTON_HEIGHT), p.field, edge, look);
             } else {
-                border
-            };
-            rc.rect_outline(*x, top, *bw, BUTTON_HEIGHT, edge, 1.0);
-            let tx = x + ((bw - measure(self.font.as_ref(), label)) * 0.5).floor();
-            caption(rc, label, tx, top, BUTTON_HEIGHT, text);
+                rc.fill(*x, top, *bw, BUTTON_HEIGHT, CLASSIC_BUTTON);
+                let edge = if i == 0 {
+                    CLASSIC_DEFAULT_BORDER
+                } else {
+                    MENU_BORDER
+                };
+                rc.rect_outline(*x, top, *bw, BUTTON_HEIGHT, edge, 1.0);
+            }
+            let tx = x + ((bw - measure(font, label)) * 0.5).floor();
+            caption(rc, font, label, (tx, top), BUTTON_HEIGHT, text);
         }
         let cx = w - CLOSE_SIZE - 2.0;
         let cy = ((TITLE_HEIGHT - CLOSE_SIZE) * 0.5).round();
-        rc.fill(cx, cy, CLOSE_SIZE, CLOSE_SIZE, face);
-        rc.rect_outline(cx, cy, CLOSE_SIZE, CLOSE_SIZE, border, 1.0);
-        let tx = cx + ((CLOSE_SIZE - measure(self.font.as_ref(), "x")) * 0.5).floor();
-        caption(rc, "x", tx, cy, CLOSE_SIZE, text);
+        if let Some(p) = p {
+            let look = self.look(Part::Close, w, h);
+            rc.push_transform(cx, cy);
+            style::close_button(rc, p, CLOSE_SIZE, CLOSE_SIZE, look, false);
+            rc.pop_transform();
+        } else {
+            rc.fill(cx, cy, CLOSE_SIZE, CLOSE_SIZE, CLASSIC_BUTTON);
+            rc.rect_outline(cx, cy, CLOSE_SIZE, CLOSE_SIZE, MENU_BORDER, 1.0);
+            let tx = cx + ((CLOSE_SIZE - measure(font, "x")) * 0.5).floor();
+            caption(rc, font, "x", (tx, cy), CLOSE_SIZE, text);
+        }
     }
 
     fn draw_after_children(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut RenderContext<'_>) {
-        let (w, h) = ui.element(me).map_or((0.0, 0.0), |e| (e.width, e.height));
-        rc.rect_outline(
-            0.0,
-            0.0,
-            w,
-            h,
-            self.palette.map_or(MENU_BORDER, |p| p.border),
-            1.0,
-        );
+        // A themed window's edge is part of its rounded surface.
+        if self.palette.is_none() {
+            let (w, h) = ui.element(me).map_or((0.0, 0.0), |e| (e.width, e.height));
+            rc.rect_outline(0.0, 0.0, w, h, MENU_BORDER, 1.0);
+        }
     }
 }
 
@@ -304,7 +401,9 @@ impl DialogPresenter {
     /// Follows the session's dialogs: the first of each owner's queue is
     /// shown, centred on its owner (`frames` maps a panel number to its
     /// window frame, `palettes` to its theme), others wait; answered ones
-    /// go and focus they took goes back.
+    /// go and focus they took goes back. One with a themed owner draws in
+    /// the bundled fonts when they are loaded.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         ui: &mut UiRoot,
@@ -312,6 +411,7 @@ impl DialogPresenter {
         frames: &HashMap<u32, ElementId>,
         palettes: &HashMap<u32, Palette>,
         font: Option<&Arc<UiFont>>,
+        modern: Option<&ModernFonts>,
         outbox: &PluginOutbox,
     ) {
         let live: HashSet<u32> = dialogs.iter().map(|d| d.handle).collect();
@@ -366,8 +466,18 @@ impl DialogPresenter {
             let Some((element, _)) = self.shown.get(&dialog.handle).copied() else {
                 continue;
             };
-            if let Some(b) = ui.widget_mut::<PluginDialogBox>(element) {
-                b.palette = dialog.owner_panel.and_then(|p| palettes.get(&p).copied());
+            let palette = dialog.owner_panel.and_then(|p| palettes.get(&p).copied());
+            let (body, title) = match (palette, modern) {
+                (Some(_), Some(m)) => (Some(Arc::clone(&m.regular)), Some(Arc::clone(&m.semibold))),
+                _ => (font.cloned(), font.cloned()),
+            };
+            let resized = ui.widget_mut::<PluginDialogBox>(element).and_then(|b| {
+                b.palette = palette;
+                b.set_fonts(body, title)
+            });
+            if let (Some((w, h)), Some(el)) = (resized, ui.element_mut(element)) {
+                el.width = w;
+                el.height = h;
             }
             let (cx, cy) = match owner.and_then(|o| ui.element(o).map(|e| (o, e.width, e.height))) {
                 Some((o, ow, oh)) => {
@@ -460,6 +570,7 @@ mod tests {
             &frames,
             &HashMap::new(),
             None,
+            None,
             &outbox,
         );
         assert!(ui.is_window_blocked(owner));
@@ -480,7 +591,7 @@ mod tests {
                 button: 1
             }]
         );
-        presenter.sync(&mut ui, &[], &frames, &HashMap::new(), None, &outbox);
+        presenter.sync(&mut ui, &[], &frames, &HashMap::new(), None, None, &outbox);
         assert!(!ui.is_window_blocked(owner));
         assert!(!ui.exists(element));
     }
@@ -491,11 +602,19 @@ mod tests {
         let (mut ui, _owner, frames, outbox) = setup();
         let mut presenter = DialogPresenter::default();
         let all = [dialog(1, Some(7)), dialog(2, Some(7)), dialog(3, None)];
-        presenter.sync(&mut ui, &all, &frames, &HashMap::new(), None, &outbox);
+        presenter.sync(&mut ui, &all, &frames, &HashMap::new(), None, None, &outbox);
         assert!(presenter.shown.contains_key(&1));
         assert!(!presenter.shown.contains_key(&2));
         assert!(presenter.shown.contains_key(&3));
-        presenter.sync(&mut ui, &all[1..], &frames, &HashMap::new(), None, &outbox);
+        presenter.sync(
+            &mut ui,
+            &all[1..],
+            &frames,
+            &HashMap::new(),
+            None,
+            None,
+            &outbox,
+        );
         assert!(presenter.shown.contains_key(&2));
     }
 
@@ -516,10 +635,11 @@ mod tests {
             &frames,
             &HashMap::new(),
             None,
+            None,
             &outbox,
         );
         assert_eq!(ui.keyboard_focus(), Some(chat));
-        presenter.sync(&mut ui, &[], &frames, &HashMap::new(), None, &outbox);
+        presenter.sync(&mut ui, &[], &frames, &HashMap::new(), None, None, &outbox);
         assert_eq!(ui.keyboard_focus(), Some(chat));
     }
 

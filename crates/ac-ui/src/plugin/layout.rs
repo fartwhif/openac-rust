@@ -336,6 +336,7 @@ impl ScrollArea {
                 w.plain_track_color = palette.map_or(classic.plain_track_color, |p| p.field);
                 w.plain_border_color = palette.map_or(classic.plain_border_color, |p| p.border);
                 w.plain_nub_color = palette.map_or(classic.plain_nub_color, |p| p.muted);
+                w.theme_palette = palette.copied();
             }
         }
     }

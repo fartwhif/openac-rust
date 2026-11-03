@@ -656,6 +656,25 @@ impl Arm {
         sent
     }
 
+    /// [`Self::record_outbound`] while the character walks: its position
+    /// updates (0xF753) are left out of the transcript. Where a walking body
+    /// stands when one goes out, and how many go out (one a second while it
+    /// moves), is real time, not what the client was asked; the rest is
+    /// recorded as it is, and all of it is returned.
+    pub fn record_outbound_while_walking(&mut self, transcript: &mut Transcript) -> Vec<Outbound> {
+        const AUTONOMOUS_POSITION: u32 = 0xF753;
+        let sent = self.outbound();
+        let said: Vec<&Outbound> = sent
+            .iter()
+            .filter(|m| m.game_action() != Some(AUTONOMOUS_POSITION))
+            .collect();
+        transcript.record("outbound.count", said.len());
+        for (index, message) in said.iter().enumerate() {
+            transcript.record(&format!("outbound[{index}]"), message);
+        }
+        sent
+    }
+
     /// The relay's events, every one so far.
     pub fn parity_events(&self) -> impl Iterator<Item = Event> + '_ {
         self.logs

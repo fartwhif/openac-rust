@@ -67,6 +67,8 @@ pub struct ItemsView<'a> {
     pub vendor_split_exempt: bool,
     /// The player's current strength (burden capacity).
     pub strength: Option<i32>,
+    /// The vendor whose shop window is open; 0 when none.
+    pub open_vendor: u32,
     /// The player's name.
     pub owner_name: Option<&'a str>,
     /// Composes displayed names; the plain appropriate name without it.
@@ -101,6 +103,7 @@ impl<'a> ItemsView<'a> {
             split: None,
             vendor_split_exempt: false,
             strength: None,
+            open_vendor: 0,
             owner_name: None,
             names: None,
         }

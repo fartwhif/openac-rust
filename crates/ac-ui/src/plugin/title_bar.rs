@@ -1,8 +1,8 @@
 //! The title bar of a plugin window with chrome: the title, shortened with
 //! "..." when it does not fit, and the close button at the right. The bar
 //! lets presses through, so dragging it moves the window. Under a theme the
-//! title takes the theme's font and colour and the close button is drawn
-//! as a flat themed button with an "x".
+//! title takes the title weight and the theme's colour, and the close button
+//! is a ghost X.
 
 use std::sync::Arc;
 
@@ -11,7 +11,8 @@ use ac_plugin_ui::chrome::{
     TITLE_BAR_HEIGHT, ellipsize,
 };
 
-use super::widgets::{MarkupButton, Palette};
+use super::style::{self, PointerState};
+use super::widgets::{ButtonLook, Palette};
 use crate::draw::{Color, RenderContext};
 use crate::event::{UiEvent, kind};
 use crate::font::UiFont;
@@ -120,7 +121,7 @@ impl TitleBar {
             return;
         };
         if let Some(c) = ui.widget_mut::<CloseButton>(close) {
-            c.set_palette(palette, font);
+            c.palette = palette;
         }
         if let Some(e) = ui.element_mut(close) {
             e.top = if palette.is_none() {
@@ -209,50 +210,27 @@ impl Widget for TitleBar {
     }
 }
 
-/// The close button: the inventory window's close art in Classic, a flat
-/// themed button with an "x" under a theme. A click sends
-/// [`ElementMessage::Clicked`].
+/// The close button: the inventory window's close art in Classic, a ghost X
+/// under a theme. A click sends [`ElementMessage::Clicked`].
 #[derive(Debug, Clone, Default)]
 pub struct CloseButton {
-    themed: Option<MarkupButton>,
-    hovered: bool,
-    pressed: bool,
+    /// The theme (`None`: the Classic art).
+    pub palette: Option<Palette>,
+    pointer: PointerState,
     keyboard_focused: bool,
 }
 
 impl CloseButton {
-    /// Themes the button (`None`: the Classic art).
-    pub fn set_palette(&mut self, palette: Option<Palette>, font: Option<Arc<UiFont>>) {
-        self.themed = palette.map(|p| MarkupButton {
-            text: "x".to_owned(),
-            text_color: p.text,
-            background: p.field,
-            border: p.border,
-            outline: false,
-            palette: Some(p),
-            ..MarkupButton::new(font)
-        });
-    }
-
     /// Whether it draws themed.
     #[must_use]
     pub fn is_themed(&self) -> bool {
-        self.themed.is_some()
+        self.palette.is_some()
     }
 }
 
 impl Widget for CloseButton {
     fn on_event(&mut self, ui: &mut UiRoot, me: ElementId, e: &UiEvent) -> bool {
-        match e.kind {
-            kind::HOVER_ENTER => self.hovered = true,
-            kind::HOVER_LEAVE => self.hovered = false,
-            kind::MOUSE_DOWN => {
-                self.pressed = true;
-                self.hovered = true;
-            }
-            kind::MOUSE_UP | kind::CAPTURE_CHANGED => self.pressed = false,
-            _ => {}
-        }
+        self.pointer.observe(e);
         if let Some(activate) =
             super::widgets::tab_stop_event(ui, me, e, &mut self.keyboard_focused)
         {
@@ -273,14 +251,14 @@ impl Widget for CloseButton {
     }
 
     fn draw(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut RenderContext<'_>) {
-        if let Some(themed) = &mut self.themed {
-            themed.keyboard_focused = self.keyboard_focused;
-            themed.draw(ui, me, rc);
+        let (w, h) = ui.element(me).map_or((0.0, 0.0), |e| (e.width, e.height));
+        let look = self.pointer.look(true);
+        if let Some(p) = &self.palette {
+            style::close_button(rc, p, w, h, look, self.keyboard_focused);
             return;
         }
-        let (w, h) = ui.element(me).map_or((0.0, 0.0), |e| (e.width, e.height));
         let mut sprite = None;
-        if self.pressed && self.hovered {
+        if look == ButtonLook::Pressed {
             sprite = rc
                 .sprite_size(CLASSIC_CLOSE_PRESSED_SPRITE)
                 .map(|s| (CLASSIC_CLOSE_PRESSED_SPRITE, s));
@@ -298,7 +276,7 @@ impl Widget for CloseButton {
             let (sw, sh) = (tw * scale, th * scale);
             let (x, y) = ((w - sw) / 2.0, (h - sh) / 2.0);
             rc.surface(file, x, y, sw, sh, Color::WHITE);
-            if self.hovered && !self.pressed {
+            if look == ButtonLook::Hovered {
                 rc.fill(x, y, sw, sh, CLASSIC_CLOSE_HOVER);
             }
         }

@@ -8,7 +8,7 @@
 //! house lines); the map refreshes every five seconds, the house page when
 //! its lines change.
 
-use ac_core::world::CalendarDate;
+use ac_core::world::{CalendarDate, HourName};
 use ac_dat::objects::PropertyValue;
 use ac_runtime::gameplay::HouseLineColor;
 
@@ -150,15 +150,24 @@ pub const MAP_LOCATIONS: [MapLocation; 53] = [
 /// "Morntide-and-Half").
 #[must_use]
 pub fn format_date_time(date: &CalendarDate) -> String {
-    let hour = format!("{:?}", date.hour);
-    let hour = match hour.strip_suffix("AndHalf") {
-        Some(name) => format!("{name}-and-Half"),
-        None => hour,
-    };
     format!(
-        "Date: {:?} {}, {} P.Y.\nTime: {hour}",
-        date.month, date.day, date.year
+        "Date: {:?} {}, {} P.Y.\nTime: {}",
+        date.month,
+        date.day,
+        date.year,
+        hour_text(date.hour)
     )
+}
+
+/// An hour's name as the game shows it: "Dawnsong", a half hour
+/// "Morntide-and-Half".
+#[must_use]
+pub fn hour_text(hour: HourName) -> String {
+    let name = format!("{hour:?}");
+    match name.strip_suffix("AndHalf") {
+        Some(name) => format!("{name}-and-Half"),
+        None => name,
+    }
 }
 
 /// Where a marker of `icon_w` x `icon_h` goes on a map whose marker area

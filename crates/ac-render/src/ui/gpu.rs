@@ -677,6 +677,7 @@ fn bind(
 mod tests {
     use super::super::batch::{UiRun, UiVertex};
     use super::*;
+    use ac_ui::draw::Color;
 
     struct Source(HashMap<TextureRef, UiPixels>);
 
@@ -816,25 +817,6 @@ mod tests {
     /// Three quads side by side: texture 1, texture 2, texture 1 again,
     /// over a grey background; the target's RGBA bytes.
     fn draw(device: &wgpu::Device, queue: &wgpu::Queue, second: UiPixels) -> Vec<u8> {
-        let format = wgpu::TextureFormat::Rgba8Unorm;
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: None,
-            size: wgpu::Extent3d {
-                width: W,
-                height: H,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let background: Vec<u8> = (0..W * H).flat_map(|_| [40, 80, 120, 255]).collect();
-        crate::renderer::pipelines::write_layer(queue, &target, 0, 0, W, H, &background);
         let first = UiPixels::Rgba(DecodedTexture {
             width: 2,
             height: 2,
@@ -846,7 +828,6 @@ mod tests {
             (TextureRef::Surface(1), first),
             (TextureRef::Surface(2), second),
         ]));
-        let mut renderer = UiRenderer::new(device, queue, format);
         let run = |texture: u32, first: u32| UiRun {
             key: UiTextureKey {
                 texture: UiTexture::Named(TextureRef::Surface(texture)),
@@ -860,11 +841,54 @@ mod tests {
             runs: vec![run(1, 0), run(2, 6), run(1, 12)],
             skipped_zero_ids: 0,
         };
-        renderer.prepare(device, queue, &batch, (W, H), &mut source);
+        draw_batch(
+            device,
+            queue,
+            &batch,
+            &mut source,
+            (W, H),
+            (W, H),
+            [40, 80, 120, 255],
+        )
+    }
+
+    /// `batch` drawn for a UI of `ui_size` units over a target of `pixels`
+    /// filled with `background`; the target's RGBA bytes.
+    fn draw_batch(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &UiBatch,
+        source: &mut dyn UiTextureSource,
+        ui_size: (u32, u32),
+        (w, h): (u32, u32),
+        background: [u8; 4],
+    ) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let fill: Vec<u8> = (0..w * h).flat_map(|_| background).collect();
+        crate::renderer::pipelines::write_layer(queue, &target, 0, 0, w, h, &fill);
+        let mut renderer = UiRenderer::new(device, queue, format);
+        renderer.prepare(device, queue, batch, ui_size, source);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let row = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
-            size: u64::from(256 * H),
+            size: u64::from(row * h),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -876,8 +900,8 @@ mod tests {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(256),
-                    rows_per_image: Some(H),
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(h),
                 },
             },
             target.size(),
@@ -889,9 +913,169 @@ mod tests {
             .expect("the GPU finishes");
         let mapped = readback.slice(..).get_mapped_range().expect("mapped");
         mapped
-            .chunks(256)
-            .flat_map(|row| row[..(W * 4) as usize].to_vec())
+            .chunks(row as usize)
+            .flat_map(|bytes| bytes[..(w * 4) as usize].to_vec())
             .collect()
+    }
+
+    /// What `paint` draws in white over black: a UI of `ui` units, `pixels`
+    /// framebuffer pixels a unit, read back as one red byte a pixel.
+    fn shape_pixels(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ui: u32,
+        pixels: u32,
+        paint: impl FnOnce(&mut ac_ui::draw::RenderContext<'_>),
+    ) -> Vec<u8> {
+        let mut list = ac_ui::draw::DrawList {
+            canvas_scale: (1.0, 1.0),
+            ..Default::default()
+        };
+        let mut context = ac_ui::draw::RenderContext::new(
+            &mut list,
+            (ui as f32, ui as f32),
+            &ac_ui::draw::NoSprites,
+        )
+        .with_pixels_per_unit(pixels as f32);
+        paint(&mut context);
+        let side = ui * pixels;
+        let drawn = draw_batch(
+            device,
+            queue,
+            &UiBatch::build(&list),
+            &mut Source(HashMap::new()),
+            (ui, ui),
+            (side, side),
+            [0, 0, 0, 255],
+        );
+        drawn.chunks(4).map(|p| p[0]).collect()
+    }
+
+    /// A rectangle's edge on a pixel boundary comes out crisp at any scale:
+    /// the soft edge is one framebuffer pixel wide, its pixel centres at no
+    /// coverage and at full. Half a pixel off, that pixel is half covered.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_shapes_soft_edge_is_one_framebuffer_pixel_wide() {
+        let (device, queue) = crate::test_gpu::device().expect("a GPU device");
+        let square = ac_ui::shapes::CornerRadii::default();
+        let row = |bytes: &[u8], side: usize, y: usize| bytes[y * side..(y + 1) * side].to_vec();
+
+        let one = shape_pixels(&device, &queue, 16, 1, |c| {
+            c.fill_rounded_rect(4.0, 4.0, 8.0, 8.0, square, Color::WHITE);
+        });
+        assert_eq!(
+            row(&one, 16, 8)[2..7],
+            [0, 0, 255, 255, 255],
+            "crisp at one pixel a unit"
+        );
+
+        let two = shape_pixels(&device, &queue, 16, 2, |c| {
+            c.fill_rounded_rect(4.0, 4.0, 8.0, 8.0, square, Color::WHITE);
+        });
+        assert_eq!(
+            row(&two, 32, 16)[6..11],
+            [0, 0, 255, 255, 255],
+            "crisp at two pixels a unit"
+        );
+
+        let off = shape_pixels(&device, &queue, 16, 1, |c| {
+            c.fill_rounded_rect(4.5, 4.0, 8.0, 8.0, square, Color::WHITE);
+        });
+        let half = row(&off, 16, 8)[4];
+        assert!((126..=129).contains(&half), "half covered, got {half}");
+    }
+
+    /// What a curve lights up comes to its own area, and its rim holds pixels
+    /// between dark and full: it really is smooth.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_circle_lights_its_own_area_with_a_smooth_rim() {
+        let (device, queue) = crate::test_gpu::device().expect("a GPU device");
+        let drawn = shape_pixels(&device, &queue, 64, 1, |c| {
+            c.fill_ellipse(12.0, 12.0, 40.0, 40.0, Color::WHITE);
+        });
+        let lit: f64 = drawn.iter().map(|&p| f64::from(p) / 255.0).sum();
+        let area = std::f64::consts::PI * 20.0 * 20.0;
+        assert!((lit - area).abs() <= area * 0.01, "lit {lit}, area {area}");
+        let between = drawn.iter().filter(|&&p| p > 0 && p < 255).count();
+        assert!(between > 60, "only {between} rim pixels between");
+    }
+
+    /// A gradient draws bright to dark from top to bottom, with no step
+    /// larger than its share of the height.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_gradient_runs_smoothly_down_the_shape() {
+        let (device, queue) = crate::test_gpu::device().expect("a GPU device");
+        let drawn = shape_pixels(&device, &queue, 64, 1, |c| {
+            c.fill_vertical_gradient(
+                8.0,
+                8.0,
+                48.0,
+                48.0,
+                ac_ui::shapes::CornerRadii::default(),
+                Color::WHITE,
+                Color::BLACK,
+            );
+        });
+        let column: Vec<u8> = (9..55).map(|y| drawn[y * 64 + 32]).collect();
+        assert!(
+            column[0] > 240 && column[column.len() - 1] < 15,
+            "{column:?}"
+        );
+        for pair in column.windows(2) {
+            assert!(pair[0] > pair[1], "{column:?}");
+            assert!(pair[0] - pair[1] <= 7, "{column:?}");
+        }
+    }
+
+    /// A horizontal gradient draws bright to dark from left to right, with no
+    /// step larger than its share of the width.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_horizontal_gradient_runs_smoothly_across_the_shape() {
+        let (device, queue) = crate::test_gpu::device().expect("a GPU device");
+        let drawn = shape_pixels(&device, &queue, 64, 1, |c| {
+            c.fill_horizontal_gradient(
+                8.0,
+                8.0,
+                48.0,
+                48.0,
+                ac_ui::shapes::CornerRadii::default(),
+                Color::WHITE,
+                Color::BLACK,
+            );
+        });
+        let row: Vec<u8> = (9..55).map(|x| drawn[32 * 64 + x]).collect();
+        assert!(row[0] > 240 && row[row.len() - 1] < 15, "{row:?}");
+        for pair in row.windows(2) {
+            assert!(pair[0] > pair[1], "{row:?}");
+            assert!(pair[0] - pair[1] <= 7, "{row:?}");
+        }
+        // A column stays one shade from top to bottom.
+        let column: Vec<u8> = (9..55).map(|y| drawn[y * 64 + 32]).collect();
+        assert!(column.iter().all(|&p| p == column[0]), "{column:?}");
+    }
+
+    /// A shadow darkens most beside its caster, fades smoothly and is gone
+    /// past its spread.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_shadow_fades_out_from_its_caster() {
+        let (device, queue) = crate::test_gpu::device().expect("a GPU device");
+        let drawn = shape_pixels(&device, &queue, 64, 1, |c| {
+            c.soft_shadow(20.0, 20.0, 24.0, 24.0, 4.0, 0.0, 12.0, Color::WHITE);
+        });
+        let across: Vec<u8> = (44..58).map(|x| drawn[32 * 64 + x]).collect();
+        assert!(across[0] > 100, "{across:?}");
+        assert_eq!(across[across.len() - 1], 0, "{across:?}");
+        // No flat runs and no jumps: it fades, it does not step.
+        let fading = &across[..12];
+        for pair in fading.windows(2) {
+            assert!(pair[0] > pair[1], "{across:?}");
+            assert!(pair[0] - pair[1] <= 25, "{across:?}");
+        }
     }
 
     /// A one-byte coverage texture draws exactly as its four-channel image

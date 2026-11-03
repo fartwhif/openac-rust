@@ -568,6 +568,85 @@ fn update_int_property_player_killer_status_missing_bitfield_is_zero() {
 }
 
 #[test]
+fn update_bool_property_ui_hidden_sets_and_clears_the_public_bit() {
+    // The UI-hidden bool (24) moves the description's UI-hidden bit (0x80)
+    // and leaves the other bits alone: a hook the server makes visible can
+    // be picked again.
+    use crate::properties::PropertyBool;
+    let mut f = Fixture::new();
+    let mut hook = ClientObject::new(0x5000_00B5);
+    hook.public_weenie_bitfield = Some(PublicWeenieFlags::STUCK | PublicWeenieFlags::UI_HIDDEN);
+    f.add(hook);
+    f.take();
+    assert!(f.t.update_bool_property(0x5000_00B5, PropertyBool::UI_HIDDEN.0, false, &mut f.ev));
+    assert_eq!(
+        f.get(0x5000_00B5).public_weenie_bitfield,
+        Some(PublicWeenieFlags::STUCK)
+    );
+    assert_eq!(count_updated(&f.take()), 1);
+    f.t.update_bool_property(0x5000_00B5, PropertyBool::UI_HIDDEN.0, true, &mut f.ev);
+    assert_eq!(
+        f.get(0x5000_00B5).public_weenie_bitfield,
+        Some(PublicWeenieFlags::STUCK | PublicWeenieFlags::UI_HIDDEN)
+    );
+    // An unrelated bool leaves the bits.
+    f.t.update_bool_property(0x5000_00B5, PropertyBool::OPEN.0, true, &mut f.ev);
+    assert_eq!(
+        f.get(0x5000_00B5).public_weenie_bitfield,
+        Some(PublicWeenieFlags::STUCK | PublicWeenieFlags::UI_HIDDEN)
+    );
+}
+
+#[test]
+fn a_description_bool_update_moves_its_description_bit() {
+    // DescriptionBoolUpdate_MovesItsDescriptionBit: each of these bools is
+    // also a bit of the public description, and the update moves that bit
+    // with it, leaving every other bit alone. Locked (3) is the inverse of
+    // openable (0x1): unlocking a chest with a key makes it openable.
+    use crate::properties::PropertyBool;
+    let cases = [
+        (PropertyBool::STUCK, PublicWeenieFlags::STUCK, false),
+        (PropertyBool::LOCKED, PublicWeenieFlags::OPENABLE, true),
+        (
+            PropertyBool::INSCRIBABLE,
+            PublicWeenieFlags::INSCRIBABLE,
+            false,
+        ),
+        (PropertyBool::UI_HIDDEN, PublicWeenieFlags::UI_HIDDEN, false),
+        (
+            PropertyBool::IGNORE_HOUSE_BARRIERS,
+            PublicWeenieFlags::IMMUNE_CELL_RESTRICTIONS,
+            false,
+        ),
+        (
+            PropertyBool::HIDDEN_ADMIN,
+            PublicWeenieFlags::HIDDEN_ADMIN,
+            false,
+        ),
+    ];
+    let guid = 0x7E16_6010;
+    let other = PublicWeenieFlags::ATTACKABLE | PublicWeenieFlags::BINDSTONE;
+    for (property, bit, inverted) in cases {
+        let mut f = Fixture::new();
+        let mut object = ClientObject::new(guid);
+        object.public_weenie_bitfield = Some(other);
+        f.add(object);
+        assert!(f.t.update_bool_property(guid, property.0, !inverted, &mut f.ev));
+        assert_eq!(
+            f.get(guid).public_weenie_bitfield,
+            Some(other | bit),
+            "{property:?} set"
+        );
+        assert!(f.t.update_bool_property(guid, property.0, inverted, &mut f.ev));
+        assert_eq!(
+            f.get(guid).public_weenie_bitfield,
+            Some(other),
+            "{property:?} cleared"
+        );
+    }
+}
+
+#[test]
 fn ingest_and_live_properties_preserve_hook_identity() {
     let guid = 0x5000_00AE;
     let mut f = Fixture::new();
@@ -1926,6 +2005,27 @@ fn a_house_owner_instance_id_update_sets_and_clears_the_owner() {
     assert_eq!(f.get(0x802).house_owner_id(), None);
 }
 
+// Swearing or breaking allegiance announces the new monarch with an
+// instance-id update (Monarch, 26); the object's monarch follows it, as the
+// one its description carries does, and 0 clears it. The radar's allegiance
+// square and the house entry gate both read it.
+#[test]
+fn a_monarch_instance_id_update_sets_and_clears_the_monarch() {
+    let mut f = Fixture::new();
+    f.ingest(full_weenie(0x802));
+    assert_eq!(f.get(0x802).monarch_id(), None);
+
+    let before = f.t.mutation_revision();
+    let monarch = crate::properties::PropertyInstanceId::MONARCH.0;
+    assert!(f.t.update_instance_id_property(0x802, monarch, 0x5000_0777, &mut f.ev));
+    assert_eq!(f.get(0x802).monarch_id(), Some(0x5000_0777));
+    // One for the monarch change, one for the update.
+    assert_eq!(f.t.mutation_revision(), before + 2);
+
+    assert!(f.t.update_instance_id_property(0x802, monarch, 0, &mut f.ev));
+    assert_eq!(f.get(0x802).monarch_id(), None);
+}
+
 #[test]
 fn house_authority_changes_advance_the_mutation_revision() {
     let mut f = Fixture::new();
@@ -2121,4 +2221,105 @@ fn a_move_the_client_makes_on_its_own_leaves_a_refusal_standing() {
     assert!(f.t.move_item_optimistic(CARRIED, 0x5000_0002, 0, &mut f.ev));
 
     assert!(f.get(CARRIED).last_appraisal_unsuccessful);
+}
+
+// --- A re-sent description re-creates the object -----------------------
+//
+// The game handles a re-sent description by deleting the object, which
+// takes it out of its container's list, and creating it again; the
+// container then has no place for it and puts it first among its own kind
+// (items or packs). Revealing a coalesced Aetheria's sigil sends one, so
+// the revealed Aetheria lands in its pack's top-left slot.
+
+const RECREATE_PACK: u32 = 0x5000_00C9;
+
+fn named_in(guid: u32, container: u32, name: &str) -> WeenieData {
+    WeenieData {
+        name: Some(name.into()),
+        ..in_container(guid, container)
+    }
+}
+
+#[test]
+fn ingest_recreated_puts_the_item_first_in_its_pack() {
+    let items = [0x7000_0A01, 0x7000_0A02, 0x7000_0A03];
+    let mut f = Fixture::new();
+    for (slot, &id) in items.iter().enumerate() {
+        f.ingest(named_in(id, RECREATE_PACK, "Coalesced Aetheria"));
+        assert!(f.server_move(id, RECREATE_PACK, slot as i32));
+    }
+    assert_eq!(f.contents(RECREATE_PACK), items);
+    f.take();
+
+    f.t.ingest_recreated(&named_in(items[2], RECREATE_PACK, "Aetheria"), &mut f.ev);
+
+    assert_eq!(f.contents(RECREATE_PACK), [items[2], items[0], items[1]]);
+    let slots: Vec<i32> = [items[2], items[0], items[1]]
+        .iter()
+        .map(|&id| f.get(id).container_slot)
+        .collect();
+    assert_eq!(slots, [0, 1, 2]);
+    assert_eq!(f.get(items[2]).name, "Aetheria");
+    let moved = moves(&f.take());
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0].item_id, items[2]);
+    assert_eq!(moved[0].current.container_slot, 0);
+}
+
+#[test]
+fn ingest_recreated_puts_a_pack_first_among_packs_and_leaves_the_items() {
+    let (item_a, item_b) = (0x7000_0B01, 0x7000_0B02);
+    let (pack_a, pack_b) = (0x7000_0B11, 0x7000_0B12);
+    let mut f = Fixture::new();
+    for (slot, &id) in [item_a, item_b].iter().enumerate() {
+        f.ingest(in_container(id, PLAYER));
+        assert!(f.server_move(id, PLAYER, slot as i32));
+    }
+    for (slot, &id) in [pack_a, pack_b].iter().enumerate() {
+        f.ingest(in_container(id, PLAYER));
+        assert!(f.confirmed_move(id, PLAYER, slot as i32, 1));
+    }
+
+    f.t.ingest_recreated(&in_container(pack_b, PLAYER), &mut f.ev);
+
+    let order = f.contents(PLAYER);
+    let packs: Vec<u32> = order
+        .iter()
+        .copied()
+        .filter(|id| [pack_a, pack_b].contains(id))
+        .collect();
+    let loose: Vec<u32> = order
+        .iter()
+        .copied()
+        .filter(|id| [item_a, item_b].contains(id))
+        .collect();
+    assert_eq!(packs, [pack_b, pack_a]);
+    assert_eq!(loose, [item_a, item_b]);
+    assert_eq!(f.get(pack_b).container_slot, 0);
+    assert_eq!(f.get(pack_a).container_slot, 1);
+    assert_eq!(f.get(item_a).container_slot, 0);
+    assert_eq!(f.get(item_b).container_slot, 1);
+}
+
+#[test]
+fn ingest_recreated_without_a_container_keeps_where_the_object_is() {
+    const SWORD: u32 = 0x7000_0C01;
+    let mut f = Fixture::new();
+    f.ingest(full_weenie(SWORD));
+    assert!(f.t.apply_server_move(
+        SWORD,
+        wielded(PLAYER, EquipMask::MELEE_WEAPON),
+        None,
+        &mut f.ev
+    ));
+    f.take();
+
+    f.t.ingest_recreated(&full_weenie(SWORD), &mut f.ev);
+
+    assert_eq!(f.get(SWORD).wielder_id, PLAYER);
+    assert_eq!(
+        f.get(SWORD).currently_equipped_location,
+        EquipMask::MELEE_WEAPON
+    );
+    assert!(moves(&f.take()).is_empty());
 }

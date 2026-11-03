@@ -764,8 +764,11 @@ impl World {
         // hook given an item takes the item's setup and loses its no-draw
         // bit). The item record is taken as any description is taken (an
         // icon underlay a rend adds, a revealed Aetheria), keeping what was
-        // learned about it. One not held only refreshes the item record; it
-        // never puts an object in the world.
+        // learned about it; being created again, it takes the first place
+        // in the container the description names (a revealed Aetheria
+        // moves to its pack's top-left slot). One not held only refreshes
+        // the item record, where it is; it never puts an object in the
+        // world.
         let Some(existing) = self.objects.get_mut(&update.guid) else {
             self.ingest_description(update);
             return;
@@ -777,7 +780,7 @@ impl World {
         self.attachments
             .end_generation(update.guid, stamps.instance);
         self.insert(update, gate, true);
-        self.ingest_description(update);
+        self.ingest_recreated_description(update);
         self.queue_notes
             .push(liveness::QueueNote::Spawned(update.guid));
         self.attach_after_spawn(update);

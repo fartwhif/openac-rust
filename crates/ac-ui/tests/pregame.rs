@@ -1452,6 +1452,78 @@ fn the_heritage_profession_and_town_pages_drive_the_owner() {
     assert!(w.selected(yaraq));
 }
 
+/// The profession page's help box: a bordered text two lines tall in the
+/// authored layout, not one line.
+const PROFESSION_HELP_ID: u32 = 0x1000_03EC;
+
+#[test]
+#[ignore = "needs the retail dat files"]
+fn every_page_lays_its_authored_text_out_inside_its_box() {
+    // The authored text of a text element that is not one line wraps to the
+    // element's width between its margins. The profession page's help box
+    // (754 by 42 pixels, margins 8, 8, 5 and 5, a 14-pixel font) holds its
+    // sentence on two lines.
+    let mut w = Wizard::new();
+    w.open();
+    let pages = [
+        Page::Heritage,
+        Page::Profession,
+        Page::Skills,
+        Page::Appearance,
+        Page::Town,
+        Page::Summary,
+    ];
+    for (i, page) in pages.into_iter().enumerate() {
+        w.click(w.shell(chargen::TAB_IDS[i]));
+        let mut stack = vec![w.screen().page_root(page)];
+        while let Some(e) = stack.pop() {
+            stack.extend(w.h.ui.children(e));
+            let (width, dat) = {
+                let el = w.h.ui.element(e).unwrap();
+                (el.width, el.dat_element_id)
+            };
+            let Some(t) = w.h.ui.widget_mut::<Text>(e) else {
+                continue;
+            };
+            if t.one_line {
+                continue;
+            }
+            let room = width - t.margin_left - t.margin_right;
+            let font = t.font.clone().expect("a dat font");
+            for line in t.refresh_lines(width) {
+                let fits = font.measure_width(&line.text) <= room;
+                assert!(
+                    fits || !line.text.contains(' '),
+                    "{page:?} {dat:#X}: {:?} is wider than {room} px",
+                    line.text
+                );
+            }
+        }
+    }
+
+    w.click(w.shell(chargen::TAB_IDS[1]));
+    let help =
+        w.h.ui
+            .find_descendant(w.screen().page_root(Page::Profession), PROFESSION_HELP_ID)
+            .unwrap();
+    let (width, height) = {
+        let el = w.h.ui.element(help).unwrap();
+        (el.width, el.height)
+    };
+    let t = w.h.ui.widget_mut::<Text>(help).unwrap();
+    let (top, bottom) = (t.margin_top, t.margin_bottom);
+    let line_height = t.font.as_ref().unwrap().line_height;
+    let lines: Vec<String> = t
+        .refresh_lines(width)
+        .iter()
+        .map(|l| l.text.clone())
+        .collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].starts_with("From this screen you can modify your profession"));
+    assert!(lines[1].ends_with("by adjusting the slider bars."));
+    assert!(lines.len() as f32 * line_height <= height - top - bottom);
+}
+
 #[test]
 #[ignore = "needs the retail dat files"]
 fn the_skills_page_lists_groups_and_trains_through_the_arrows() {
@@ -1626,6 +1698,69 @@ fn the_appearance_page_spins_paints_and_shades() {
     assert_eq!(preview.heritage, ALUVIAN);
     assert_eq!(preview.viewport, page.viewport().unwrap());
     assert!(!preview.summary, "the appearance page's preview");
+}
+
+#[test]
+#[ignore = "needs the retail dat files"]
+fn a_gearknights_trim_and_gear_colours_stay_picked_as_they_change() {
+    // Issue #37: a Gearknight's trim colour (the eyes spin) and gear colour
+    // (the skin spin) went back to the body style (the hair) on the
+    // change's refresh.
+    use ac_runtime::session::creation::{AppearanceSlot, ShadeSlot};
+    use ac_ui::pregame::chargen::appearance::Part;
+    const GEARKNIGHT: u32 = 6;
+    let mut w = Wizard::new();
+    w.open();
+    let gearknight = w
+        .screen()
+        .heritage_page()
+        .buttons()
+        .iter()
+        .find(|b| b.2 == GEARKNIGHT)
+        .map(|b| b.0)
+        .unwrap();
+    w.click(gearknight);
+    w.click(w.shell(chargen::TAB_IDS[3]));
+    let page = w.screen().appearance_page().clone();
+    let trim = page.spin(Part::Eyes).unwrap();
+    w.message(trim, ElementMessage::Clicked { x: 130, y: 10 });
+    assert_eq!(w.screen().appearance_page().part(), Part::Eyes);
+    let (swatches, _) = page.swatches();
+    assert_eq!(
+        w.click(swatches[1].unwrap()),
+        [CreationCommand::SetAppearance(AppearanceSlot::EyeColor, 1)]
+    );
+    assert_eq!(w.screen().appearance_page().part(), Part::Eyes);
+    assert_eq!(w.h.ui.retail_state(trim), Some(ac_ui::states::HIGHLIGHT));
+
+    let gear = page.spin(Part::Skin).unwrap();
+    w.message(gear, ElementMessage::Clicked { x: 130, y: 10 });
+    let (_, shade) = page.grad_and_shade();
+    assert_eq!(
+        w.message(shade.unwrap(), ElementMessage::ScalarChanged(0.25)),
+        [CreationCommand::SetShade(ShadeSlot::Skin, 0.25)]
+    );
+    assert_eq!(w.screen().appearance_page().part(), Part::Skin);
+
+    // The gear colour moves up into the hidden nose's place (90 pixels
+    // from the top), and back down below the mouth (180 pixels) for a
+    // heritage with a nose and mouth.
+    let top = |w: &Wizard, e| w.h.ui.element(e).map(|e| (e.left, e.top));
+    let nose = page.spin(Part::Nose).unwrap();
+    assert_eq!(top(&w, gear), Some((0.0, 90.0)));
+    assert_eq!(top(&w, gear), top(&w, nose));
+    w.click(w.shell(chargen::TAB_IDS[0]));
+    let aluvian = w
+        .screen()
+        .heritage_page()
+        .buttons()
+        .iter()
+        .find(|b| b.2 == ALUVIAN)
+        .map(|b| b.0)
+        .unwrap();
+    w.click(aluvian);
+    w.click(w.shell(chargen::TAB_IDS[3]));
+    assert_eq!(top(&w, gear), Some((0.0, 180.0)));
 }
 
 #[test]

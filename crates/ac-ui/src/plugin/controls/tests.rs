@@ -13,7 +13,7 @@ use ac_plugin_ui::{
     UiOwner, UiValue,
 };
 
-use super::super::fold::{MarkupExpander, MarkupSplit};
+use super::super::fold::{ExpanderHeader, MarkupExpander, MarkupSplit};
 use super::super::{MarkupIcons, PluginTheme, build_panel_with_state};
 use super::*;
 use crate::event::MouseButton;
@@ -449,6 +449,251 @@ fn folding_an_expander_moves_what_is_below_it_up() {
     );
 }
 
+fn click_header(m: &mut Mounted, x: i32, node: usize) {
+    let y = top(m, node) as i32 + 6;
+    m.click(x, y);
+    m.tick(0.016);
+}
+
+fn height(m: &mut Mounted, node: usize) -> f32 {
+    let el = m.element(node);
+    m.host.root.element(el).unwrap().height
+}
+
+#[test]
+fn side_by_side_expanders_give_back_only_what_both_left_free() {
+    // What is below moves up by what the lowest thing above it gave up, not
+    // by each expander's height, in whatever order they fold and open.
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Tall"/>
+           <expander x="170" y="20" w="150" h="60" text="Short"/>
+           <group x="8" y="130" w="312" h="20"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 90.0, "the short one is still open");
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 2), 48.0, "both folded");
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 130.0, "the tall one is open again");
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 2), 130.0);
+
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 2), 130.0, "the tall one still reaches as far");
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 48.0);
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 2), 90.0);
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 130.0);
+}
+
+#[test]
+fn what_is_below_never_covers_a_folded_header() {
+    // A group lifted by the sum of the folds would sit over the headers,
+    // and the one it covered could not be clicked open again.
+    let mut m = Mounted::new(
+        r#"<expander x="12" y="100" w="120" h="90" text="One"/>
+           <expander x="140" y="100" w="110" h="60" text="Two" open="false"/>
+           <expander x="258" y="100" w="110" h="60" text="Three"/>
+           <group x="12" y="198" w="356" h="60"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    m.tick(0.016);
+    assert_eq!(height(&mut m, 1), 18.0);
+    assert_eq!(top(&mut m, 3), 198.0, "the first is taller than the fold");
+    click_header(&mut m, 40, 0);
+    click_header(&mut m, 280, 2);
+    assert_eq!(top(&mut m, 3), 126.0, "all folded: 8 below the headers");
+    click_header(&mut m, 160, 1);
+    assert_eq!(height(&mut m, 1), 60.0, "the header could still be clicked");
+    assert_eq!(top(&mut m, 3), 168.0);
+}
+
+#[test]
+fn each_column_follows_its_own_expander() {
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Left"/>
+           <expander x="170" y="20" w="150" h="100" text="Right"/>
+           <group x="8" y="130" w="150" h="20"/>
+           <group x="170" y="130" w="150" h="20"/>
+           <group x="8" y="160" w="312" h="20"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 48.0, "under the fold");
+    assert_eq!(top(&mut m, 3), 130.0, "the other column stays");
+    assert_eq!(top(&mut m, 4), 160.0, "held by the other column");
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 3), 48.0);
+    assert_eq!(top(&mut m, 4), 78.0, "keeps its gap to both columns");
+}
+
+#[test]
+fn stacked_expanders_add_up_in_any_order() {
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="10" w="150" h="100" text="Upper"/>
+           <expander x="8" y="120" w="150" h="60" text="Lower"/>
+           <group x="8" y="190" w="150" h="10"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 38.0);
+    assert_eq!(top(&mut m, 2), 108.0);
+    click_header(&mut m, 30, 1);
+    assert_eq!(top(&mut m, 2), 66.0);
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 120.0);
+    assert_eq!(top(&mut m, 2), 148.0);
+    click_header(&mut m, 30, 1);
+    assert_eq!(top(&mut m, 2), 190.0);
+}
+
+#[test]
+fn expanders_folded_from_the_start_are_placed_together() {
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Tall" open="false"/>
+           <expander x="170" y="20" w="150" h="60" text="Short" open="false"/>
+           <group x="8" y="130" w="312" h="20"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    m.tick(0.016);
+    assert_eq!(top(&mut m, 2), 48.0);
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 2), 90.0);
+}
+
+#[test]
+fn an_element_beside_an_expander_holds_up_what_is_below_both() {
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Fold"/>
+           <group x="170" y="30" w="100" h="60"/>
+           <group x="8" y="130" w="312" h="20"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 30.0, "beside the fold");
+    assert_eq!(top(&mut m, 2), 100.0, "keeps its gap below the group");
+}
+
+#[test]
+fn a_label_reaches_as_far_as_its_text() {
+    // A label with no width is as wide as its text (7 px a character with
+    // no font: 210 px here), so it spans both columns and stays under the
+    // one still open.
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Left"/>
+           <expander x="170" y="20" w="150" h="100" text="Right"/>
+           <label x="8" y="130" text="A caption across both columns"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 130.0, "the right column is still open");
+    click_header(&mut m, 190, 1);
+    assert_eq!(top(&mut m, 2), 48.0, "both folded");
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 130.0, "the left column is open again");
+}
+
+#[test]
+fn a_hidden_element_beside_an_expander_holds_up_nothing() {
+    // Hidden, it takes no room; shown again while the expander is folded,
+    // what is below it moves back down under it.
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Fold"/>
+           <group x="170" y="30" w="100" h="60" visible="{Shown}"/>
+           <group x="8" y="130" w="312" h="20"/>"#,
+        BindingSchema::new("B").with("Shown", K::Bool),
+        vec![("Shown", UiValue::Bool(false))],
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 48.0, "only the fold is above it");
+    m.set("Shown", UiValue::Bool(true));
+    m.tick(0.016);
+    assert_eq!(top(&mut m, 2), 100.0, "below the group again");
+    m.set("Shown", UiValue::Bool(false));
+    m.tick(0.016);
+    assert_eq!(top(&mut m, 2), 48.0);
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 2), 130.0);
+}
+
+#[test]
+fn a_stretched_sibling_grows_into_the_room_and_gives_it_back() {
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="20" w="150" h="100" text="Fold"/>
+           <group x="8" y="130" w="150" h="100" anchor="left,top,bottom"/>
+           <group x="8" y="240" w="150" h="20" anchor="left,bottom"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 48.0);
+    assert_eq!(height(&mut m, 1), 182.0);
+    assert_eq!(top(&mut m, 2), 240.0, "the stretched one's bottom stays");
+
+    let frame = m._frame;
+    m.host.root.element_mut(frame).unwrap().height = 350.0;
+    for node in [1, 2] {
+        let el = m.element(node);
+        m.host.root.apply_anchor(el, 400.0, 350.0);
+    }
+    assert_eq!(height(&mut m, 1), 232.0);
+    assert_eq!(top(&mut m, 2), 290.0);
+
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 130.0);
+    assert_eq!(height(&mut m, 1), 150.0);
+    assert_eq!(top(&mut m, 2), 290.0);
+}
+
+#[test]
+fn a_folded_stretched_expander_moved_from_above_opens_to_the_right_height() {
+    let mut m = Mounted::new(
+        r#"<expander x="8" y="10" w="150" h="50" text="Upper"/>
+           <expander x="8" y="70" w="150" h="100" text="Lower" anchor="left,top,bottom"/>"#,
+        BindingSchema::new("B"),
+        Vec::new(),
+    );
+    click_header(&mut m, 30, 1);
+    assert_eq!(height(&mut m, 1), 18.0);
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 38.0);
+    assert_eq!(height(&mut m, 1), 18.0);
+    click_header(&mut m, 30, 1);
+    assert_eq!(top(&mut m, 1), 38.0);
+    assert_eq!(height(&mut m, 1), 132.0, "its bottom stays where it was");
+    click_header(&mut m, 30, 0);
+    assert_eq!(top(&mut m, 1), 70.0);
+    assert_eq!(height(&mut m, 1), 100.0);
+}
+
+#[test]
+fn the_header_arrow_follows_a_click() {
+    let mut m = expander("");
+    let el = m.element(0);
+    let arrow = |m: &Mounted| {
+        let header = m.host.root.widget::<MarkupExpander>(el).unwrap().header;
+        let header = m.host.root.widget::<ExpanderHeader>(header).unwrap();
+        header.expanded
+    };
+    assert!(arrow(&m));
+    m.click(30, 66);
+    assert!(!arrow(&m), "folded by the click");
+    m.tick(0.016);
+    assert!(!arrow(&m));
+    m.click(30, 66);
+    assert!(arrow(&m), "opened by the click");
+}
+
 #[test]
 fn a_bound_expander_only_asks_and_follows_its_binding() {
     // MarkupExpanderTests: with expanded bound, a click only calls onchange
@@ -748,6 +993,38 @@ fn a_multi_select_list_reports_the_rows_a_click_picks() {
             action(panel, "SetRows", ActionValue::IntList(vec![2])),
         ]
     );
+}
+
+#[test]
+fn ctrl_or_the_command_key_adds_to_a_multi_select_list() {
+    // MarkupListMultiSelectTests with OpenAC's UiSelectModifiers: Add is
+    // Ctrl or Cmd (the Windows key elsewhere), for a click and for A.
+    for add in [Modifiers::CTRL, Modifiers::WIN] {
+        let mut m = Mounted::new(
+            r#"<list x="0" y="0" w="300" h="108" selectmode="multi" selected="{Selection}" onchange="{SetRows}">
+             <column type="text" width="120" items="{Names}"/><column type="text" items="{Dists}"/></list>"#,
+            list_schema(),
+            list_values(),
+        );
+        let panel = m.panel;
+        m.click(30, 5);
+        m.set("Selection", UiValue::IntList(vec![0]));
+        m.host.set_modifiers(add);
+        m.click(30, 18 * 2 + 5);
+        // A click does not take keyboard focus.
+        let list = m.element(0);
+        m.host.root.set_keyboard_focus(Some(list));
+        m.host.key_down(Key::A, add);
+        assert_eq!(
+            m.take(),
+            [
+                action(panel, "SetRows", ActionValue::IntList(vec![0])),
+                action(panel, "SetRows", ActionValue::IntList(vec![0, 2])),
+                action(panel, "SetRows", ActionValue::IntList(vec![0, 1, 2, 3])),
+            ],
+            "{add:?}"
+        );
+    }
 }
 
 #[test]

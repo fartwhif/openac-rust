@@ -32,9 +32,9 @@ use ac_dat::objects::{
 };
 use ac_runtime::world::ObjectView;
 use ac_vfx::{
-    ActivationInfo, EXTENDED_RANGE_MULTIPLIER, EffectEvent, EffectOwnerQueries, EffectPoseSource,
-    EntityEffectProfile, LiveRootState, NetworkEffectDescription, ParticleGfxCache, ParticleSystem,
-    VfxDats, VfxEvent, VfxWorld,
+    ActivationInfo, EffectEvent, EffectOwnerQueries, EffectPoseSource, EntityEffectProfile,
+    LiveRootState, NetworkEffectDescription, ParticleGfxCache, ParticleSystem, VfxDats, VfxEvent,
+    VfxWorld,
 };
 use glam::{Mat4, Quat, Vec3};
 
@@ -184,6 +184,9 @@ pub struct EffectsFrame<'a> {
     pub camera: Vec3,
     /// Setups.
     pub source: &'a dyn AnimationSource,
+    /// The particle range setting: how many times its authored degrade
+    /// distance an emitter is drawn out to.
+    pub particle_range: f32,
 }
 
 impl std::fmt::Debug for EffectsFrame<'_> {
@@ -568,7 +571,7 @@ impl WindowEffects {
         );
         if let Err(error) = self
             .vfx
-            .tick(&self.facts, dt, self.clock, EXTENDED_RANGE_MULTIPLIER)
+            .tick(&self.facts, dt, self.clock, input.particle_range)
         {
             self.print(&error.to_string());
         }

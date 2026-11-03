@@ -20,8 +20,7 @@ use ac_runtime::inventory::{
     HousePurchaseCommand, HousePurchaseTab, HousePurchaseView, ItemCommand,
 };
 use ac_runtime::session::SessionCommand;
-use ac_ui::ElementId;
-use ac_ui::event::{DragPayload, ItemDragPayload, ItemDragSource, kind};
+use ac_ui::event::{DragAcceptance, DragPayload, ItemDragPayload, ItemDragSource, kind};
 use ac_ui::host::UiHost;
 use ac_ui::import::ImportedLayout;
 use ac_ui::panels::PanelOutput;
@@ -30,6 +29,7 @@ use ac_ui::panels::house_purchase::{
 };
 use ac_ui::panels::items::ItemsView;
 use ac_ui::widgets::{ItemList, ItemSlot};
+use ac_ui::{ElementId, MouseButton, UiOutput};
 use common::items::*;
 use common::panels::*;
 use common::*;
@@ -454,6 +454,66 @@ fn dragging_off_and_a_right_click_unstage() {
     w.host.pump();
     let lifted = format!("{:?}", sessions(&panel_outputs(&mut w.host)));
     assert!(lifted.contains(&format!("{unstage:?}")), "{lifted}");
+}
+
+/// A staged payment let go over the world says it came from the house
+/// purchase window, so the world only unstages it and never drops it on
+/// the ground (the same bug as issue #44's vendor sell list).
+#[test]
+fn a_staged_item_dragged_out_over_the_world_comes_from_the_house_window() {
+    let mut w = window();
+    w.update(&staged(view(1, profile(PLAYER, "Me", 1)), RENT, 10));
+    w.click(hp::MAINTENANCE_TAB_ID);
+    let cell = w.cell(hp::MAINTENANCE_ITEMS_LIST_ID, 0);
+    assert_eq!(
+        w.host.root.widget::<ItemSlot>(cell).unwrap().source_kind,
+        ItemDragSource::Vendor
+    );
+    let (x, y) = w.host.root.screen_position(cell);
+    let e = w.host.root.element(cell).unwrap();
+    let (x, y) = ((x + e.width / 2.0) as i32, (y + e.height / 2.0) as i32);
+    w.host.take_outputs();
+    w.host.mouse_move(x, y);
+    w.host.mouse_down(MouseButton::Left, x, y, 0);
+    w.host.mouse_move(x + 200, y + 300);
+    w.host.mouse_up(MouseButton::Left, x + 200, y + 300, 0);
+    let released: Vec<ItemDragSource> = w
+        .host
+        .take_outputs()
+        .into_iter()
+        .filter_map(|o| match o {
+            UiOutput::DragReleasedOutsideUi { payload, .. } => {
+                payload.get::<ItemDragPayload>().map(|p| p.source_kind)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(released, [ItemDragSource::Vendor]);
+}
+
+/// A drag out of the house window is refused by the window itself: let
+/// go over a row again, it stages nothing.
+#[test]
+fn a_staged_item_dropped_back_on_the_row_stages_nothing() {
+    let mut w = window();
+    w.update(&staged(view(1, profile(PLAYER, "Me", 1)), RENT, 10));
+    let lifted = ItemDragPayload::new(ITEM, ItemDragSource::Vendor, 0);
+    let cell = w.cell(hp::MAINTENANCE_ITEMS_LIST_ID, 0);
+    w.host.root.fire_event(
+        kind::DRAG_ENTER,
+        cell,
+        Some(DragPayload::new(lifted.clone())),
+    );
+    w.host.pump();
+    assert_eq!(
+        w.host
+            .root
+            .widget::<ItemSlot>(cell)
+            .unwrap()
+            .drag_acceptance(),
+        DragAcceptance::Reject
+    );
+    assert!(w.drop_on(hp::MAINTENANCE_ITEMS_LIST_ID, lifted).is_empty());
 }
 
 // HousePurchaseUiControllerTests.CloseButton_ClosesAndHides

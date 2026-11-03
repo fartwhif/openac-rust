@@ -280,6 +280,16 @@ pub enum ItemCommand {
     AddShortcut(ShortcutEntry),
     /// Take the shortcut in this slot off the toolbar.
     RemoveShortcut(i32),
+    /// A loose item (on the ground or in an outside container) dropped on a
+    /// toolbar slot: it is picked up into the preferred pack, as the use key
+    /// picks it up, and once that request has gone out it gets the shortcut
+    /// in `slot`.
+    PickUpToShortcut {
+        /// The item.
+        item: ObjectRef,
+        /// The toolbar slot.
+        slot: i32,
+    },
     /// The next object clicked is used (the toolbar's use button with
     /// nothing selected).
     EnterUseMode,
@@ -649,6 +659,9 @@ pub struct Inventory {
     salvage_marked: std::collections::BTreeSet<u32>,
     /// Game boards used, oldest first, whose games the session begins.
     begun_games: Vec<u32>,
+    /// The stacks merges were just sent into, oldest first, which the
+    /// session selects.
+    merged_into: Vec<u32>,
     notices: Vec<Notice>,
     events: Vec<InventoryEvent>,
     /// `OPENAC_PROBE_EXTERNAL_CONTAINER=1`: the viewed container's probe
@@ -1112,6 +1125,15 @@ impl Inventory {
     /// it (the chess owner's join) on every host.
     pub fn take_begun_games(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.begun_games)
+    }
+
+    /// Take the stacks merges were sent into, oldest first. Each merge, by
+    /// any caller (a pickup that joins a carried stack, a drag, a plugin),
+    /// selects the stack it joins, so the selection shows that stack and
+    /// its count as it grows rather than the stack poured away; the
+    /// session selects them on every host.
+    pub fn take_merged_into(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.merged_into)
     }
 
     fn interface(&mut self, text: impl Into<String>) {
@@ -1621,6 +1643,7 @@ impl Inventory {
         self.mode = InteractionMode::None;
         self.shortcuts.clear();
         self.item_mana.clear();
+        self.merged_into.clear();
     }
 }
 

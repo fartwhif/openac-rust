@@ -485,6 +485,13 @@ pub trait Widget: AsAny + fmt::Debug {
         false
     }
 
+    /// The element stays hovered while the pointer rests on it, past the
+    /// time a tooltip shows (it draws its own label, which is not a timed
+    /// tooltip).
+    fn hover_outlasts_tooltip(&self) -> bool {
+        false
+    }
+
     /// The element can start a drag.
     fn is_drag_source(&self, element: &Element) -> bool {
         element
@@ -568,6 +575,13 @@ pub trait Widget: AsAny + fmt::Debug {
 
     /// For a resize grip: the window edges it drags.
     fn resize_grip_edges(&self) -> Option<ResizeEdges> {
+        None
+    }
+
+    /// For an element that changes its window's size itself: the edges whose
+    /// resize cursor shows over it and while it holds the pointer. The window
+    /// is left alone: a press on it does not start a resize.
+    fn resize_cursor_edges(&self) -> Option<ResizeEdges> {
         None
     }
 

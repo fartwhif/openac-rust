@@ -21,12 +21,13 @@ use std::thread::{self, JoinHandle};
 use ac_audio::ambient::AmbientRegion;
 use ac_core::lighting::LightInfoSource;
 use ac_core::sky::LoadedSkyDesc;
-use ac_dat::objects::{Palette, Region};
+use ac_dat::objects::Region;
 use ac_dat::texture::DecodedTexture;
 use ac_physics::PhysicsEngine;
 use glam::Vec3;
 
-use crate::appearance::{AppearanceKey, PaletteSpec};
+use crate::appearance::AppearanceKey;
+use crate::appearance_residency::{SentLooks, SurfaceVariantKey};
 use crate::assets::{
     self, GfxObjData, LandblockData, NearData, REGION_ID, SurfaceData, TerrainAtlasData,
 };
@@ -63,14 +64,23 @@ pub enum LoadRequest {
     EffectSurface(u32),
     /// The camera's collision around a landblock (it and its neighbours).
     CameraCollision(LandblockCoord),
+    /// The world's texture detail changed: the terrain atlas and every world
+    /// surface already sent come again at the new detail (the sky's and the
+    /// particles' keep their full detail), and everything sent from now on
+    /// is made at it.
+    TextureDetail(WorldTextureDetail),
     /// The window released these: send them again when next needed.
     Forget {
         /// Model ids.
         models: Vec<u32>,
         /// GfxObj ids.
         gfx_objs: Vec<u32>,
-        /// Surface ids.
+        /// Surface ids and recoloured surface handles.
         surfaces: Vec<u32>,
+        /// Appearances.
+        appearances: Vec<AppearanceKey>,
+        /// Variant ids.
+        variants: Vec<u32>,
     },
 }
 
@@ -370,28 +380,18 @@ struct Worker<'a> {
     gfx_objs: HashSet<u32>,
     /// Each GfxObj's box, model-local.
     gfx_bounds: HashMap<u32, (Vec3, Vec3)>,
-    surfaces: HashSet<u32>,
-    appearances: HashSet<AppearanceKey>,
-    /// Modified palettes built so far (`None`: the swap cannot be built).
-    palettes: HashMap<PaletteSpec, Option<Arc<Palette>>>,
-    /// Substituted surfaces: (surface, texture, palette) to handle.
-    surface_variants: HashMap<(u32, Option<u32>, Option<PaletteSpec>), u32>,
-    next_surface_handle: u32,
-    /// Part surface maps to variant ids.
-    variants: HashMap<Vec<(u32, u32)>, u32>,
-    /// The world's texture detail (fixed for the window's life).
+    surfaces: SentSurfaces,
+    /// Appearances, their variants and recoloured surfaces sent.
+    looks: SentLooks,
+    /// The world's texture detail.
     detail: WorldTextureDetail,
     /// Block-compressed textures may stay compressed (the GPU samples them).
     block_compression: bool,
-    /// World surfaces the helpers prepared ahead.
+    /// World surfaces the helpers prepared ahead (at the detail they hold).
     prepared: Arc<PreparedSurfaces>,
     /// The sky's models, whose textures keep their full detail.
     full_detail_models: HashSet<u32>,
 }
-
-/// Handles of substituted surfaces start here, above every surface id
-/// (`0x08xxxxxx`), so a handle never names a stored surface.
-const FIRST_SURFACE_HANDLE: u32 = 0x1000_0000;
 
 /// Work the loader queues between requests.
 /// One landblock job.
@@ -514,7 +514,6 @@ enum Built {
 /// What a landblock job and a model warm-up read.
 struct BuildContext {
     content: Arc<Content>,
-    detail: WorldTextureDetail,
     block_compression: bool,
     prepared: Arc<PreparedSurfaces>,
     region: Arc<Region>,
@@ -608,36 +607,89 @@ impl BuildContext {
         if self.prepared.contains(id) {
             return;
         }
-        let data = surface_for_world(
-            &self.content,
-            id,
-            &self.detail,
-            self.block_compression,
-            false,
-        );
-        self.prepared.put(id, data);
+        let detail = self.prepared.detail();
+        let data = surface_for_world(&self.content, id, &detail, self.block_compression, false);
+        self.prepared.put(id, detail, data);
     }
 }
 
 /// World surfaces the helpers prepared ahead, waiting for the loader thread
 /// (which takes each one out). Bounded: the oldest beyond
 /// [`PREPARED_AHEAD`] are dropped, and the loader prepares those itself.
-#[derive(Default)]
+/// It holds the world's texture detail too: a surface prepared at a detail
+/// that has since changed is never taken.
 struct PreparedSurfaces {
     waiting: std::sync::Mutex<PreparedQueue>,
 }
 
-/// The prepared surfaces and the order they arrived in.
-#[derive(Default)]
+/// The prepared surfaces, the order they arrived in and the detail they
+/// are made at.
 struct PreparedQueue {
+    detail: WorldTextureDetail,
     by_id: HashMap<u32, SurfaceData>,
     order: VecDeque<u32>,
+}
+
+/// The world surfaces sent to the window (and not forgotten since), and
+/// which of them went at full detail (a sky or particle model's, which
+/// keeps that size whoever else uses it).
+#[derive(Debug, Default)]
+struct SentSurfaces {
+    sent: HashSet<u32>,
+    full: HashSet<u32>,
+}
+
+impl SentSurfaces {
+    /// Note `id` as sent (`full`: at full detail); false when it was
+    /// already.
+    fn insert(&mut self, id: u32, full: bool) -> bool {
+        if !self.sent.insert(id) {
+            return false;
+        }
+        if full {
+            self.full.insert(id);
+        }
+        true
+    }
+
+    fn remove(&mut self, id: u32) {
+        self.sent.remove(&id);
+        self.full.remove(&id);
+    }
+
+    /// Whether `id` was sent at the world's texture detail.
+    fn at_world_detail(&self, id: u32) -> bool {
+        self.sent.contains(&id) && !self.full.contains(&id)
+    }
+
+    /// The surfaces a texture-detail change sends again, in id order: every
+    /// one sent at the world's detail.
+    fn to_resize(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = self
+            .sent
+            .iter()
+            .copied()
+            .filter(|id| !self.full.contains(id))
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
 }
 
 /// World surfaces kept prepared ahead at most.
 const PREPARED_AHEAD: usize = 128;
 
 impl PreparedSurfaces {
+    fn new(detail: WorldTextureDetail) -> Self {
+        Self {
+            waiting: std::sync::Mutex::new(PreparedQueue {
+                detail,
+                by_id: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, PreparedQueue> {
         // Inserts and removals only; a panic never leaves it half-updated.
         self.waiting
@@ -645,12 +697,33 @@ impl PreparedSurfaces {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The detail surfaces are prepared at now.
+    fn detail(&self) -> WorldTextureDetail {
+        self.lock().detail
+    }
+
+    /// Prepare at `detail` from now on: what was prepared at another is
+    /// dropped.
+    fn set_detail(&self, detail: WorldTextureDetail) {
+        let mut queue = self.lock();
+        if queue.detail != detail {
+            queue.detail = detail;
+            queue.by_id.clear();
+            queue.order.clear();
+        }
+    }
+
     fn contains(&self, id: u32) -> bool {
         self.lock().by_id.contains_key(&id)
     }
 
-    fn put(&self, id: u32, data: SurfaceData) {
+    /// Keep `data`, made at `detail`, for the loader; made at a detail no
+    /// longer in use, it is dropped.
+    fn put(&self, id: u32, detail: WorldTextureDetail, data: SurfaceData) {
         let mut queue = self.lock();
+        if queue.detail != detail {
+            return;
+        }
         if queue.by_id.insert(id, data).is_none() {
             queue.order.push_back(id);
         }
@@ -835,6 +908,12 @@ enum Work {
     GfxObj(u32, bool),
     /// A surface; true: at full texture detail.
     Surface(u32, bool),
+    /// A world surface sent before the texture detail changed: again, at
+    /// the new detail.
+    Resize(u32),
+    /// A substituted surface (its key and handle) sent before the texture
+    /// detail changed: again, at the new detail.
+    ResizeVariant(SurfaceVariantKey, u32),
 }
 
 impl Worker<'_> {
@@ -897,9 +976,13 @@ impl Worker<'_> {
     }
 
     fn ensure_surface(&mut self, id: u32, full: bool) -> bool {
-        if !self.surfaces.insert(id) {
+        if !self.surfaces.insert(id, full) {
             return true;
         }
+        self.send_surface(id, full)
+    }
+
+    fn send_surface(&self, id: u32, full: bool) -> bool {
         // A world surface a helper prepared ahead is taken as it is; the
         // same function makes it here otherwise, so the bytes match.
         let data = match (!full).then(|| self.prepared.take(id)).flatten() {
@@ -915,6 +998,56 @@ impl Worker<'_> {
         self.send(Loaded::Surface(Box::new(data)))
     }
 
+    /// The texture detail changed: from now on everything is made at
+    /// `detail`, and the work that sends again, at it, every world surface
+    /// and substituted surface sent so far.
+    fn change_detail(&mut self, detail: WorldTextureDetail) -> Vec<Work> {
+        self.detail = detail;
+        self.prepared.set_detail(detail);
+        let variants = self.looks.surface_variants();
+        self.surfaces
+            .to_resize()
+            .into_iter()
+            .map(Work::Resize)
+            .chain(
+                variants
+                    .into_iter()
+                    .map(|(key, handle)| Work::ResizeVariant(key, handle)),
+            )
+            .collect()
+    }
+
+    /// Send world surface `id` again at the current detail, unless the
+    /// window released it since (or it went at full detail).
+    fn resize_surface(&self, id: u32) -> bool {
+        if !self.surfaces.at_world_detail(id) {
+            return true;
+        }
+        self.send_surface(id, false)
+    }
+
+    /// Make the substituted surface `key` under `handle` at the current
+    /// detail.
+    fn variant_surface(&self, key: &SurfaceVariantKey, handle: u32) -> SurfaceData {
+        let (surface_id, texture, spec) = key;
+        // A palette that cannot be built repaints nothing.
+        let repaint = spec
+            .as_ref()
+            .and_then(|spec| self.looks.built_palette(spec));
+        sized(
+            assets::build_surface_with(
+                &self.content,
+                handle,
+                *surface_id,
+                *texture,
+                repaint.as_deref(),
+                self.block_compression,
+            ),
+            &self.detail,
+            false,
+        )
+    }
+
     /// Send a landblock's near-tier content, preceded by the surfaces its
     /// cell meshes use. False once the window is gone.
     fn send_near(&mut self, coord: LandblockCoord, data: NearData) -> bool {
@@ -928,35 +1061,49 @@ impl Worker<'_> {
         self.send(Loaded::Near(coord, Box::new(data)))
     }
 
-    fn forget(&mut self, models: &[u32], gfx_objs: &[u32], surfaces: &[u32]) {
+    /// The window released these: they are sent again when next wanted.
+    /// Recoloured surfaces (handles) are forgotten with the variants that
+    /// name them.
+    fn forget(
+        &mut self,
+        models: &[u32],
+        gfx_objs: &[u32],
+        surfaces: &[u32],
+        appearances: &[AppearanceKey],
+        variants: &[u32],
+    ) {
         for id in models {
             self.models.remove(id);
         }
         for id in gfx_objs {
             self.gfx_objs.remove(id);
         }
-        for id in surfaces {
-            self.surfaces.remove(id);
+        for &id in surfaces {
+            if id < crate::appearance_residency::FIRST_SURFACE_HANDLE {
+                self.surfaces.remove(id);
+            }
         }
+        self.looks.forget(appearances, variants, surfaces);
     }
 
     /// Send a model drawn with an appearance, preceded by its GfxObjs, the
     /// substituted surfaces and the variants that are new. False once the
     /// window is gone.
     fn ensure_appearance(&mut self, key: AppearanceKey) -> bool {
-        if self.appearances.contains(&key) {
+        if self.looks.was_sent(&key) {
             return true;
         }
         let palette = match &key.palette {
-            Some(spec) => self
-                .palettes
-                .entry(spec.clone())
-                .or_insert_with(|| assets::modified_palette(&self.content, spec).map(Arc::new))
-                .clone(),
+            Some(spec) => {
+                let content = &self.content;
+                self.looks.palette(spec, || {
+                    assets::modified_palette(content, spec).map(Arc::new)
+                })
+            }
             None => None,
         };
         let Some(parts) = assets::appearance_parts(&self.content, &key) else {
-            self.appearances.insert(key.clone());
+            self.looks.sent(key.clone());
             return self.send(Loaded::Appearance {
                 key: Box::new(key),
                 parts: None,
@@ -968,63 +1115,36 @@ impl Worker<'_> {
             if !self.ensure_gfx_obj(part.part.gfx_obj_id, false) {
                 return false;
             }
-            let mut surfaces = Vec::new();
-            for change in &part.changes {
+            let changes = part.changes.iter().filter_map(|change| {
                 // A palette that cannot be built repaints nothing.
                 let repaint = change.repaint.then_some(()).and(palette.as_ref());
                 if change.texture.is_none() && repaint.is_none() {
-                    continue;
+                    return None;
                 }
                 let spec = repaint.and(key.palette.clone());
-                let variant_key = (change.surface_id, change.texture, spec);
-                let handle = match self.surface_variants.get(&variant_key) {
-                    Some(&handle) => handle,
-                    None => {
-                        let handle = self.next_surface_handle;
-                        self.next_surface_handle += 1;
-                        self.surface_variants.insert(variant_key, handle);
-                        let data = sized(
-                            assets::build_surface_with(
-                                &self.content,
-                                handle,
-                                change.surface_id,
-                                change.texture,
-                                repaint.map(|p| &**p),
-                                self.block_compression,
-                            ),
-                            &self.detail,
-                            false,
-                        );
-                        if !self.send(Loaded::Surface(Box::new(data))) {
-                            return false;
-                        }
-                        handle
-                    }
-                };
-                surfaces.push((change.surface_id, handle));
-            }
-            let variant = if surfaces.is_empty() {
-                0
-            } else {
-                surfaces.sort_unstable();
-                match self.variants.get(&surfaces) {
-                    Some(&id) => id,
-                    None => {
-                        let id = self.variants.len() as u32 + 1;
-                        self.variants.insert(surfaces.clone(), id);
-                        if !self.send(Loaded::Variant { id, surfaces }) {
-                            return false;
-                        }
-                        id
-                    }
+                Some((change.surface_id, change.texture, spec))
+            });
+            let variant = self.looks.part_variant(changes);
+            for (variant_key, handle) in &variant.new_surfaces {
+                let data = self.variant_surface(variant_key, *handle);
+                if !self.send(Loaded::Surface(Box::new(data))) {
+                    return false;
                 }
-            };
+            }
+            if let Some(surfaces) = variant.new_variant
+                && !self.send(Loaded::Variant {
+                    id: variant.id,
+                    surfaces,
+                })
+            {
+                return false;
+            }
             meshes.push(MeshRef {
-                variant,
+                variant: variant.id,
                 ..part.part
             });
         }
-        self.appearances.insert(key.clone());
+        self.looks.sent(key.clone());
         let bounds = assets::parts_bounds(&meshes, |g| self.gfx_bounds.get(&g).copied());
         self.send(Loaded::Appearance {
             key: Box::new(key),
@@ -1105,20 +1225,15 @@ fn run(
         models: HashSet::new(),
         gfx_objs: HashSet::new(),
         gfx_bounds: HashMap::new(),
-        surfaces: HashSet::new(),
-        appearances: HashSet::new(),
-        palettes: HashMap::new(),
-        surface_variants: HashMap::new(),
-        next_surface_handle: FIRST_SURFACE_HANDLE,
-        variants: HashMap::new(),
+        surfaces: SentSurfaces::default(),
+        looks: SentLooks::default(),
         detail,
         block_compression,
-        prepared: Arc::new(PreparedSurfaces::default()),
+        prepared: Arc::new(PreparedSurfaces::new(detail)),
         full_detail_models: sky_models.iter().copied().collect(),
     };
     let context = Arc::new(BuildContext {
         content: Arc::clone(&worker.content),
-        detail,
         block_compression,
         prepared: Arc::clone(&worker.prepared),
         region,
@@ -1160,7 +1275,26 @@ fn run(
                     models: m,
                     gfx_objs,
                     surfaces,
-                } => worker.forget(&m, &gfx_objs, &surfaces),
+                    appearances,
+                    variants,
+                } => worker.forget(&m, &gfx_objs, &surfaces, &appearances, &variants),
+                LoadRequest::TextureDetail(detail) => {
+                    let old = worker.detail;
+                    // The terrain goes first: the window writes the new
+                    // atlas over a few frames and swaps it in whole.
+                    if detail.landscape != old.landscape {
+                        let atlas =
+                            assets::build_terrain_atlas(&worker.content, &context.region, detail);
+                        if !worker.send(Loaded::Atlas(Box::new(atlas))) {
+                            return;
+                        }
+                    }
+                    let resize = worker.change_detail(detail);
+                    if detail.environment != old.environment {
+                        models.retain(|w| !matches!(w, Work::Resize(_) | Work::ResizeVariant(..)));
+                        models.extend(resize);
+                    }
+                }
                 LoadRequest::Landblock { coord, near } => {
                     blocks.push(BlockWork::Terrain(coord), near);
                 }
@@ -1230,7 +1364,13 @@ fn run(
             Some(Work::Appearance(key)) => worker.ensure_appearance(*key),
             Some(Work::GfxObj(id, full)) => worker.ensure_gfx_obj(id, full),
             Some(Work::Surface(id, full)) => worker.ensure_surface(id, full),
-            None => true,
+            Some(Work::Resize(id)) => worker.resize_surface(id),
+            // Unless the window released it since.
+            Some(Work::ResizeVariant(key, handle)) if worker.looks.holds_handle(&key, handle) => {
+                let data = worker.variant_surface(&key, handle);
+                worker.send(Loaded::Surface(Box::new(data)))
+            }
+            Some(Work::ResizeVariant(..)) | None => true,
         };
         if !done {
             return;
@@ -1482,5 +1622,162 @@ mod retail_tests {
             first.map(|i| &helped[i.saturating_sub(2)..(i + 3).min(helped.len())]),
             first.map(|i| &alone[i.saturating_sub(2)..(i + 3).min(alone.len())]),
         );
+    }
+}
+
+#[cfg(test)]
+mod texture_detail_tests {
+    use super::*;
+    use crate::texture_detail::ImageScale;
+
+    const EIGHTH: WorldTextureDetail = WorldTextureDetail {
+        landscape: ImageScale::Eighth,
+        environment: ImageScale::Eighth,
+    };
+
+    fn solid(id: u32) -> SurfaceData {
+        SurfaceData {
+            id,
+            texture: crate::surface_image::SurfaceImage::rgba(Arc::new(DecodedTexture {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 0, 0, 0xFF],
+            })),
+            translucency: crate::meshing::Translucency::Opaque,
+            opacity: 1.0,
+            alpha_cutoff: 0.05,
+            untextured: true,
+            luminosity: 0.0,
+            diffuse: 1.0,
+            disable_fog: false,
+        }
+    }
+
+    /// A detail change sends again every world surface still sent, in id
+    /// order, but not one that went at full detail (a sky or particle
+    /// model's) nor one the window released.
+    #[test]
+    fn a_detail_change_resizes_the_world_surfaces_still_sent() {
+        let mut sent = SentSurfaces::default();
+        assert!(sent.insert(0x0800_0003, false));
+        assert!(sent.insert(0x0800_0001, false));
+        assert!(sent.insert(0x0800_0002, true));
+        assert!(sent.insert(0x0800_0004, false));
+        assert!(!sent.insert(0x0800_0004, true), "already sent");
+        sent.remove(0x0800_0003);
+        assert_eq!(sent.to_resize(), [0x0800_0001, 0x0800_0004]);
+        assert!(sent.at_world_detail(0x0800_0001));
+        assert!(!sent.at_world_detail(0x0800_0002), "full detail");
+        assert!(!sent.at_world_detail(0x0800_0003), "released");
+    }
+
+    /// A surface a helper made at the old detail is never taken after the
+    /// change, even when it finishes after it.
+    #[test]
+    fn a_surface_prepared_at_the_old_detail_is_never_taken() {
+        let prepared = PreparedSurfaces::new(WorldTextureDetail::FULL);
+        prepared.put(1, WorldTextureDetail::FULL, solid(1));
+        prepared.set_detail(EIGHTH);
+        assert!(prepared.take(1).is_none(), "dropped by the change");
+        // A helper that read the old detail before the change finishes now.
+        prepared.put(2, WorldTextureDetail::FULL, solid(2));
+        assert!(prepared.take(2).is_none(), "made at the old detail");
+        prepared.put(3, EIGHTH, solid(3));
+        assert_eq!(prepared.take(3).map(|s| s.id), Some(3));
+        assert_eq!(prepared.detail(), EIGHTH);
+    }
+
+    /// Against the retail dats: after a detail change the loader sends the
+    /// terrain atlas again at the new landscape detail and every world
+    /// surface it sent before (those with a mip chain; the sky's keep their
+    /// one full level) again at the new environment detail, while the
+    /// window keeps running.
+    #[test]
+    #[ignore = "needs the retail dat files"]
+    fn a_detail_change_sends_the_atlas_and_the_world_surfaces_again() {
+        let dir = std::env::var_os("OPENAC_DAT_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(ac_dat::default_dat_dir)
+            .expect("no dat directory: set OPENAC_DAT_DIR");
+        let (requests, request_rx) = mpsc::channel();
+        let center = LandblockCoord { x: 0xA9, y: 0xB4 };
+        requests
+            .send(LoadRequest::Landblock {
+                coord: center,
+                near: true,
+            })
+            .expect("queued");
+        requests.send(LoadRequest::Near(center)).expect("queued");
+        let (out, results) = mpsc::channel();
+        let loader = thread::spawn(move || {
+            run(
+                &ContentSlot::new(dir),
+                WorldTextureDetail::FULL,
+                true,
+                2,
+                &request_rx,
+                &out,
+                &AtomicBool::new(false),
+            );
+        });
+        let size = |s: &SurfaceData| (s.texture.width(), s.texture.height());
+        let mut atlases = Vec::new();
+        let mut before: HashMap<u32, ((u32, u32), u32)> = HashMap::new();
+        // Up to the landblock's content: its cell surfaces were sent ahead
+        // of it, its models are still to come.
+        for item in results.iter() {
+            match item {
+                Loaded::Failed(reason) => panic!("{reason}"),
+                Loaded::Atlas(atlas) => atlas_sizes(&mut atlases, &atlas),
+                Loaded::Surface(s) => {
+                    before.insert(s.id, (size(&s), s.texture.level_count()));
+                }
+                Loaded::Near(..) => break,
+                _ => {}
+            }
+        }
+        requests
+            .send(LoadRequest::TextureDetail(EIGHTH))
+            .expect("queued");
+        drop(requests);
+        let mut after: HashMap<u32, (u32, u32)> = HashMap::new();
+        for item in results.iter() {
+            match item {
+                Loaded::Failed(reason) => panic!("{reason}"),
+                Loaded::Atlas(atlas) => atlas_sizes(&mut atlases, &atlas),
+                Loaded::Surface(s) if atlases.len() == 2 => {
+                    after.insert(s.id, size(&s));
+                }
+                _ => {}
+            }
+        }
+        loader.join().expect("the loader ends");
+        assert_eq!(atlases.len(), 2, "the atlas again after the change");
+        assert_eq!(
+            atlases[1],
+            (
+                EIGHTH.landscape_size(atlases[0].0),
+                EIGHTH.landscape_size(atlases[0].1)
+            )
+        );
+        let world: Vec<u32> = before
+            .iter()
+            .filter(|(_, (_, levels))| *levels > 1)
+            .map(|(id, _)| *id)
+            .collect();
+        assert!(!world.is_empty(), "the landblock's cells have textures");
+        for id in world {
+            let ((w, h), _) = before[&id];
+            assert_eq!(
+                after.get(&id).copied(),
+                Some((EIGHTH.environment_size(w), EIGHTH.environment_size(h))),
+                "surface {id:08X} ({w} x {h}) again at an eighth"
+            );
+        }
+    }
+
+    fn atlas_sizes(sizes: &mut Vec<(u32, u32)>, atlas: &crate::assets::TerrainAtlasData) {
+        let first = atlas.layers.first().expect("terrain layers");
+        sizes.push((first.width, first.height));
     }
 }

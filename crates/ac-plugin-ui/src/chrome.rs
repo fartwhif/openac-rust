@@ -38,8 +38,8 @@ pub const MINIMUM_BAR_FRAME_WIDTH: f32 = 96.0;
 /// The close button's tooltip.
 pub const CLOSE_TOOLTIP: &str = "Close";
 
-/// The close button's tooltip on a window on the plugin shelf.
-pub const DOCKED_CLOSE_TOOLTIP: &str = "Close (reopen from the plugin sidepanel)";
+/// The close button's tooltip on a window on the plugin dock.
+pub const DOCKED_CLOSE_TOOLTIP: &str = "Close (reopen from the plugin dock)";
 
 /// The geometry attributes whose raw values make a window's revision.
 pub const GEOMETRY_ATTRIBUTES: [&str; 8] = [

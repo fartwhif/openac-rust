@@ -93,7 +93,9 @@ pub struct Text {
     pub honor_vertical_justification: bool,
     /// The scroll model (also read by a linked scrollbar).
     pub scroll: Scrollable,
-    /// Keep the view at the end as lines arrive.
+    /// Keep the view at the end as lines arrive (lines set by code, such as
+    /// a log; the element's own authored string always starts at its first
+    /// line).
     pub preserve_end_on_layout: bool,
     /// The wheel scrolls even when not selectable.
     pub wheel_scroll_enabled: bool,
@@ -202,6 +204,20 @@ impl Text {
         self.wrapped_cache = None;
     }
 
+    /// Show an authored string (the element's own text property) as the
+    /// element lays it out: word-wrapped to its width between the margins
+    /// unless the element is one line. An authored line break always
+    /// starts a new line.
+    pub fn set_authored(&mut self, text: String) {
+        if !self.one_line || text.contains('\n') {
+            self.set_content(TextContent::Wrapped(text));
+        } else {
+            // In the default colour as it is when drawn, so a state's font
+            // colour reaches the authored line.
+            self.set_content(TextContent::Single(text));
+        }
+    }
+
     /// Show these lines.
     pub fn set_lines(&mut self, lines: Vec<Line>) {
         self.set_content(TextContent::Lines(lines));
@@ -303,7 +319,7 @@ impl Text {
             .find(|(k, _)| *k == state_id)
             .map(|(_, t)| (t.clone(), ()))
         {
-            self.set_content(TextContent::Single(text));
+            self.set_authored(text);
         }
         if let Some((ui, me)) = ui {
             if let Some(s) = state
@@ -533,10 +549,17 @@ impl Text {
         let bottom = height - self.padding - self.margin_bottom;
         let content_h = lines.len() as f32 * lh;
         self.scroll.line_height = lh.round_ties_even() as i32;
+        // A text element keeps its scroll offset (zero at first) as its text
+        // is laid out, so an authored string too tall for its box shows its
+        // start; only a panel streaming lines in follows the end.
+        let authored = matches!(
+            self.content,
+            TextContent::Single(_) | TextContent::Wrapped(_)
+        );
         self.scroll.set_extents(
             content_h.ceil() as i32,
             (bottom - top).floor() as i32,
-            self.preserve_end_on_layout,
+            self.preserve_end_on_layout && !authored,
         );
         let base_y = content_base_y(
             top,

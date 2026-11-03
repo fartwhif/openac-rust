@@ -20,8 +20,10 @@ pub use components::{
     school_infusion_property,
 };
 pub use enchantment::{
-    ActiveEnchantmentRecord, BUCKET_ADDITIVE, BUCKET_COOLDOWN, BUCKET_MULTIPLICATIVE, BUCKET_VITAE,
-    EnchantmentTypeFlags, STAT_KEY_MAX_HEALTH, STAT_KEY_MAX_MANA, STAT_KEY_MAX_STAMINA, VitalMod,
+    ATTACK_SKILLS, ActiveEnchantmentRecord, BUCKET_ADDITIVE, BUCKET_COOLDOWN,
+    BUCKET_MULTIPLICATIVE, BUCKET_VITAE, DEFENSE_SKILLS, EnchantStep, EnchantmentTypeFlags,
+    STAT_KEY_MAX_HEALTH, STAT_KEY_MAX_MANA, STAT_KEY_MAX_STAMINA, VitalMod, affects_attack_skills,
+    affects_defense_skills, affects_stat, candidate_wins, cull_enchantments, duel,
     enchant_attribute, enchant_skill, get_enchantments_in_effect, get_mod, get_skill_mod,
     get_vitae_multiplier, make_identity, skill_vitae_modifier, vitae_modifier,
 };

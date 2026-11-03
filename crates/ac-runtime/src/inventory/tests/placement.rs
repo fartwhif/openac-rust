@@ -171,6 +171,54 @@ fn a_pickup_by_use_waits_in_the_open_pack_and_a_second_is_refused() {
 }
 
 #[test]
+fn a_loose_item_dropped_on_a_toolbar_slot_is_picked_up_and_then_gets_the_shortcut() {
+    // GitHub #45: a ground item dropped on the hotbar is picked up into the
+    // preferred pack, as the use key picks it up, and the shortcut follows
+    // the request; when the pickup cannot go out the bar is left alone.
+    use ac_proto::inventory::build_add_shortcut;
+    let mut f = Fixture::new();
+    f.scroll();
+    f.run(ItemCommand::SetOpenPack(PACK));
+    assert!(f.run(ItemCommand::PickUpToShortcut {
+        item: guid(SCROLL),
+        slot: 4,
+    }));
+    let wire = ac_proto::Shortcut {
+        index: 4,
+        object_id: SCROLL,
+        spell_id: 0,
+    };
+    assert_eq!(
+        f.sent(),
+        [
+            build_put_item_in_container(1, SCROLL, PACK, 0),
+            build_add_shortcut(2, &wire)
+        ]
+    );
+    assert_eq!(f.inventory.shortcuts().get(4), SCROLL);
+    assert_eq!(f.placement(), Some((SCROLL, PACK, 0)));
+    // A second while the first is in flight: refused, nothing sent, the
+    // bar unchanged.
+    f.world.apply(&create(0x7000_000A, "Book", |d| {
+        d.item_type = ItemType::WRITABLE.bits();
+    }));
+    f.world.take_table_events();
+    f.notices();
+    assert!(!f.run(ItemCommand::PickUpToShortcut {
+        item: guid(0x7000_000A),
+        slot: 5,
+    }));
+    assert!(f.sent().is_empty());
+    assert!(f.inventory.shortcuts().is_empty(5));
+    // A slot off the bar is refused before anything is asked.
+    assert!(!f.run(ItemCommand::PickUpToShortcut {
+        item: guid(0x7000_000A),
+        slot: 18,
+    }));
+    assert!(f.sent().is_empty());
+}
+
+#[test]
 fn a_pickup_that_joins_a_held_stack_waits_in_the_pack_it_would_take() {
     // TryPlaceWorldItemInBackpack's merge: the join is the placement, shown
     // in the pack the search chose (the main pack here).

@@ -492,9 +492,16 @@ fn a_use_counts_busy_until_the_use_done_and_is_paced() {
     f.now_ms += 100;
     assert!(f.run(ItemCommand::Use(guid(NPC))));
     assert_eq!(f.sent(), [build_use(2, NPC)]);
-    // A use-done with an error is worded for the player.
+    // A use-done with an error is worded for the player (after the use's
+    // own line, the client's "Approaching %s" for a creature).
     f.server(GameEventType::USE_DONE, &[0x0402]);
-    assert_eq!(f.notices(), [Notice::WeenieError(0x0402)]);
+    assert_eq!(
+        f.notices(),
+        [
+            Notice::Interface("Approaching Town Crier".into()),
+            Notice::WeenieError(0x0402)
+        ]
+    );
 }
 
 #[test]
@@ -1980,6 +1987,26 @@ fn a_pickup_that_joins_a_carried_stack_moves_the_shortcut_too() {
     assert_eq!(f.slot(6), None);
 }
 
+// OpenAC `InventoryController.OnMergeAttempted`: every merge sent, the
+// pickup's join and a drag's merge alike, names the stack it joins for the
+// selection, once.
+#[test]
+fn every_merge_sent_names_the_stack_it_joins_for_the_selection() {
+    let mut f = Fixture::new();
+    assert!(f.run(ItemCommand::PickUp(guid(LOOSE))));
+    assert_eq!(f.sent(), [build_stackable_merge(1, LOOSE, GEM, 2)]);
+    assert_eq!(f.inventory.take_merged_into(), [GEM]);
+    assert!(f.inventory.take_merged_into().is_empty());
+
+    let mut f = Fixture::new();
+    assert!(f.run(ItemCommand::Merge {
+        from: guid(GEM),
+        to: guid(GEM2),
+        amount: 5,
+    }));
+    assert_eq!(f.inventory.take_merged_into(), [GEM2]);
+}
+
 #[test]
 fn the_use_and_examine_modes_act_on_the_next_object_offered() {
     // OpenAC `RuntimeItemInteraction.OfferPrimaryClick`: the use mode uses
@@ -2146,6 +2173,40 @@ fn a_corpse_is_opened_looted_into_the_packs_and_closed() {
     f.now_ms += 1_000;
     assert!(f.run(ItemCommand::Use(guid(CORPSE))));
     assert_eq!(f.sent(), [build_use(3, CORPSE)]);
+}
+
+#[test]
+fn a_locked_chest_is_used_but_not_viewed_and_the_client_says_it_is_locked() {
+    // Golden text and order: the retail client sends the use, then refuses
+    // to view a container not described as openable and shows "The %s is
+    // locked" as client-local text, and then "Using the %s". The server
+    // answers a locked chest's use with a sound and an empty use-done, no
+    // text. The corpse already open stays the open container.
+    const CORPSE: u32 = 0x8000_D011;
+    const CHEST: u32 = 0x8000_D012;
+    let mut f = Fixture::new();
+    open_empty_corpse(&mut f, CORPSE);
+    f.notices();
+    f.world.apply(&create(CHEST, "Legendary Chest", |d| {
+        d.item_type = ItemType::CONTAINER.bits();
+        d.object_description_flags = PublicWeenieFlags::STUCK.bits();
+        d.useability = Some(ItemUseable::REMOTE.bits());
+        d.items_capacity = Some(120);
+    }));
+    f.world.take_table_events();
+    f.now_ms += 1_000;
+    assert!(f.run(ItemCommand::Use(guid(CHEST))));
+    assert_eq!(f.sent(), [build_use(2, CHEST)]);
+    assert_eq!(
+        f.notices(),
+        [
+            Notice::Interface("The Legendary Chest is locked".into()),
+            Notice::Interface("Using the Legendary Chest".into())
+        ]
+    );
+    let external = f.inventory.external_containers();
+    assert_eq!(external.requested_container_id(), CORPSE);
+    assert_eq!(external.current_container_id(), CORPSE);
 }
 
 /// Leave the open corpse `corpse` (with nothing in it) as the open
@@ -2378,6 +2439,7 @@ fn full_pack(carried: u16, loose: u16, item_slots: i8) -> Fixture {
     );
     f.server(GameEventType::USE_DONE, &[0]);
     f.sent();
+    f.notices();
     f.now_ms += 1_000;
     f
 }
@@ -2811,7 +2873,13 @@ fn an_empty_mana_stone_asks_before_destroying_its_target() {
             target: RARE,
             message: "Are you sure you want to attempt to destroy your Rare and drain its mana into this stone?".into(),
         };
-        assert_eq!(f.notices(), [Notice::Confirm(question)]);
+        assert_eq!(
+            f.notices(),
+            [
+                Notice::Interface("Using the Mana Stone with the Rare".into()),
+                Notice::Confirm(question)
+            ]
+        );
 
         if retained {
             f.world.apply(&create(RARE, "Rare", |d| {
@@ -2861,11 +2929,15 @@ fn a_charged_stone_sends_at_once_and_a_retained_target_is_never_drained() {
         } else {
             assert!(f.sent().is_empty());
             assert_eq!(f.inventory.transactions().busy_count(), 0);
+            // The pick's own line comes first, then the refusal.
             assert_eq!(
                 f.notices(),
-                [Notice::Interface(
-                    "You cannot drain the mana of this item because it is retained.".into()
-                )]
+                [
+                    Notice::Interface("Using the Mana Stone with the Rare".into()),
+                    Notice::Interface(
+                        "You cannot drain the mana of this item because it is retained.".into()
+                    )
+                ]
             );
         }
     }
@@ -2897,6 +2969,39 @@ fn a_volatile_rare_is_used_only_after_a_yes() {
     assert!(confirmed_use(&mut f, RARE));
     assert_eq!(f.sent(), [build_use(1, RARE)]);
     assert_eq!(f.inventory.transactions().busy_count(), 1);
+    // Golden text: the retail client's yes to a use question prints "Using
+    // the %s" once the use is out.
+    assert_eq!(f.notices(), [Notice::Interface("Using the Rare".into())]);
+}
+
+#[test]
+fn a_target_pick_says_what_it_does_or_why_it_cannot() {
+    // Golden text: the retail client's target pick prints "Using the %s with
+    // the %s" (" on %s" for a player) before the use goes out, and the
+    // refusal ("Cannot use the %s with the %s") when the target does not
+    // fit; the target mode ends either way.
+    let mut f = with_stone(PublicWeenieFlags::NONE, true);
+    assert!(drain_on_rare(&mut f));
+    assert_eq!(f.sent(), [build_use_with_target(1, STONE, RARE)]);
+    assert_eq!(
+        f.notices(),
+        [Notice::Interface(
+            "Using the Mana Stone with the Rare".into()
+        )]
+    );
+
+    let mut f = with_stone(PublicWeenieFlags::NONE, true);
+    assert!(f.run(ItemCommand::Use(guid(STONE))));
+    f.notices();
+    f.run(ItemCommand::OfferTarget(guid(NPC)));
+    assert!(f.sent().is_empty());
+    assert!(f.inventory.interaction_mode().source().is_none());
+    assert_eq!(
+        f.notices(),
+        [Notice::Interface(
+            "You can't use the Mana Stone on what you don't own".into()
+        )]
+    );
 }
 
 #[test]

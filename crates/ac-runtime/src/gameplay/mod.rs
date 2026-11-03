@@ -609,6 +609,12 @@ impl Gameplay {
         }
     }
 
+    /// The account name spell formulas are personalised for.
+    #[must_use]
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
     /// Whether the player carries the components `spell_id` needs (the
     /// component book's rule, as a cast checks it).
     #[must_use]

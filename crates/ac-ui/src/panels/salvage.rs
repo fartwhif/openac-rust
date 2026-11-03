@@ -473,7 +473,7 @@ impl SalvageController {
                 // cells past its visible width when it lays out, and an
                 // unfilled cell would count as one.
                 fill_slot(&mut s, view.get(*id), view, icons);
-                s.source_kind = ItemDragSource::Inventory;
+                s.source_kind = ItemDragSource::Salvage;
                 let cell = ui.insert(slot_element(), s);
                 ui.with::<ItemList, _>(list, |l, ui| l.add_item(ui, list, cell));
             }

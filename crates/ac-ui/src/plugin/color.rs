@@ -14,11 +14,13 @@ use ac_plugin_ui::{ActionValue, Rgba};
 
 use super::controls::{DISABLED_ALPHA, Emit, FOCUS, HOTKEY_BACKGROUND, UNLIT_INNER};
 use super::fold::{MENU_BACKGROUND, MENU_BORDER, MENU_TEXT, SharedControlState};
+use super::style;
 use super::{Palette, color as to_color};
 use crate::draw::{Color, RenderContext};
 use crate::event::{Key, UiEvent, kind};
 use crate::font::UiFont;
 use crate::root::UiRoot;
+use crate::shapes::CornerRadii;
 use crate::tree::{Element, ElementId, Widget};
 
 /// The popup's margin.
@@ -476,8 +478,13 @@ impl MarkupColor {
         let (x, y, w, h) = self.rect;
         let border = p.map_or(MENU_BORDER, |p| p.border);
         rc.push_alpha_absolute(1.0);
-        rc.fill(x, y, w, h, p.map_or(MENU_BACKGROUND, |p| p.field));
-        rc.rect_outline(x, y, w, h, border, 1.0);
+        if let Some(p) = p {
+            style::popup_shadow(rc, x, y, w, h);
+            style::surface(rc, x, y, w, h, style::CONTAINER_RADIUS, p.field, border);
+        } else {
+            rc.fill(x, y, w, h, MENU_BACKGROUND);
+            rc.rect_outline(x, y, w, h, border, 1.0);
+        }
         // The square: drawn in cells of the hue at each saturation and value.
         let (sx, sy) = (x + PAD, y + PAD);
         let cells = 16;
@@ -530,13 +537,17 @@ impl MarkupColor {
         }
         // The hex field.
         let (fx, fy, fw) = (x + PAD, y + HEX_Y, w - 2.0 * PAD);
-        rc.fill(fx, fy, fw, ROW, p.map_or(HOTKEY_BACKGROUND, |p| p.field));
         let edge = if self.hex_editing {
             p.map_or(FOCUS, |p| p.accent)
         } else {
             p.map_or(UNLIT_INNER, |p| p.border)
         };
-        rc.rect_outline(fx, fy, fw, ROW, edge, 1.0);
+        if let Some(p) = p {
+            style::surface(rc, fx, fy, fw, ROW, style::SMALL_RADIUS, p.field, edge);
+        } else {
+            rc.fill(fx, fy, fw, ROW, HOTKEY_BACKGROUND);
+            rc.rect_outline(fx, fy, fw, ROW, edge, 1.0);
+        }
         if let Some(font) = &self.font {
             let ty = fy + ((ROW - font.line_height) * 0.5).floor();
             rc.string_dat(
@@ -720,14 +731,21 @@ impl Widget for MarkupColor {
                 if live { 1.0 } else { DISABLED_ALPHA },
             );
         }
-        rc.fill(1.0, 1.0, w - 2.0, h - 2.0, fade(rgba(self.value)));
         let focused = self.focused || self.open;
-        let p = self.palette.as_ref();
-        let edge = if focused {
-            p.map_or(FOCUS, |p| p.accent)
-        } else {
-            p.map_or(UNLIT_INNER, |p| p.border)
-        };
+        if let Some(p) = &self.palette {
+            let radii = CornerRadii::all(style::CONTROL_RADIUS - 1.0);
+            rc.fill_rounded_rect(1.0, 1.0, w - 2.0, h - 2.0, radii, fade(rgba(self.value)));
+            if !live {
+                rc.push_alpha(style::DISABLED_ALPHA);
+            }
+            style::field(rc, p, w, h, Color::TRANSPARENT, focused);
+            if !live {
+                rc.pop_alpha();
+            }
+            return;
+        }
+        rc.fill(1.0, 1.0, w - 2.0, h - 2.0, fade(rgba(self.value)));
+        let edge = if focused { FOCUS } else { UNLIT_INNER };
         rc.rect_outline(0.0, 0.0, w, h, fade(edge), 1.0);
     }
 

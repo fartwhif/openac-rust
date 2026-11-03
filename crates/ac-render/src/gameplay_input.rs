@@ -33,6 +33,10 @@ use crate::camera::{
     CameraController, CameraMode, ChaseAdjustment, ChaseTuning, FlyInput, MOUSE_ORBIT_SCALE,
 };
 use crate::world_click::WorldClick;
+
+#[path = "modern_mouse.rs"]
+pub mod modern_mouse;
+use modern_mouse::ModernMouse;
 /// One wheel notch zooms the chase camera 0.8 steps.
 const WHEEL_ZOOM_STEP: f32 = 0.8;
 
@@ -270,6 +274,8 @@ pub struct GameplayInput {
 struct Router {
     mouse_look: MouseLookState,
     rmb_orbit_held: bool,
+    /// Modern mouse turning (an OpenAC option).
+    modern: ModernMouse,
     fly_sensitivity: f32,
     orbit_sensitivity: f32,
     movement_keys: MovementKeys,
@@ -296,6 +302,7 @@ impl GameplayInput {
             router: Router {
                 mouse_look: MouseLookState::new(),
                 rmb_orbit_held: false,
+                modern: ModernMouse::default(),
                 fly_sensitivity: 1.0,
                 orbit_sensitivity: 1.0,
                 movement_keys: MovementKeys::default(),
@@ -321,6 +328,20 @@ impl GameplayInput {
     #[must_use]
     pub fn rmb_orbit_held(&self) -> bool {
         self.router.rmb_orbit_held
+    }
+
+    /// A modern mouse turning drag is on.
+    #[must_use]
+    pub fn modern_drag_active(&self) -> bool {
+        self.router.modern.dragging()
+    }
+
+    /// The window holds the cursor for the gameplay input (mouse look or a
+    /// modern mouse turning drag): the interface gets no pointer input and
+    /// raw motion comes here.
+    #[must_use]
+    pub fn holds_cursor(&self) -> bool {
+        self.router.mouse_look.active() || self.router.modern.dragging()
     }
 
     /// The dispatcher (bindings, scopes).
@@ -446,6 +467,9 @@ impl GameplayInput {
             keys: Some(&self.held),
             ..*state
         };
+        if pressed {
+            self.router.modern.button_pressed();
+        }
         let mut frame = Frame {
             cameras,
             now,
@@ -504,7 +528,8 @@ impl GameplayInput {
             ..*state
         };
         self.dispatcher.mouse_move(dx, dy, &devices);
-        if state.want_mouse {
+        // A modern drag turns by the raw motion, wherever the pointer is.
+        if state.want_mouse || self.router.modern.dragging() {
             return;
         }
         let Some(cameras) = cameras else {
@@ -522,10 +547,14 @@ impl GameplayInput {
         }
     }
 
-    /// Raw mouse motion (the cursor held): mouse look's samples, or the fly
-    /// camera's look.
+    /// Raw mouse motion (the cursor held): a modern drag's turn, mouse
+    /// look's samples, or the fly camera's look.
     pub fn raw_motion(&mut self, dx: f32, dy: f32, cameras: Option<&mut CameraController>) {
         let r = &mut self.router;
+        if r.modern.dragging() {
+            r.modern.motion(dx, dy, cameras);
+            return;
+        }
         if r.mouse_look.active() {
             r.mouse_look.queue_delta(dx, dy);
             return;
@@ -589,9 +618,11 @@ impl GameplayInput {
         } else {
             FlyInput::default()
         };
+        // A key held when a text field took the keyboard is still held
+        // (the dispatcher ends it on its release), one pressed into the
+        // field is not.
         if let Some(cameras) = cameras.as_deref_mut()
             && mode == Some(CameraMode::Chase)
-            && !state.want_keyboard
         {
             use InputAction as A;
             let any = |actions: &[InputAction]| actions.iter().any(|a| held(*a));
@@ -627,13 +658,16 @@ impl GameplayInput {
         }
         // In the head view a rotate (keys or mouse orbit) turns the
         // character, one turn a frame.
-        if let Some(step) = cameras.and_then(|c| c.chase.take_first_person_turn()) {
+        if let Some(step) = cameras
+            .as_deref_mut()
+            .and_then(|c| c.chase.take_first_person_turn())
+        {
             out.push(GameplayOutput::Movement(MovementCommand::FirstPersonTurn(
                 step,
             )));
         }
 
-        let keys = if mode == Some(CameraMode::Fly) {
+        let mut keys = if mode == Some(CameraMode::Fly) {
             MovementKeys::default()
         } else {
             MovementKeys {
@@ -647,6 +681,17 @@ impl GameplayInput {
                 jump: held(InputAction::MovementJump),
             }
         };
+        // Modern mouse turning: the view heading for the session, and both
+        // buttons held running forward (the back-up key cancels that).
+        let mouse_forward = self.router.modern.tick(
+            dt,
+            &devices,
+            cameras,
+            keys.backward,
+            keys.turn_left || keys.turn_right,
+            out,
+        );
+        keys.forward |= mouse_forward;
         if keys != self.router.movement_keys {
             self.router.movement_keys = keys;
             out.push(GameplayOutput::Movement(MovementCommand::Keys(keys)));
@@ -661,6 +706,8 @@ impl GameplayInput {
         self.dispatcher.deactivate();
         self.dispatcher.activate();
         self.router.end_mouse_look(out);
+        // The held view is let go at the next tick (no camera here).
+        self.router.modern.end(None, out);
         self.router.rmb_orbit_held = false;
         if self.router.movement_keys != MovementKeys::default() {
             self.router.movement_keys = MovementKeys::default();
@@ -669,6 +716,11 @@ impl GameplayInput {
             )));
         }
     }
+}
+
+/// Modern mouse turning is on in this camera's settings.
+fn modern_mouse_enabled(cameras: Option<&CameraController>) -> bool {
+    cameras.is_some_and(|c| c.chase.tuning.modern_mouse_turning)
 }
 
 impl Router {
@@ -720,6 +772,14 @@ impl Router {
         if frame.cameras.as_deref().map(CameraController::mode) != Some(CameraMode::Chase) {
             return;
         }
+        // A modern drag keeps the mouse; once it is let go, mouse look
+        // takes over from its settling.
+        if self.modern.dragging() {
+            return;
+        }
+        if self.modern.active() {
+            self.modern.end(frame.cameras.as_deref_mut(), frame.out);
+        }
         self.mouse_look.press(0.0, 0.0, frame.want_mouse, frame.now);
         if !self.mouse_look.active() {
             return;
@@ -764,6 +824,27 @@ impl Router {
 
         // Pointer actions: the right-button orbit, mouse look (the middle
         // button or the alternate-mode key held).
+        if action == A::AcdreamRmbOrbitHold
+            && (self.modern.active() || modern_mouse_enabled(frame.cameras.as_deref()))
+        {
+            // Modern mouse turning takes the right button instead of the
+            // orbit.
+            self.rmb_orbit_held = false;
+            match activation {
+                ActivationType::Press => {
+                    let mouse_look = self.mouse_look.active();
+                    self.modern.press(
+                        frame.cameras.as_deref_mut(),
+                        frame.want_mouse,
+                        mouse_look,
+                        frame.out,
+                    );
+                }
+                ActivationType::Release => self.modern.release(frame.cameras.as_deref(), frame.out),
+                _ => {}
+            }
+            return;
+        }
         if action == A::AcdreamRmbOrbitHold {
             match activation {
                 ActivationType::Press => self.rmb_orbit_held = mode == Some(CameraMode::Chase),
@@ -936,6 +1017,8 @@ impl Router {
             A::EscapeKey => frame.out.push(GameplayOutput::Escape),
             A::CaptureScreenshot => frame.out.push(GameplayOutput::CaptureScreenshot),
             A::AcdreamDumpNearby => frame.out.push(GameplayOutput::DumpNearby),
+            // A modern drag's clicks pick nothing (the cursor was hidden).
+            A::SelectLeft | A::SelectRight | A::SelectDblLeft if self.modern.swallows_clicks() => {}
             A::SelectLeft => frame
                 .out
                 .push(GameplayOutput::WorldClick(WorldClick::Select)),
@@ -971,3 +1054,7 @@ impl Router {
 #[cfg(test)]
 #[path = "gameplay_input_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "modern_mouse_tests.rs"]
+mod modern_mouse_tests;

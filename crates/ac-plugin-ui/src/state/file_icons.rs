@@ -20,6 +20,14 @@
 //! file each hold it, so one window going does not take the image from the
 //! other.
 //!
+//! A file may have a light and a dark version beside it
+//! (`icons/sword.light.png`, `icons/sword.dark.png`). The window always names
+//! the file its markup names, and the session reads the version for the
+//! theme instead when it is there: a light theme in a themed window draws
+//! the light one, everything else the dark one. A missing version is not
+//! reported, and one that cannot be used falls back to the named file. A
+//! change of theme keeps the old picture until the new one is ready.
+//!
 //! [`UiInput::FileIconsShown`]: crate::UiInput::FileIconsShown
 
 use std::collections::BTreeMap;
@@ -27,7 +35,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::PluginUi;
-use crate::file_images::{FileImage, FileImageLoader, FileImageRead};
+use crate::file_images::{FileImage, FileImageLoader, FileImageRead, variant_path};
 use crate::model::UiChange;
 
 /// A file the window has not drawn for this long, milliseconds, is let go.
@@ -58,6 +66,16 @@ struct FileIcon {
     offered_at: u64,
     /// The window's time of the last time it drew this file.
     drawn_at: u64,
+    /// The read came back with a reason it cannot be used.
+    failed: bool,
+}
+
+/// The versions there are beside a file markup names, each looked for once
+/// per window.
+#[derive(Debug, Clone, Default)]
+struct Versions {
+    dark: Option<String>,
+    light: Option<String>,
 }
 
 /// What one plugin window holds of the file icons it draws.
@@ -65,9 +83,16 @@ struct FileIcon {
 pub(super) struct PanelFiles {
     owner: String,
     directory: Option<PathBuf>,
-    /// By the path as the markup gives it.
+    /// Whether the window takes the plugin theme.
+    themed: bool,
+    /// By the path it is read from: the path as the markup gives it, or a
+    /// version of it.
     icons: BTreeMap<String, FileIcon>,
-    /// What the window draws now.
+    /// By the path as the markup gives it.
+    versions: BTreeMap<String, Versions>,
+    /// The image the window draws for each path as the markup gives it.
+    published: BTreeMap<String, u32>,
+    /// What the window draws now, as the markup gives it.
     shown: Vec<String>,
     /// The window's own time, milliseconds: each tick moves it on by the
     /// time since the last, but by no more than [`MAXIMUM_STEP_MS`], so a
@@ -107,8 +132,8 @@ impl PluginUi {
     #[must_use]
     pub fn file_icon(&self, panel: u32, path: &str) -> Option<(u32, u32, u32)> {
         let files = self.panel_files.get(&panel)?;
-        let icon = files.icons.get(path)?;
-        let view = self.images.get(&files.owner)?.resolve(icon.handle)?;
+        let handle = *files.published.get(path)?;
+        let view = self.images.get(&files.owner)?.resolve(handle)?;
         Some((view.handle, view.width, view.height))
     }
 
@@ -137,11 +162,15 @@ impl PluginUi {
         };
         let owner = p.view.owner.id.clone();
         let directory = p.directory.clone();
+        let themed = p.view.document.panel.themed;
         let now = self.file_clock;
         let files = self.panel_files.entry(panel).or_insert_with(|| PanelFiles {
             owner,
             directory,
+            themed,
             icons: BTreeMap::new(),
+            versions: BTreeMap::new(),
+            published: BTreeMap::new(),
             shown: Vec::new(),
             time: 0,
             last_tick: now,
@@ -176,20 +205,62 @@ impl PluginUi {
         let Some(mut files) = self.panel_files.remove(&panel) else {
             return;
         };
+        let light = files.themed && self.theme.is_light();
         let shown = std::mem::take(&mut files.shown);
         for path in &shown {
-            self.resolve_in(panel, &mut files, path);
+            let version = self.version_for(&mut files, path, light);
+            let mut drawn = version.as_deref().unwrap_or(path.as_str());
+            self.resolve_in(panel, &mut files, drawn);
+            if version.is_some() && files.icons.get(drawn).is_some_and(|icon| icon.failed) {
+                drawn = path;
+                self.resolve_in(panel, &mut files, drawn);
+            }
+            let handle = files.icons.get(drawn).map_or(0, |icon| icon.handle);
+            if handle != 0 && files.published.get(path) != Some(&handle) {
+                files.published.insert(path.clone(), handle);
+                self.changes.push(UiChange::FileIcon {
+                    panel,
+                    path: path.clone(),
+                    handle,
+                });
+            }
         }
         files.shown = shown;
         self.panel_files.insert(panel, files);
     }
 
-    /// One draw of `path` in window `panel` (OpenAC `ResolveFile`).
+    /// The version of `path` this theme draws, when it is there.
+    fn version_for(&self, files: &mut PanelFiles, path: &str, light: bool) -> Option<String> {
+        if !files.versions.contains_key(path) {
+            if files.versions.len() >= MAXIMUM_REMEMBERED {
+                files.versions.clear();
+            }
+            let there = |light| {
+                let directory = files.directory.as_deref()?;
+                let loader = self.file_images.as_ref()?;
+                variant_path(path, light).filter(|v| loader.has_file(directory, v))
+            };
+            let versions = Versions {
+                dark: there(false),
+                light: there(true),
+            };
+            files.versions.insert(path.to_owned(), versions);
+        }
+        let versions = files.versions.get(path)?;
+        if light {
+            versions.light.clone()
+        } else {
+            versions.dark.clone()
+        }
+    }
+
+    /// One draw of the file at `path` in window `panel` (OpenAC `ResolveFile`).
     fn resolve_in(&mut self, panel: u32, files: &mut PanelFiles, path: &str) {
         let PanelFiles {
             owner,
             directory,
             icons,
+            published,
             time,
             room_retries,
             reported_no_folder,
@@ -213,7 +284,7 @@ impl PluginUi {
         let time = *time;
         if !icons.contains_key(path) {
             if icons.len() >= MAXIMUM_REMEMBERED {
-                self.release_all(panel, owner, icons);
+                self.release_all(panel, owner, icons, published);
             }
             icons.insert(
                 path.to_owned(),
@@ -223,6 +294,7 @@ impl PluginUi {
                     refused_for_room: None,
                     offered_at: 0,
                     drawn_at: time,
+                    failed: false,
                 },
             );
         }
@@ -241,7 +313,7 @@ impl PluginUi {
             // changed on disk since it was read.
             if loader.is_current(&image) {
                 *room_retries += 1;
-                self.hold(panel, owner, path, icon, image, time);
+                self.hold(owner, icon, image, time);
             } else {
                 icon.reading = Some(loader.load(directory, path));
             }
@@ -251,8 +323,11 @@ impl PluginUi {
         };
         icon.reading = None;
         match result {
-            Ok(image) => self.hold(panel, owner, path, icon, image, time),
-            Err(reason) => self.report_file(owner, path, &reason),
+            Ok(image) => self.hold(owner, icon, image, time),
+            Err(reason) => {
+                icon.failed = true;
+                self.report_file(owner, path, &reason);
+            }
         }
     }
 
@@ -262,16 +337,8 @@ impl PluginUi {
             .map_or(0, crate::images::ImageTable::release_generation)
     }
 
-    /// Offers `image` to the plugin's table for window `panel`'s `path`.
-    fn hold(
-        &mut self,
-        panel: u32,
-        owner: &str,
-        path: &str,
-        icon: &mut FileIcon,
-        image: Arc<FileImage>,
-        time: u64,
-    ) {
+    /// Offers `image` to the plugin's table for `icon`.
+    fn hold(&mut self, owner: &str, icon: &mut FileIcon, image: Arc<FileImage>, time: u64) {
         icon.offered_at = time;
         let generation = self.release_generation(owner);
         match self.table(owner).acquire_file(owner, &image) {
@@ -280,11 +347,6 @@ impl PluginUi {
                 if let Some(view) = acquired.added {
                     self.changes.push(UiChange::ImageAdded(Box::new(view)));
                 }
-                self.changes.push(UiChange::FileIcon {
-                    panel,
-                    path: path.to_owned(),
-                    handle: acquired.handle,
-                });
             }
             Err(report) => {
                 icon.refused_for_room = Some((image, generation));
@@ -315,28 +377,48 @@ impl PluginUi {
                 .collect();
             for path in undrawn {
                 if let Some(icon) = files.icons.remove(&path) {
-                    self.let_go(&files.owner, panel, &path, icon.handle);
+                    self.let_go(&files.owner, panel, icon.handle, &mut files.published);
                 }
             }
         }
         self.panel_files.insert(panel, files);
     }
 
-    fn release_all(&mut self, panel: u32, owner: &str, icons: &mut BTreeMap<String, FileIcon>) {
-        for (path, icon) in std::mem::take(icons) {
-            self.let_go(owner, panel, &path, icon.handle);
+    fn release_all(
+        &mut self,
+        panel: u32,
+        owner: &str,
+        icons: &mut BTreeMap<String, FileIcon>,
+        published: &mut BTreeMap<String, u32>,
+    ) {
+        for (_, icon) in std::mem::take(icons) {
+            self.let_go(owner, panel, icon.handle, published);
         }
     }
 
-    fn let_go(&mut self, owner: &str, panel: u32, path: &str, handle: u32) {
+    /// Lets go of `handle`, and the window stops drawing it for any path
+    /// that still shows it.
+    fn let_go(
+        &mut self,
+        owner: &str,
+        panel: u32,
+        handle: u32,
+        published: &mut BTreeMap<String, u32>,
+    ) {
         if handle == 0 {
             return;
         }
         self.image_release(owner, handle);
-        self.changes.push(UiChange::FileIcon {
-            panel,
-            path: path.to_owned(),
-            handle: 0,
+        published.retain(|path, shown| {
+            let keep = *shown != handle;
+            if !keep {
+                self.changes.push(UiChange::FileIcon {
+                    panel,
+                    path: path.clone(),
+                    handle: 0,
+                });
+            }
+            keep
         });
     }
 
@@ -365,13 +447,12 @@ impl PluginUi {
             .iter()
             .flat_map(|(panel, files)| {
                 files
-                    .icons
+                    .published
                     .iter()
-                    .filter(|(_, icon)| icon.handle != 0)
-                    .map(|(path, icon)| UiChange::FileIcon {
+                    .map(|(path, handle)| UiChange::FileIcon {
                         panel: *panel,
                         path: path.clone(),
-                        handle: icon.handle,
+                        handle: *handle,
                     })
             })
             .collect()

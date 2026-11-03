@@ -1,18 +1,59 @@
-//! The retail detail textures: the region's building and environment
-//! detail images, repeated over building shells and interior cell walls
-//! and blended into the lit surface by the mesh shader. They draw only with
-//! the "building detail textures" option on and a non-zero tiling.
+//! The retail detail textures: the region's building, environment and
+//! landscape detail images. The building and environment images repeat
+//! over building shells and interior cell walls and are blended into the
+//! lit surface by the mesh shader; they draw only with the "building detail
+//! textures" option on and a non-zero tiling. The landscape image repeats
+//! over the outdoor terrain near the player and is blended in by the
+//! terrain shader the same way, fading out between 10 m and 50 m from the
+//! camera; it draws only with the "landscape detail textures" option on
+//! and a non-zero tiling.
 
 use super::pipelines::write_layer;
 use crate::assets::DetailTexture;
 
-/// The tilings the shader reads: x building shells, y interior cells; 0
-/// where the detail is off (the option, a missing texture or a zero
-/// tiling).
+/// Which detail options are on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DetailOptions {
+    /// Building shells and interior cells.
+    pub building: bool,
+    /// The outdoor terrain.
+    pub landscape: bool,
+}
+
+/// The tilings the shaders read: x building shells, y interior cells, z
+/// the landscape; 0 where the detail is off (its option, a missing texture
+/// or a zero tiling). `tilings` is building, environment, landscape.
 #[must_use]
-pub fn detail_tiling(enabled: bool, tilings: [Option<f32>; 2]) -> [f32; 4] {
-    let on = |t: Option<f32>| t.filter(|t| enabled && *t != 0.0).unwrap_or(0.0);
-    [on(tilings[0]), on(tilings[1]), 0.0, 0.0]
+pub fn detail_tiling(options: DetailOptions, tilings: [Option<f32>; 3]) -> [f32; 4] {
+    let on = |enabled: bool, t: Option<f32>| t.filter(|t| enabled && *t != 0.0).unwrap_or(0.0);
+    [
+        on(options.building, tilings[0]),
+        on(options.building, tilings[1]),
+        on(options.landscape, tilings[2]),
+        0.0,
+    ]
+}
+
+/// How strongly the landscape detail draws at a terrain vertex
+/// `depth_metres` in front of the camera (its view-space depth), 0..=255:
+/// full strength nearer than 10 m, fading linearly to nothing at 50 m
+/// (truncated to a byte), nothing beyond. The terrain shaders compute the
+/// same value per vertex (`landscape_detail_fade` in `terrain.wgsl` and
+/// `terrain_atmospheric.wgsl`, as a fraction of 255) and let it
+/// interpolate across the triangle; this is the reference they follow.
+#[cfg(test)]
+#[must_use]
+pub fn landscape_detail_fade(depth_metres: f32) -> u8 {
+    const NEAR: f32 = 10.0;
+    const FAR: f32 = 50.0;
+    if depth_metres < NEAR {
+        255
+    } else if depth_metres <= FAR {
+        // Truncated, not rounded.
+        ((1.0 - (depth_metres - NEAR) * (1.0 / (FAR - NEAR))) * 255.0) as u8
+    } else {
+        0
+    }
 }
 
 /// The detail textures on the GPU and their bind group.
@@ -21,9 +62,10 @@ pub(super) struct DetailGpu {
     sampler: wgpu::Sampler,
     params: wgpu::Buffer,
     pub group: wgpu::BindGroup,
-    /// Building (0) and environment (1): the image and its tiling.
-    textures: [Option<(wgpu::TextureView, f32)>; 2],
-    enabled: bool,
+    /// Building (0), environment (1) and landscape (2): the image and its
+    /// tiling.
+    textures: [Option<(wgpu::TextureView, f32)>; 3],
+    options: DetailOptions,
 }
 
 impl DetailGpu {
@@ -31,7 +73,7 @@ impl DetailGpu {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
-        enabled: bool,
+        options: DetailOptions,
     ) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("detail none"),
@@ -71,8 +113,8 @@ impl DetailGpu {
             sampler,
             params,
             group,
-            textures: [None, None],
-            enabled,
+            textures: [None, None, None],
+            options,
         };
         this.write_params(queue);
         this
@@ -112,25 +154,30 @@ impl DetailGpu {
 
     fn write_params(&self, queue: &wgpu::Queue) {
         let tiling = detail_tiling(
-            self.enabled,
+            self.options,
             [
                 self.textures[0].as_ref().map(|t| t.1),
                 self.textures[1].as_ref().map(|t| t.1),
+                self.textures[2].as_ref().map(|t| t.1),
             ],
         );
         queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&tiling));
     }
 
     /// The region's detail textures arrived: upload them with their mips.
+    /// The terrain's bind group holds the landscape image, so it is built
+    /// again after this.
     pub fn set_textures(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         layout: &wgpu::BindGroupLayout,
         details: &[Option<DetailTexture>; 2],
+        landscape: Option<&DetailTexture>,
     ) {
-        for (slot, detail) in self.textures.iter_mut().zip(details) {
-            *slot = detail.as_ref().map(|d| {
+        let sources = [details[0].as_ref(), details[1].as_ref(), landscape];
+        for (slot, detail) in self.textures.iter_mut().zip(sources) {
+            *slot = detail.map(|d| {
                 let image = &d.image;
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("detail"),
@@ -169,29 +216,211 @@ impl DetailGpu {
         self.write_params(queue);
     }
 
-    /// The "building detail textures" option changed.
-    pub fn set_enabled(&mut self, queue: &wgpu::Queue, enabled: bool) {
-        if self.enabled != enabled {
-            self.enabled = enabled;
+    /// The detail options changed.
+    pub fn set_options(&mut self, queue: &wgpu::Queue, options: DetailOptions) {
+        if self.options != options {
+            self.options = options;
             self.write_params(queue);
         }
+    }
+
+    /// The landscape detail image (a white texel without one).
+    pub fn landscape_view(&self) -> &wgpu::TextureView {
+        self.textures[2].as_ref().map_or(&self.white, |t| &t.0)
+    }
+
+    /// The detail images' sampler: repeating, linear with linear mips.
+    pub fn sampler(&self) -> &wgpu::Sampler {
+        &self.sampler
+    }
+
+    /// The tilings the shaders read ([`detail_tiling`]).
+    pub fn params(&self) -> &wgpu::Buffer {
+        &self.params
     }
 }
 
 #[cfg(test)]
 mod tests {
     //! OpenAC `RetailDetailTextureContract.ShouldRender` (the option and an
-    //! available texture) and the dispatchers' `Tiling != 0` gate.
+    //! available texture) and the dispatchers' `Tiling != 0` gate; the
+    //! landscape detail behind its own option.
 
     use super::*;
+
+    const BOTH: DetailOptions = DetailOptions {
+        building: true,
+        landscape: true,
+    };
 
     #[test]
     fn detail_draws_only_with_the_option_a_texture_and_a_tiling() {
         assert_eq!(
-            detail_tiling(true, [Some(10.0), Some(4.0)]),
+            detail_tiling(BOTH, [Some(10.0), Some(4.0), None]),
             [10.0, 4.0, 0.0, 0.0]
         );
-        assert_eq!(detail_tiling(false, [Some(10.0), Some(4.0)]), [0.0; 4]);
-        assert_eq!(detail_tiling(true, [None, Some(0.0)]), [0.0; 4]);
+        assert_eq!(
+            detail_tiling(DetailOptions::default(), [Some(10.0), Some(4.0), None]),
+            [0.0; 4]
+        );
+        assert_eq!(detail_tiling(BOTH, [None, Some(0.0), None]), [0.0; 4]);
+    }
+
+    // The fade the landscape detail takes with distance from the camera
+    // (the research note on landscape detail textures): 255 nearer than
+    // 10 m, (1 - (z - 10) / 40) * 255 truncated up to 50 m, 0 beyond.
+    #[test]
+    fn the_landscape_detail_fades_from_ten_to_fifty_metres() {
+        let curve: Vec<u8> = [0.0, 10.0, 30.0, 50.0, 60.0]
+            .into_iter()
+            .map(landscape_detail_fade)
+            .collect();
+        assert_eq!(curve, [255, 255, 127, 0, 0]);
+    }
+
+    /// The text of the shader function `landscape_detail_fade` in `source`:
+    /// from its `fn` line to the closing brace at the line's start.
+    fn wgsl_fade_function(source: &str) -> &str {
+        let start = source
+            .find("fn landscape_detail_fade(")
+            .expect("the shader has landscape_detail_fade");
+        let end = source[start..].find("\n}").expect("the function ends") + start + 2;
+        &source[start..end]
+    }
+
+    /// `function` (a WGSL `landscape_detail_fade`) run on the GPU at each
+    /// of `depths`, as bytes (the fraction of 255 it returns, rounded).
+    fn run_on_gpu(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        function: &str,
+        depths: &[f32],
+    ) -> Vec<u8> {
+        let source = format!(
+            "@group(0) @binding(0) var<storage, read> depths: array<f32>;\n\
+             @group(0) @binding(1) var<storage, read_write> fades: array<f32>;\n\
+             {function}\n\
+             @compute @workgroup_size(1)\n\
+             fn main(@builtin(global_invocation_id) id: vec3<u32>) {{\n\
+                 fades[id.x] = landscape_detail_fade(depths[id.x]);\n\
+             }}\n"
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("landscape detail fade test"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("landscape detail fade test"),
+            layout: None,
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let size = std::mem::size_of_val(depths) as u64;
+        let input = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("depths"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&input, 0, bytemuck::cast_slice(depths));
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fades"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fades readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("landscape detail fade test"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: input.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(depths.len() as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, size);
+        queue.submit([encoder.finish()]);
+        readback.map_async(wgpu::MapMode::Read, .., |_| {});
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("the GPU finishes");
+        let mapped = readback.slice(..).get_mapped_range().expect("mapped");
+        let fades: &[f32] = bytemuck::cast_slice(&mapped);
+        fades.iter().map(|f| (f * 255.0).round() as u8).collect()
+    }
+
+    // Both terrain shaders' fade, run on the GPU, gives the reference's
+    // bytes either side of each edge; and the two copies are the same text.
+    #[test]
+    fn the_terrain_shaders_fade_as_the_reference_does() {
+        let shaders = [
+            ("terrain.wgsl", include_str!("../shaders/terrain.wgsl")),
+            (
+                "terrain_atmospheric.wgsl",
+                include_str!("../shaders/terrain_atmospheric.wgsl"),
+            ),
+        ];
+        let depths = [0.0, 9.99, 10.0, 30.0, 49.99, 50.0, 60.0];
+        let expected: Vec<u8> = depths.into_iter().map(landscape_detail_fade).collect();
+        if let Some((device, queue)) = crate::test_gpu::device() {
+            for (name, source) in shaders {
+                let on_gpu = run_on_gpu(&device, &queue, wgsl_fade_function(source), &depths);
+                assert_eq!(on_gpu, expected, "{name} at {depths:?}");
+            }
+        }
+        assert_eq!(
+            wgsl_fade_function(shaders[0].1),
+            wgsl_fade_function(shaders[1].1),
+            "the two terrain shaders' fades differ"
+        );
+    }
+
+    #[test]
+    fn the_landscape_detail_draws_only_with_its_own_option_a_texture_and_a_tiling() {
+        assert_eq!(
+            detail_tiling(BOTH, [None, None, Some(4.0)]),
+            [0.0, 0.0, 4.0, 0.0]
+        );
+        // Off by its own option, whatever the building option says.
+        let building_only = DetailOptions {
+            building: true,
+            landscape: false,
+        };
+        assert_eq!(
+            detail_tiling(building_only, [Some(10.0), Some(4.0), Some(4.0)]),
+            [10.0, 4.0, 0.0, 0.0]
+        );
+        // On by its own option alone; the building details stay off.
+        let landscape_only = DetailOptions {
+            building: false,
+            landscape: true,
+        };
+        assert_eq!(
+            detail_tiling(landscape_only, [Some(10.0), Some(4.0), Some(4.0)]),
+            [0.0, 0.0, 4.0, 0.0]
+        );
+        // No texture, or a zero tiling: off.
+        assert_eq!(detail_tiling(BOTH, [None, None, None]), [0.0; 4]);
+        assert_eq!(detail_tiling(BOTH, [None, None, Some(0.0)]), [0.0; 4]);
     }
 }

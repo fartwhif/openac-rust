@@ -369,12 +369,15 @@ fn automation_press_obeys_keyboard_capture_but_its_release_always_goes() {
         assert!(r.d.try_invoke_automation_action(A::CombatToggleCombat, &r.dev, &mut sink));
         assert!(r.d.try_set_automation_action_held(A::MovementForward, true, &r.dev, &mut sink));
     }
+    // A hold begun before a field took the keyboard goes on, as a held key
+    // does, until it is let go.
     r.dev.want_keyboard = true;
-    assert!(!r.held(A::MovementForward));
+    assert!(r.held(A::MovementForward));
     {
         let mut sink = Rig::record(&mut r.fired, &mut r.captured);
         assert!(r.d.try_set_automation_action_held(A::MovementForward, false, &r.dev, &mut sink));
     }
+    assert!(!r.held(A::MovementForward));
     assert_eq!(
         r.fired,
         [
@@ -682,16 +685,66 @@ fn a_bare_chord_stays_held_with_shift_added_but_not_with_ctrl() {
     assert!(!r.held(A::MovementForward));
 }
 
+/// A key held before a text field takes the keyboard (the chat entry
+/// clicked while running) stays held until it comes up: the game ends a
+/// held action on its key's release only, whatever has the keyboard then.
 #[test]
-fn nothing_is_held_while_the_keyboard_is_captured() {
+fn a_key_held_before_a_field_takes_the_keyboard_stays_held_until_released() {
     let mut r = Rig::with(&[Binding::new(bare(Key::W), A::MovementForward)]);
     r.key_down(Key::W, NONE);
     assert!(r.held(A::MovementForward));
     r.dev.want_keyboard = true;
-    assert!(!r.held(A::MovementForward));
-    r.dev.want_keyboard = false;
+    assert!(r.held(A::MovementForward), "the field took the keyboard");
     r.dev.want_mouse = true;
     assert!(r.held(A::MovementForward));
+    r.key_up(Key::W, NONE);
+    assert!(
+        !r.held(A::MovementForward),
+        "released while the field has it"
+    );
+}
+
+/// A key pressed while a text field has the keyboard types into the field
+/// and holds nothing, then or after the field lets the keyboard go.
+#[test]
+fn a_key_pressed_while_a_field_has_the_keyboard_holds_nothing() {
+    let mut r = Rig::with(&[Binding::new(bare(Key::W), A::MovementForward)]);
+    r.dev.want_keyboard = true;
+    r.key_down(Key::W, NONE);
+    assert!(!r.held(A::MovementForward));
+    r.dev.want_keyboard = false;
+    assert!(
+        !r.held(A::MovementForward),
+        "a key typed into the field does not move once the field lets go"
+    );
+    r.key_up(Key::W, NONE);
+    r.key_down(Key::W, NONE);
+    assert!(r.held(A::MovementForward), "a fresh press holds again");
+}
+
+/// A key pressed into a rebind capture is the capture's, not a held action.
+#[test]
+fn a_key_taken_by_a_capture_holds_nothing() {
+    let mut r = Rig::with(&[Binding::new(bare(Key::W), A::MovementForward)]);
+    r.d.begin_capture();
+    r.key_down(Key::W, NONE);
+    assert_eq!(r.captured, [Some(bare(Key::W))]);
+    assert!(!r.held(A::MovementForward));
+}
+
+/// A button pressed over the interface is the interface's: an action bound
+/// to it is not held.
+#[test]
+fn a_button_pressed_over_the_ui_holds_nothing() {
+    let mut r =
+        Rig::with(&[
+            Binding::new(KeyChord::mouse(mouse::RIGHT, NONE), A::AcdreamRmbOrbitHold)
+                .activation(HOLD),
+        ]);
+    r.dev.want_mouse = true;
+    r.mouse_down(mouse::RIGHT, NONE);
+    r.dev.want_mouse = false;
+    assert!(!r.held(A::AcdreamRmbOrbitHold));
 }
 
 // ── MuteChordDispatchTests, deactivation ───────────────────────────────
@@ -715,4 +768,11 @@ fn a_deactivated_dispatcher_fires_nothing() {
     r.key_down(Key::W, NONE);
     assert_eq!(r.fired.len(), 1);
     assert!(!r.held(A::MovementForward));
+    // Deactivating lets go of every key: one still down when dispatching
+    // resumes holds nothing until it is pressed again.
+    r.d.activate();
+    assert!(!r.held(A::MovementForward));
+    r.key_up(Key::W, NONE);
+    r.key_down(Key::W, NONE);
+    assert!(r.held(A::MovementForward));
 }

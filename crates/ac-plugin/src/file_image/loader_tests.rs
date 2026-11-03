@@ -285,3 +285,15 @@ fn a_window_rebuilt_after_its_file_changed_gets_the_new_image() {
     assert_eq!(ui.file_icon(second, "icons/sword.png"), Some(old));
     assert_eq!(ui.image_count("acme.hello"), 2);
 }
+
+#[test]
+fn only_a_file_inside_the_folder_counts_as_there() {
+    let root = folder();
+    write(&root, "icons/sword.light.png", &png(4, 4));
+    let loader = inline();
+    assert!(loader.has_file(root.path(), "icons/sword.light.png"));
+    assert!(loader.has_file(root.path(), r".\icons\sword.light.png"));
+    assert!(!loader.has_file(root.path(), "icons/sword.dark.png"));
+    assert!(!loader.has_file(root.path(), "../outside.light.png"));
+    assert!(!loader.has_file(root.path(), "icons"));
+}

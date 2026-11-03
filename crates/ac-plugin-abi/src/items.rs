@@ -126,7 +126,14 @@ wire_record! {
         pub gear_critical_damage_resistance: i32,
         /// The largest stack it makes.
         pub maximum_stack_size: i32,
-        /// Its slot in its container, -1 for none.
+        /// Its place in its container's contents, counted among its own
+        /// kind: a loose item's index among the container's loose items, a
+        /// pack's (or spell focus's) among its packs, both from 0 in the
+        /// order the container lists them. The same for the main pack, a
+        /// side pack or an open chest. -1 when it is in no container
+        /// (worn or wielded, on the ground) or its container's list does
+        /// not hold it; 0 when its container has no list at all (never
+        /// listed, or its view closed).
         pub container_slot: i32,
         /// Items a container holds.
         pub items_capacity: i32,

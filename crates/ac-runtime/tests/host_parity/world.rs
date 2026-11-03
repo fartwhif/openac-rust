@@ -1,8 +1,9 @@
 //! The little world a scenario stages, written once and said by the
 //! server to both arms alike (OpenAC `ParityWorld`, `ParityPlayerBody`):
 //! the character, a monster a few metres out, a second beyond it, a dead
-//! one, a hidden one and a harmless bystander, a metre or more apart along
-//! the x axis.
+//! one and a harmless bystander, a metre or more apart along the x axis
+//! east of the character, and a hidden one off to the south-east, out of
+//! every route a scenario walks or runs.
 
 use super::arm::Arm;
 use super::wire::{self, Object};
@@ -112,10 +113,23 @@ pub fn bystander(guid: u32, x: f32) -> Object {
 /// dead one, a hidden one and a harmless bystander (OpenAC
 /// `ParityWorld.Stage`).
 pub fn stage(arm: &mut Arm) {
-    let hidden = Object {
+    // OpenAC stands the hidden one a metre out on the line east of the
+    // character. Here it stands four metres east and four south, clear of
+    // every scenario's route (the runs north, the turns, the walks east to
+    // the creatures, west to the corpse and four metres south): a hidden
+    // creature is still solid, only an ethereal one is passed through, and
+    // on this slope a walk that brushes it can be pinned against it (the
+    // step down lands the body inside its sphere, and the check that the
+    // body fits refuses the move). Whether a walk brushes it depends on the
+    // frame timing, so a walk past it re-planned on one arm and not the
+    // other.
+    let mut hidden = Object {
         physics_state: HIDDEN,
-        ..monster(HIDDEN_MONSTER, PLAYER_X + 1.0)
+        ..monster(HIDDEN_MONSTER, PLAYER_X + 4.0)
     };
+    if let Some((_, _, y, _)) = hidden.position.as_mut() {
+        *y -= 4.0;
+    }
     arm.say_grounded(&hidden);
     arm.say_grounded(&monster(DEAD_MONSTER, PLAYER_X + 2.0));
     arm.server

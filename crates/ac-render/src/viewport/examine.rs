@@ -9,8 +9,6 @@
 
 use glam::{Mat4, Quat, Vec3};
 
-use crate::meshing::MeshRef;
-
 /// The heading the copies are turned to, degrees: a little past facing
 /// the viewer, so the figure stands slightly turned.
 pub const FIGURE_HEADING_DEGREES: f32 = 191.367_9;
@@ -24,17 +22,22 @@ pub fn figure_turn() -> Quat {
     Quat::from_axis_angle(Vec3::Z, -FIGURE_HEADING_DEGREES.to_radians())
 }
 
-/// The box around a creature for framing, model-local: its own box when
-/// known, else one built around its parts' offsets (half a metre each way,
-/// and at least a 1 x 1 x 2 m body standing on the origin).
+/// The box around a creature for framing, in its own frame at its size:
+/// its own box (`bounds`, model-local at size 1) grown by its `scale`
+/// when known, else one built around where its parts stand in its own
+/// frame (`part_offsets`, its size already in them; half a metre each
+/// way, and at least a 1 x 1 x 2 m body standing on the origin).
 #[must_use]
-pub fn creature_box(bounds: Option<(Vec3, Vec3)>, parts: &[MeshRef]) -> (Vec3, Vec3) {
-    if let Some(b) = bounds {
-        return b;
+pub fn creature_box(
+    bounds: Option<(Vec3, Vec3)>,
+    scale: f32,
+    part_offsets: impl IntoIterator<Item = Vec3>,
+) -> (Vec3, Vec3) {
+    if let Some((min, max)) = bounds {
+        return (min * scale, max * scale);
     }
     let (mut min, mut max) = super::camera::EXAMINE_DEFAULT_BOX;
-    for part in parts {
-        let p = part.transform.w_axis.truncate();
+    for p in part_offsets {
         min = min.min(p - Vec3::splat(0.5));
         max = max.max(p + Vec3::splat(0.5));
     }
@@ -112,20 +115,64 @@ mod tests {
 
     #[test]
     fn without_a_box_one_is_built_around_the_parts() {
-        let part = |x| MeshRef {
-            gfx_obj_id: 1,
-            transform: Mat4::from_translation(Vec3::new(x, 0.0, 3.0)),
-            variant: 0,
-        };
-        let (lo, hi) = creature_box(None, &[part(2.0), part(-0.2)]);
+        let part = |x| Vec3::new(x, 0.0, 3.0);
+        let (lo, hi) = creature_box(None, 1.0, [part(2.0), part(-0.2)]);
         assert_eq!(lo, Vec3::new(-0.7, -0.5, 0.0));
         assert_eq!(hi, Vec3::new(2.5, 0.5, 3.5));
+        // The parts already stand at the creature's size: not grown again.
+        assert_eq!(creature_box(None, 2.0, [part(2.0), part(-0.2)]), (lo, hi));
         let own = (Vec3::splat(-3.0), Vec3::splat(3.0));
-        assert_eq!(creature_box(Some(own), &[part(9.0)]), own);
+        assert_eq!(creature_box(Some(own), 1.0, [part(9.0)]), own);
         assert_eq!(
-            creature_box(None, &[]),
+            creature_box(None, 1.0, []),
             crate::viewport::camera::EXAMINE_DEFAULT_BOX
         );
+    }
+
+    #[test]
+    fn a_creatures_own_box_grows_with_its_size() {
+        let own = (Vec3::new(-0.4, -0.3, 0.0), Vec3::new(0.4, 0.3, 1.8));
+        let (lo, hi) = creature_box(Some(own), 1.15, []);
+        assert!(lo.abs_diff_eq(own.0 * 1.15, 1e-6));
+        assert!(hi.abs_diff_eq(own.1 * 1.15, 1e-6));
+    }
+
+    /// The portrait frames the creature as drawn: a creature larger (or
+    /// smaller) than its model, as many are, still fits the viewport
+    /// whatever the viewport's shape, filling it along one axis.
+    #[test]
+    fn a_scaled_creature_fits_the_portrait() {
+        use crate::viewport::camera::{EXAMINE_FAR, ViewportCamera, examine_eye};
+        let own = (Vec3::new(-0.4, -0.3, 0.0), Vec3::new(0.4, 0.3, 1.8));
+        for scale in [0.6_f32, 1.0, 1.15, 2.5] {
+            for aspect in [300.0 / 265.0, 240.0 / 165.0, 0.5, 2.0] {
+                let framed = turned_box(creature_box(Some(own), scale, []), figure_turn());
+                let mut camera =
+                    ViewportCamera::new(examine_eye(framed.0, framed.1, aspect), EXAMINE_FAR);
+                camera.aspect = aspect;
+                let clip = camera.projection() * camera.view();
+                // The corners of the copy as drawn: the model's box at the
+                // creature's size, turned toward the viewer.
+                let mut reach = 0.0_f32;
+                for corner in 0..8 {
+                    let p = Vec3::new(
+                        if corner & 1 == 0 { own.0.x } else { own.1.x },
+                        if corner & 2 == 0 { own.0.y } else { own.1.y },
+                        if corner & 4 == 0 { own.0.z } else { own.1.z },
+                    );
+                    let ndc = clip.project_point3(figure_turn() * (p * scale));
+                    reach = reach.max(ndc.x.abs()).max(ndc.y.abs());
+                }
+                assert!(
+                    reach <= 1.0 + 1e-4,
+                    "scale {scale}, aspect {aspect}: the figure reaches {reach} of the half view"
+                );
+                assert!(
+                    reach > 0.8,
+                    "scale {scale}, aspect {aspect}: the figure fills only {reach}"
+                );
+            }
+        }
     }
 
     #[test]

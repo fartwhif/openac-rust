@@ -38,6 +38,7 @@ pub mod plugin;
 pub mod pregame;
 pub mod radar;
 pub mod root;
+pub mod shapes;
 pub mod states;
 pub mod strings;
 pub mod text;

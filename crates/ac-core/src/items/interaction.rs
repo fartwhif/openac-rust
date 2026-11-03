@@ -112,6 +112,9 @@ pub enum ItemPolicyActionKind {
     DropToWorld,
     /// Print `message`; nothing else happens.
     Reject,
+    /// Print `message`, the client's own line saying what the use is doing
+    /// ("Using the ...", "Approaching ..."); the steps around it go on.
+    Announce,
     /// Ask before an empty mana stone destroys `target_id` to take its
     /// mana; `message` is the question. The use goes out only after a yes.
     ConfirmManaStoneDrain,
@@ -149,8 +152,16 @@ impl ItemPolicyAction {
     }
 
     fn reject(message: String) -> Self {
+        Self::say(ItemPolicyActionKind::Reject, message)
+    }
+
+    fn announce(message: String) -> Self {
+        Self::say(ItemPolicyActionKind::Announce, message)
+    }
+
+    fn say(kind: ItemPolicyActionKind, message: String) -> Self {
         Self {
-            kind: ItemPolicyActionKind::Reject,
+            kind,
             object_id: 0,
             target_id: 0,
             amount: 0,
@@ -342,10 +353,12 @@ pub fn decide_use(input: &ItemUsePolicyInput) -> ItemUsePolicyDecision {
                 name_of(source)
             ));
         };
-        if let Some(failure) = target_compatibility_failure(source, target, input.player_id) {
-            return reject(failure);
-        }
+        let announcement = match use_on_target_line(source, target, input.player_id) {
+            Ok(line) => line,
+            Err(failure) => return reject(failure),
+        };
         let mut actions = vec![
+            ItemPolicyAction::announce(announcement),
             ItemPolicyAction::with(
                 ItemPolicyActionKind::SendUseWithTarget,
                 source.id,
@@ -400,6 +413,7 @@ pub fn decide_use(input: &ItemUsePolicyInput) -> ItemUsePolicyDecision {
             primary(),
             classify,
         ));
+        actions.push(ItemPolicyAction::announce(using_line(source)));
         return consumed(actions);
     }
 
@@ -437,6 +451,44 @@ pub fn is_target_compatible(
     player_id: u32,
 ) -> bool {
     target_compatibility_failure(source, target, player_id).is_none()
+}
+
+/// The line a plain use of `source` shows once it has gone out: a creature
+/// (a vendor, an NPC, which the character walks to) is "Approaching
+/// <name>"; anything else is "Using the <name>".
+#[must_use]
+pub fn using_line(source: &ItemPolicyObject) -> String {
+    if source.item_type.intersects(ItemType::CREATURE) {
+        format!("Approaching {}", name_of(source))
+    } else {
+        format!("Using the {}", name_of(source))
+    }
+}
+
+/// Using `source` on `target`: `Ok` with the line the use shows ("Using
+/// the <source> on <player>", else "... with the <target>"), or `Err` with
+/// why it cannot be used on it.
+///
+/// # Errors
+/// The refusal text when `source` may not be used on `target`.
+pub fn use_on_target_line(
+    source: &ItemPolicyObject,
+    target: &ItemPolicyObject,
+    player_id: u32,
+) -> Result<String, String> {
+    if let Some(failure) = target_compatibility_failure(source, target, player_id) {
+        return Err(failure);
+    }
+    let joint = if target.is_player() {
+        " on "
+    } else {
+        " with the "
+    };
+    Ok(format!(
+        "Using the {}{joint}{}",
+        name_of(source),
+        name_of(target)
+    ))
 }
 
 fn target_compatibility_failure(
@@ -656,6 +708,37 @@ fn build_using_item_actions(
         ));
     }
     actions
+}
+
+/// What asking to open a container on the ground comes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroundObjectDecision {
+    /// It is described as openable: view it.
+    Open,
+    /// Leave it unopened, with the client-local line that says why (none
+    /// for a creature).
+    Refuse(Option<String>),
+}
+
+/// Whether the use of a container on the ground (`container`, `None` when
+/// the client has no object for it) also views it. Only a container
+/// described as openable is viewed; a locked one is not (its use still went
+/// to the server) and the client says so itself, since the server answers
+/// a locked container's use with no text of its own.
+#[must_use]
+pub fn decide_set_ground_object(container: Option<&ItemPolicyObject>) -> GroundObjectDecision {
+    let Some(container) = container else {
+        return GroundObjectDecision::Refuse(Some(
+            "The object has no representation on the client.".into(),
+        ));
+    };
+    if container.flags.intersects(PublicWeenieFlags::OPENABLE) {
+        return GroundObjectDecision::Open;
+    }
+    if container.item_type.intersects(ItemType::CREATURE) {
+        return GroundObjectDecision::Refuse(None);
+    }
+    GroundObjectDecision::Refuse(Some(format!("The {} is locked", name_of(container))))
 }
 
 fn has_unused_location(valid: EquipMask, current: EquipMask) -> bool {
@@ -941,7 +1024,8 @@ mod tests {
             kinds(&decision.actions),
             vec![
                 ItemPolicyActionKind::SendUse,
-                ItemPolicyActionKind::IncrementBusy
+                ItemPolicyActionKind::IncrementBusy,
+                ItemPolicyActionKind::Announce
             ]
         );
     }
@@ -1093,9 +1177,123 @@ mod tests {
         assert_eq!(
             kinds(&decision.actions),
             vec![
+                ItemPolicyActionKind::Announce,
                 ItemPolicyActionKind::SendUseWithTarget,
                 ItemPolicyActionKind::IncrementBusy
             ]
+        );
+    }
+
+    fn announcements(actions: &[ItemPolicyAction]) -> Vec<&str> {
+        actions
+            .iter()
+            .filter(|a| a.kind == ItemPolicyActionKind::Announce)
+            .filter_map(|a| a.message.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn a_use_says_using_the_item_and_a_creature_is_approached() {
+        // Golden text and order: the retail client sends the use, counts it
+        // busy, does the item's own steps (viewing a container on the
+        // ground), then prints "Approaching %s" for a creature or "Using
+        // the %s" for anything else, as client-local text.
+        let chest = ItemPolicyObject {
+            name: "Legendary Chest".into(),
+            item_type: ItemType::CONTAINER,
+            is_container: true,
+            flags: PublicWeenieFlags::STUCK,
+            useability: ItemUseable::REMOTE,
+            items_capacity: 120,
+            ..obj(GROUND_CONTAINER)
+        };
+        let decision = decide_use(&use_input(chest));
+        assert_eq!(
+            kinds(&decision.actions),
+            vec![
+                ItemPolicyActionKind::SendUse,
+                ItemPolicyActionKind::IncrementBusy,
+                ItemPolicyActionKind::SetGroundObject,
+                ItemPolicyActionKind::Announce
+            ]
+        );
+        assert_eq!(
+            announcements(&decision.actions),
+            ["Using the Legendary Chest"]
+        );
+
+        let vendor = ItemPolicyObject {
+            name: "Thorsten the Shopkeeper".into(),
+            item_type: ItemType::CREATURE,
+            flags: PublicWeenieFlags::STUCK | PublicWeenieFlags::VENDOR,
+            useability: ItemUseable::REMOTE,
+            ..obj(0x7000_0002)
+        };
+        let decision = decide_use(&use_input(vendor));
+        assert_eq!(
+            announcements(&decision.actions),
+            ["Approaching Thorsten the Shopkeeper"]
+        );
+
+        // Nothing is said for a use that never goes out.
+        let not_useable = decide_use(&use_input(ItemPolicyObject {
+            name: "Pillar".into(),
+            flags: PublicWeenieFlags::STUCK,
+            ..obj(0x7000_0003)
+        }));
+        assert!(announcements(&not_useable.actions).is_empty());
+    }
+
+    #[test]
+    fn a_use_on_a_target_says_on_for_a_player_and_with_the_for_anything_else() {
+        // Golden text: the retail client's "Using the %s" followed by " on "
+        // and the target's name when the target is a player, else " with
+        // the " and its name; printed before the use goes out.
+        let kit = ItemPolicyObject {
+            name: "Healing Kit".into(),
+            useability: ItemUseable(0x0008_0008 | (ItemUseable::SELF.0 << 16)),
+            target_type: ItemType::CREATURE | ItemType::MISC,
+            ..owned_direct()
+        };
+        let me = ItemPolicyObject {
+            name: "Acdream".into(),
+            item_type: ItemType::CREATURE,
+            flags: PublicWeenieFlags::PLAYER,
+            owned_by_player: true,
+            ..obj(PLAYER)
+        };
+        let decision = decide_use(&ItemUsePolicyInput {
+            use_current_selection: true,
+            selected_target: Some(me.clone()),
+            ..use_input(kit.clone())
+        });
+        assert_eq!(
+            announcements(&decision.actions),
+            ["Using the Healing Kit on Acdream"]
+        );
+        assert_eq!(
+            use_on_target_line(&kit, &me, PLAYER),
+            Ok("Using the Healing Kit on Acdream".to_owned())
+        );
+
+        let sword = ItemPolicyObject {
+            name: "Sword".into(),
+            container_id: PLAYER,
+            owned_by_player: true,
+            ..obj(0x6002)
+        };
+        assert_eq!(
+            use_on_target_line(&kit, &sword, PLAYER),
+            Ok("Using the Healing Kit with the Sword".to_owned())
+        );
+        let armor = ItemPolicyObject {
+            item_type: ItemType::ARMOR,
+            name: "armor".into(),
+            ..sword
+        };
+        assert_eq!(
+            use_on_target_line(&kit, &armor, PLAYER),
+            Err("Cannot use the Healing Kit with the armor".to_owned())
         );
     }
 
@@ -1227,5 +1425,84 @@ mod tests {
             single(&placed.actions).kind,
             ItemPolicyActionKind::PlaceInContainer
         );
+    }
+
+    #[test]
+    fn a_ground_container_opens_only_when_openable_and_a_locked_one_says_so() {
+        // Golden text: the retail client's own lines when a container on
+        // the ground is used: "The %s is locked" with the object's name,
+        // nothing for a creature, and "The object has no representation on
+        // the client." when the object is unknown.
+        let chest = ItemPolicyObject {
+            is_container: true,
+            item_type: ItemType::CONTAINER,
+            name: "Legendary Chest".into(),
+            ..obj(GROUND_CONTAINER)
+        };
+        assert_eq!(
+            decide_set_ground_object(Some(&chest)),
+            GroundObjectDecision::Refuse(Some("The Legendary Chest is locked".into()))
+        );
+        let unlocked = ItemPolicyObject {
+            flags: PublicWeenieFlags::OPENABLE,
+            ..chest.clone()
+        };
+        assert_eq!(
+            decide_set_ground_object(Some(&unlocked)),
+            GroundObjectDecision::Open
+        );
+        let creature = ItemPolicyObject {
+            item_type: ItemType::CREATURE,
+            ..chest
+        };
+        assert_eq!(
+            decide_set_ground_object(Some(&creature)),
+            GroundObjectDecision::Refuse(None)
+        );
+        assert_eq!(
+            decide_set_ground_object(None),
+            GroundObjectDecision::Refuse(Some(
+                "The object has no representation on the client.".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn placement_follows_the_server_unlocking_and_locking_a_chest() {
+        // Placement_followsTheServerUnlockingAndLockingAChest: an unlock
+        // arrives as the Locked bool going false; the chest's openable bit
+        // is what placement reads, so the bool has to move it, and locking
+        // it again takes it away.
+        use crate::items::{ClientObject, ClientObjectTable};
+        use crate::properties::PropertyBool;
+        let mut table = ClientObjectTable::new();
+        let mut events = Vec::new();
+        let mut chest = ClientObject::new(GROUND_CONTAINER);
+        chest.item_type = ItemType::CONTAINER;
+        chest.public_weenie_bitfield = Some(PublicWeenieFlags::STUCK);
+        table.add_or_update(chest, &mut events);
+        let place_into_chest = |table: &ClientObjectTable| {
+            let chest = ItemPolicyObject {
+                is_container: true,
+                flags: table
+                    .get(GROUND_CONTAINER)
+                    .and_then(|c| c.public_weenie_bitfield)
+                    .unwrap_or_default(),
+                ..obj(GROUND_CONTAINER)
+            };
+            decide_placement(&ItemPlacementPolicyInput {
+                ground_object_id: GROUND_CONTAINER,
+                ..place(owned_direct(), chest)
+            })
+            .return_value
+        };
+        assert!(!place_into_chest(&table));
+
+        let locked = PropertyBool::LOCKED.0;
+        assert!(table.update_bool_property(GROUND_CONTAINER, locked, false, &mut events));
+        assert!(place_into_chest(&table));
+
+        assert!(table.update_bool_property(GROUND_CONTAINER, locked, true, &mut events));
+        assert!(!place_into_chest(&table));
     }
 }

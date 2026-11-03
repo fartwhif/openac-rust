@@ -108,6 +108,7 @@ fn holtburg_statics_run_their_effects_and_every_particle_is_finite() {
             sky_active: true,
             camera: camera.position,
             source: &source,
+            particle_range: ac_vfx::EXTENDED_RANGE_MULTIPLIER,
         });
         // Every outdoor cell of the landblock was drawn.
         let view = effects.vfx_mut().visibility_mut();

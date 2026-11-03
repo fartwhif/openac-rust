@@ -263,3 +263,39 @@ fn a_row_handler_reaches_the_plugin_with_its_row() {
         [("SetOn".to_owned(), Some("2".to_owned()), Some(true))]
     );
 }
+
+/// Names a dock icon on a window, and on a typed window.
+#[derive(Default)]
+struct IconFiles;
+
+impl Plugin for IconFiles {
+    fn enable(&mut self, host: &mut Host<'_>, _: &StartInfo) -> Result<(), String> {
+        let plain = PanelSpec::new("plain", "Plain", "<panel/>").icon_file("icons/plain.png");
+        host.register_panel(&plain)?;
+        let typed = PanelSpec::new("typed", "Typed", "<panel/>")
+            .icon_file("icons/typed.png")
+            .bind_typed("Value", TypedBindingKind::OptionalBool);
+        host.register_panel(&typed)?;
+        host.register_panel(&PanelSpec::new("none", "None", "<panel/>"))?;
+        Ok(())
+    }
+}
+
+#[test]
+fn a_window_names_its_dock_icon_on_either_way_of_registering() {
+    let mut host = FakeHost::new("example.icons");
+    host.enable(&mut IconFiles).unwrap();
+    let files: Vec<(String, Option<String>)> = host
+        .ui
+        .panels()
+        .map(|p| (p.descriptor.title.clone(), p.descriptor.icon_file.clone()))
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("Plain".to_owned(), Some("icons/plain.png".to_owned())),
+            ("Typed".to_owned(), Some("icons/typed.png".to_owned())),
+            ("None".to_owned(), None),
+        ]
+    );
+}

@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use ac_core::spells::SpellMetadata;
 use ac_dat::DatCollection;
 use ac_dat::objects::{Palette, PixelFormat, RenderSurface, SkillTable, SpellComponentTable};
 use ac_dat::texture::DecodeOptions;
@@ -33,7 +34,7 @@ use ac_ui::font::DEFAULT_FONT_ID;
 use ac_ui::icons::IconComposer;
 use ac_ui::import::{ImportedLayout, LayoutSource, import};
 use ac_ui::panels::PanelOutput;
-use ac_ui::panels::appraisal::{AppraisalController, SpellExamineComponent};
+use ac_ui::panels::appraisal::{AppraisalController, AppraisalPage, SpellExamineComponent};
 use ac_ui::panels::character::{
     CharacterSheet, CharacterStatController, CharacterTab, ExperienceCurves, SheetSource,
 };
@@ -152,6 +153,7 @@ pub fn radar_scene(
             cell_id: position.cell_id,
             item_type: p.radar.item_type,
             pwd_bitfield: p.radar.public_weenie_bitfield,
+            monarch_id: p.radar.monarch_id,
         })
     });
     let objects = scene
@@ -167,6 +169,7 @@ pub fn radar_scene(
                 item_type: o.radar.item_type,
                 pwd_bitfield: o.radar.public_weenie_bitfield,
                 color_override: o.radar.radar_blip_color,
+                monarch_id: o.radar.monarch_id,
                 relationship: fellowship_relationship(fellowship, o.guid),
             })
         })
@@ -509,6 +512,9 @@ pub struct WindowUi {
     /// Each spell component's weenie class (the component id map
     /// 0x27000002): the components page knows a component by its class.
     pub(super) component_classes: std::collections::HashMap<u32, u32>,
+    /// The component check over the component classes and each school's
+    /// focus: which formula an examined spell shows.
+    pub(super) spell_components: ac_core::spells::SpellComponentRequirements,
     pub(super) panels: MainPanels,
     pub(super) dialogs: DialogQueue<DialogAction>,
     pub(super) dialog_layout: Option<u32>,
@@ -521,10 +527,14 @@ pub struct WindowUi {
     pub(super) social_in_world: Option<bool>,
     /// The selection the social panel was last fed.
     pub(super) fed_social_selection: Option<Option<u32>>,
-    /// The client settings the options window edits (the window's copy).
-    pub(super) settings: PlayerSettings,
-    /// Sections the options window changed, not yet taken by the window.
-    pub(super) settings_changes: Vec<(ac_ui::panels::options::Section, bool)>,
+    /// The client settings in force in this window: the one copy every
+    /// editor here changes, only through [`WindowUi::edit_settings`] (or
+    /// [`WindowUi::replace_settings`] for a change made outside the
+    /// window), so the options window's copy always follows it.
+    settings: PlayerSettings,
+    /// Sections changed, not yet taken by the window, each with whether to
+    /// save it now.
+    settings_changes: Vec<(ac_ui::panels::options::Section, bool)>,
     /// The pre-game screens (`super::pregame`).
     pub(super) pregame: Option<ac_ui::pregame::PreGameScreens>,
     /// The chat entry, set aside while a pre-game screen shows.
@@ -607,6 +617,7 @@ impl WindowUi {
             skill_table: None,
             components: None,
             component_classes: std::collections::HashMap::new(),
+            spell_components: ac_core::spells::SpellComponentRequirements::default(),
             panels: MainPanels::new(),
             dialogs: DialogQueue::default(),
             dialog_layout: None,
@@ -663,6 +674,62 @@ impl WindowUi {
             return Err(ui.notices.join("; "));
         }
         Ok(ui)
+    }
+
+    /// The client settings in force in this window.
+    #[must_use]
+    pub fn settings(&self) -> &PlayerSettings {
+        &self.settings
+    }
+
+    /// The sections changed since the last call, each with whether to save
+    /// it now. The window applies them; its host saves them.
+    pub fn take_settings_changes(&mut self) -> Vec<(ac_ui::panels::options::Section, bool)> {
+        std::mem::take(&mut self.settings_changes)
+    }
+
+    /// Change the client settings: `edit` changes only the fields its
+    /// editor owns, on the settings as they stand now, and `section` is
+    /// recorded for the window to apply (and to save when `persist`).
+    ///
+    /// The options window keeps a copy of the settings to show and edit; it
+    /// takes every change at once, so its own next change starts from the
+    /// settings in force and cannot put another editor's older values
+    /// back (the dock's place, the theme, a console's display change).
+    pub(super) fn edit_settings(
+        &mut self,
+        section: ac_ui::panels::options::Section,
+        persist: bool,
+        edit: impl FnOnce(&mut PlayerSettings),
+    ) {
+        edit(&mut self.settings);
+        self.show_settings_in_options();
+        if !self.settings_changes.contains(&(section, persist)) {
+            self.settings_changes.push((section, persist));
+        }
+    }
+
+    /// The settings as changed outside this window (a console command, the
+    /// mixer): they replace this window's, and the options window's copy
+    /// follows. Nothing is recorded: the change's owner applied and saved
+    /// it.
+    pub(super) fn replace_settings(&mut self, settings: &PlayerSettings) {
+        self.settings.clone_from(settings);
+        self.show_settings_in_options();
+    }
+
+    /// The options window's copy of the settings follows this window's.
+    fn show_settings_in_options(&mut self) {
+        let settings = self.settings.clone();
+        self.host
+            .with_controller::<ac_ui::panels::options::OptionsWindowController, _>(
+                super::options::OPTIONS_WINDOW,
+                |c, _| {
+                    let mut live = c.live().clone();
+                    live.settings = settings;
+                    c.set_live(live);
+                },
+            );
     }
 
     pub(super) fn import(&mut self, layout_id: u32) -> Result<ImportedLayout, String> {
@@ -956,6 +1023,7 @@ impl WindowUi {
         self.update_book(dirty);
         self.update_map_house(scene);
         self.update_journal_pages(dirty, scene);
+        self.refresh_examined_spell(dirty);
         self.show_appraisals();
         self.follow_confirmation();
         let link = self.status.link.unwrap_or(ac_runtime::session::LinkStatus {
@@ -1219,6 +1287,12 @@ impl WindowUi {
         // session, which holds those and lets go of the rest.
         self.report_drawn_file_icons();
         list
+    }
+
+    /// How many framebuffer pixels one UI unit covers.
+    pub fn set_pixels_per_unit(&mut self, pixels: f32) {
+        self.host.root.set_pixels_per_unit(pixels);
+        self.follow_display_density(pixels);
     }
 
     /// The textures the UI names: dat surfaces and composed icons.
@@ -1577,6 +1651,68 @@ impl WindowUi {
         }
     }
 
+    /// An examined spell's components as the player would cast it, each
+    /// with its name, icon and whether the player carries one.
+    fn spell_examine_components(&mut self, spell: &SpellMetadata) -> Vec<SpellExamineComponent> {
+        let mut components = Vec::new();
+        let Some(table) = &self.components else {
+            return components;
+        };
+        let world = ac_runtime::gameplay::magic::TableComponentWorld {
+            objects: &self.facts.objects,
+            player: self.facts.state.player,
+        };
+        let formula = ac_runtime::gameplay::magic::examine_components(
+            &self.spell_components,
+            &world,
+            &self.facts.state.account,
+            spell,
+        );
+        for (id, owned) in formula {
+            // A component the table does not describe is left out.
+            let Some((_, base)) = table.components.iter().find(|(c, _)| *c == id) else {
+                continue;
+            };
+            components.push(SpellExamineComponent {
+                name: base.name.clone(),
+                icon: ac_ui::icons::IconSource::component_icon(&mut self.icons, base.icon),
+                owned,
+            });
+        }
+        components
+    }
+
+    /// The player's items changed while the examination window shows a
+    /// spell: its components again, as they stand now.
+    fn refresh_examined_spell(&mut self, dirty: Dirty) {
+        if !dirty.items {
+            return;
+        }
+        let examined = self
+            .host
+            .with_controller::<AppraisalController, _>(EXAMINATION_WINDOW, |c, _| {
+                (c.page() == AppraisalPage::Spell).then(|| c.spell())
+            })
+            .flatten()
+            .filter(|&id| id != 0);
+        let Some(spell) = examined.and_then(|id| {
+            self.facts
+                .numbers()
+                .and_then(|n| n.spellbook())
+                .and_then(|b| b.try_get_metadata(id))
+                .cloned()
+        }) else {
+            return;
+        };
+        let components = self.spell_examine_components(&spell);
+        let Self { host, content, .. } = self;
+        let mut cells =
+            ac_ui::panels::DatRowTemplates::new(&*content, content.font(DEFAULT_FONT_ID));
+        host.with_controller::<AppraisalController, _>(EXAMINATION_WINDOW, |c, ui| {
+            c.refresh_spell_components(ui, &spell, &components, &mut cells);
+        });
+    }
+
     /// A spell examined from the spellbook or a spell bar: the examination
     /// window's spell page, with no server request.
     fn examine_spell(&mut self, spell_id: u32) {
@@ -1592,23 +1728,13 @@ impl WindowUi {
         };
         let magic_skill = magic_skill(numbers, &spell.school);
         let icon = ac_ui::icons::IconSource::spell_icon(&mut self.icons, spell_id);
-        let mut components = Vec::new();
-        if let Some(table) = &self.components {
-            for &id in spell.formula_components.iter().filter(|&&c| c != 0) {
-                let base = table.components.iter().find(|(c, _)| *c == id);
-                components.push(SpellExamineComponent {
-                    name: base.map_or_else(String::new, |(_, b)| b.name.clone()),
-                    icon: base.and_then(|(_, b)| {
-                        ac_ui::icons::IconSource::component_icon(&mut self.icons, b.icon)
-                    }),
-                    owned: false,
-                });
-            }
-        }
-        let shown = self
-            .host
+        let components = self.spell_examine_components(&spell);
+        let Self { host, content, .. } = self;
+        let mut cells =
+            ac_ui::panels::DatRowTemplates::new(&*content, content.font(DEFAULT_FONT_ID));
+        let shown = host
             .with_controller::<AppraisalController, _>(EXAMINATION_WINDOW, |c, ui| {
-                c.examine_spell(ui, &spell, icon, magic_skill, &components);
+                c.examine_spell(ui, &spell, icon, magic_skill, &components, &mut cells);
             })
             .is_some();
         if shown {
@@ -1911,6 +2037,72 @@ mod tests {
             fellowship_relationship(None, 0x5000_0001),
             RelationshipTraits::default()
         );
+    }
+
+    #[test]
+    fn the_radar_scene_squares_the_players_allegiance() {
+        // The session's monarchs reach the radar: an object that shares
+        // the player's monarch is drawn as a box; one with another monarch
+        // keeps the plus.
+        use ac_runtime::session::PresentationEvent;
+        use ac_runtime::world::{ObjectKey, ObjectView, RadarFacts, WorldSnapshot};
+        const MONARCH: u32 = 0x5000_0777;
+        let view = |local_id, guid, y, monarch_id| ObjectView {
+            key: ObjectKey {
+                local_id,
+                incarnation: 1,
+            },
+            guid,
+            name: None,
+            setup_id: None,
+            position: Some(Position {
+                cell_id: 0xA9B4_0031,
+                origin: Vector3 {
+                    x: 100.0,
+                    y,
+                    z: 0.0,
+                },
+                orientation: Quaternion::IDENTITY,
+            }),
+            step_blend: None,
+            parent: None,
+            placement: None,
+            rest_placement: 0,
+            scale: None,
+            translucency: None,
+            state: 0,
+            velocity: None,
+            model: ac_proto::ModelData::default(),
+            motion_table_id: None,
+            sound_table_id: None,
+            radar: RadarFacts {
+                public_weenie_bitfield: 0x8,
+                radar_behavior: Some(4),
+                monarch_id,
+                ..RadarFacts::default()
+            },
+            motion: None,
+            effects: ac_runtime::world::EffectFacts::default(),
+        };
+        let mut scene = Scene::default();
+        scene.apply(PresentationEvent::Snapshot(WorldSnapshot {
+            player_guid: Some(0x5000_0001),
+            objects: vec![
+                view(1, 0x5000_0001, 100.0, MONARCH),
+                view(2, 0x5000_0002, 110.0, MONARCH),
+                view(3, 0x5000_0003, 90.0, 0x5000_0778),
+            ],
+        }));
+        let snapshot = ac_ui::panels::radar::build_snapshot(&radar_scene(&scene, None, None));
+        let shape = |guid| {
+            snapshot
+                .blips
+                .iter()
+                .find(|b| b.object_id == guid)
+                .map(|b| b.shape)
+        };
+        assert_eq!(shape(0x5000_0002), Some(ac_ui::radar::BlipShape::Box));
+        assert_eq!(shape(0x5000_0003), Some(ac_ui::radar::BlipShape::Plus));
     }
 
     #[test]

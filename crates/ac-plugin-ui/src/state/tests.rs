@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::model::{
-    ActionValue, CanvasAnchor, Color8, PaintRect, PointerEvent, PointerKind, canvas_origin,
+    ActionValue, CanvasAnchor, CanvasPlace, Color8, PaintRect, PointerEvent, PointerKind,
+    canvas_origin,
 };
 use crate::value::BindingKind;
 use crate::view::PluginUiView;
@@ -517,24 +518,135 @@ fn pointer_input_reaches_a_listening_canvas_that_opted_in() {
         wheel_delta: 0,
     };
     // Nobody listens yet: click-through.
-    ui.input(UiInput::Pointer { canvas: map, event });
+    ui.input(UiInput::Pointer {
+        canvas: map,
+        event,
+        place: None,
+    });
     assert!(ui.take_events().is_empty());
     assert!(ui.listen_canvas("edwards.tank", map, true));
     assert!(ui.listen_canvas("edwards.tank", quiet, true));
-    ui.input(UiInput::Pointer { canvas: map, event });
+    ui.input(UiInput::Pointer {
+        canvas: map,
+        event,
+        place: None,
+    });
     ui.input(UiInput::Pointer {
         canvas: quiet,
         event,
+        place: None,
     });
     assert_eq!(
         ui.take_events(),
         vec![(
             "edwards.tank".to_owned(),
-            UiEvent::Pointer { canvas: map, event }
+            UiEvent::Pointer {
+                canvas: map,
+                event,
+                place: None,
+            }
         )]
     );
     assert!(ui.release_canvas_pointer("edwards.tank", map));
     assert_eq!(ui.canvas("edwards.tank", map).unwrap().release_count, 1);
+}
+
+#[test]
+fn a_held_pointer_is_measured_from_where_the_plugin_last_put_the_canvas() {
+    let mut ui = PluginUi::new();
+    let owner = UiOwner::new("edwards.tank", "Tank");
+    let hud = ui
+        .register_canvas(
+            &owner,
+            CanvasDescriptor {
+                canvas_id: "hud".into(),
+                width: 100,
+                height: 50,
+                anchor: CanvasAnchor::TopRight,
+                offset: (-20.0, 30.0),
+                start_visible: true,
+                accepts_pointer_input: true,
+            },
+        )
+        .unwrap();
+    // The window has it at (680, 30) on an 800x600 layer.
+    let place = CanvasPlace {
+        origin: (680.0, 30.0),
+        layer: (800.0, 600.0),
+    };
+    let heard = |ui: &PluginUi, kind| {
+        let event = PointerEvent {
+            kind,
+            x: 15.0,
+            y: 25.0,
+            button: 1,
+            modifiers: 0,
+            wheel_delta: 0,
+        };
+        let event = ui.pointer_as_placed_now(UiEvent::Pointer {
+            canvas: hud,
+            event,
+            place: Some(place),
+        });
+        let UiEvent::Pointer { event, .. } = event else {
+            panic!("still a pointer event");
+        };
+        (event.x, event.y)
+    };
+    // Nothing moved: as the window measured it.
+    assert_eq!(heard(&ui, PointerKind::Move), (15.0, 25.0));
+    // The plugin moved it, and re-anchored it, as a drag does; the window has
+    // not caught up.
+    assert!(ui.place_canvas(
+        "edwards.tank",
+        hud,
+        None,
+        Some(CanvasAnchor::TopLeft),
+        Some((690.0, 40.0)),
+    ));
+    assert_eq!(heard(&ui, PointerKind::Move), (5.0, 15.0));
+    assert_eq!(heard(&ui, PointerKind::Up), (5.0, 15.0));
+    // A press stays as the player saw it.
+    assert_eq!(heard(&ui, PointerKind::Down), (15.0, 25.0));
+}
+
+#[test]
+fn a_held_pointer_whose_place_is_not_known_is_heard_as_sent() {
+    // Input that no window measured (a test, a script) carries no place: a
+    // canvas anchored away from the top-left is not moved by a made-up
+    // zero-sized layer.
+    let mut ui = PluginUi::new();
+    let owner = UiOwner::new("edwards.tank", "Tank");
+    let hud = ui
+        .register_canvas(
+            &owner,
+            CanvasDescriptor {
+                canvas_id: "hud".into(),
+                width: 100,
+                height: 50,
+                anchor: CanvasAnchor::BottomRight,
+                offset: (-20.0, -30.0),
+                start_visible: true,
+                accepts_pointer_input: true,
+            },
+        )
+        .unwrap();
+    for kind in [PointerKind::Down, PointerKind::Move, PointerKind::Up] {
+        let event = PointerEvent {
+            kind,
+            x: 15.0,
+            y: 25.0,
+            button: 1,
+            modifiers: 2,
+            wheel_delta: 0,
+        };
+        let sent = UiEvent::Pointer {
+            canvas: hud,
+            event,
+            place: None,
+        };
+        assert_eq!(ui.pointer_as_placed_now(sent.clone()), sent, "{kind:?}");
+    }
 }
 
 #[test]
@@ -632,6 +744,447 @@ fn labels_are_detached_validated_capped_and_per_owner() {
     assert_eq!(only[0].text, "one");
     ui.release("first");
     assert!(ui.merged_labels().is_empty());
+}
+
+#[test]
+fn triangle_layers_belong_to_their_plugin_and_go_with_it() {
+    let mut ui = PluginUi::new();
+    let corner = crate::model::MapPoint::default();
+    let triangle = WorldTriangle {
+        corners: [corner; 3],
+        colors_rgba: [0xFF00_0080; 3],
+    };
+    let a = ui.create_triangle_layer("edwards.tank");
+    let b = ui.create_triangle_layer("another.plugin");
+    assert!(ui.set_triangles("edwards.tank", a, vec![triangle; 3]));
+    assert!(ui.set_triangles("another.plugin", b, vec![triangle]));
+    assert!(!ui.set_triangles("another.plugin", a, vec![]));
+    assert_eq!(ui.merged_triangles().len(), 4);
+    assert!(matches!(
+        ui.take_changes().last(),
+        Some(UiChange::Triangles(t)) if t.len() == 4
+    ));
+    assert!(ui.set_triangles("edwards.tank", a, vec![triangle; MAXIMUM_TRIANGLES]));
+    assert_eq!(ui.merged_triangles().len(), MAXIMUM_TRIANGLES + 1);
+    assert!(
+        ui.snapshot()
+            .iter()
+            .any(|c| matches!(c, UiChange::Triangles(t) if t.len() == MAXIMUM_TRIANGLES + 1))
+    );
+    ui.release("edwards.tank");
+    assert_eq!(ui.merged_triangles().len(), 1);
+    assert!(!ui.remove_triangle_layer("edwards.tank", b));
+    assert!(ui.remove_triangle_layer("another.plugin", b));
+    assert!(ui.merged_triangles().is_empty());
+}
+
+/// A plugin holds at most `MAXIMUM_TRIANGLES` across its layers, as it
+/// does icons and shapes: a set that would take it over is refused and the
+/// layer keeps what it had, so more layers buy no more triangles. Other
+/// plugins count apart.
+#[test]
+fn a_plugin_holds_a_limited_number_of_triangles_across_its_layers() {
+    let mut ui = PluginUi::new();
+    let corner = crate::model::MapPoint::default();
+    let triangle = WorldTriangle {
+        corners: [corner; 3],
+        colors_rgba: [0xFF00_0080; 3],
+    };
+    let half = MAXIMUM_TRIANGLES / 2;
+    let a = ui.create_triangle_layer("edwards.tank");
+    let b = ui.create_triangle_layer("edwards.tank");
+    let c = ui.create_triangle_layer("edwards.tank");
+    let other = ui.create_triangle_layer("another.plugin");
+    assert!(ui.set_triangles("edwards.tank", a, vec![triangle; half]));
+    assert!(ui.set_triangles("edwards.tank", b, vec![triangle; half]));
+    drop(ui.take_changes());
+    assert!(!ui.set_triangles("edwards.tank", c, vec![triangle]));
+    assert!(ui.take_changes().is_empty());
+    assert_eq!(ui.merged_triangles().len(), MAXIMUM_TRIANGLES);
+    // Replacing a layer counts its new set, not the one it replaces.
+    assert!(ui.set_triangles("edwards.tank", b, vec![triangle; half - 1]));
+    assert!(ui.set_triangles("edwards.tank", c, vec![triangle]));
+    assert!(!ui.set_triangles("edwards.tank", a, vec![triangle; half + 1]));
+    assert_eq!(ui.merged_triangles().len(), MAXIMUM_TRIANGLES);
+    // One set over the limit is refused whole.
+    assert!(!ui.set_triangles(
+        "another.plugin",
+        other,
+        vec![triangle; MAXIMUM_TRIANGLES + 1]
+    ));
+    assert!(ui.set_triangles("another.plugin", other, vec![triangle; MAXIMUM_TRIANGLES]));
+    assert_eq!(ui.merged_triangles().len(), 2 * MAXIMUM_TRIANGLES);
+}
+
+fn icon(anchor: crate::model::MarkerAnchor) -> crate::model::WorldIcon {
+    crate::model::WorldIcon {
+        anchor,
+        image: 7,
+        size: 24.0,
+        tint_rgba: 0xFFFF_FFFF,
+        border_rgba: None,
+        max_range: 60.0,
+        hidden_by_world: false,
+    }
+}
+
+#[test]
+fn marker_layers_merge_by_plugin_and_go_with_it() {
+    use crate::model::MarkerAnchor;
+    let mut ui = PluginUi::new();
+    let later = ui.create_marker_layer("z.plugin");
+    let first = ui.create_marker_layer("a.plugin");
+    let second = ui.create_marker_layer("a.plugin");
+    assert!(ui.set_icons("z.plugin", later, vec![icon(MarkerAnchor::Object(3))]));
+    assert!(ui.set_icons("a.plugin", second, vec![icon(MarkerAnchor::Object(2))]));
+    assert!(ui.set_icons("a.plugin", first, vec![icon(MarkerAnchor::Object(1))]));
+    assert!(!ui.set_icons("z.plugin", first, vec![]));
+    let merged = ui.merged_icons();
+    let order: Vec<_> = merged.iter().map(|e| (&*e.owner, e.icon.anchor)).collect();
+    assert_eq!(
+        order,
+        [
+            ("a.plugin", MarkerAnchor::Object(1)),
+            ("a.plugin", MarkerAnchor::Object(2)),
+            ("z.plugin", MarkerAnchor::Object(3)),
+        ]
+    );
+    assert!(matches!(
+        ui.take_changes().last(),
+        Some(UiChange::Icons(i)) if i.len() == 3
+    ));
+    assert!(
+        ui.snapshot()
+            .iter()
+            .any(|c| matches!(c, UiChange::Icons(i) if i.len() == 3))
+    );
+    assert!(ui.remove_marker_layer("a.plugin", second));
+    assert_eq!(ui.merged_icons().len(), 2);
+    ui.release("a.plugin");
+    assert_eq!(ui.merged_icons().len(), 1);
+    assert!(!ui.remove_marker_layer("a.plugin", first));
+}
+
+#[test]
+fn unusable_icons_are_dropped_and_sizes_are_clamped() {
+    use crate::model::{MapPoint, MarkerAnchor};
+    let mut ui = PluginUi::new();
+    let layer = ui.create_marker_layer("edwards.tank");
+    let good = icon(MarkerAnchor::Object(5));
+    let bad_point = MapPoint {
+        east_west: f64::NAN,
+        ..MapPoint::default()
+    };
+    let given = vec![
+        good,
+        icon(MarkerAnchor::None),
+        icon(MarkerAnchor::Object(0)),
+        icon(MarkerAnchor::Position {
+            point: bad_point,
+            is_outdoor: true,
+        }),
+        crate::model::WorldIcon { image: 0, ..good },
+        crate::model::WorldIcon {
+            size: f32::NAN,
+            ..good
+        },
+        crate::model::WorldIcon {
+            max_range: 0.0,
+            ..good
+        },
+        crate::model::WorldIcon {
+            max_range: f32::INFINITY,
+            ..good
+        },
+        crate::model::WorldIcon { size: 1.0, ..good },
+        crate::model::WorldIcon {
+            size: 500.0,
+            ..good
+        },
+    ];
+    assert!(ui.set_icons("edwards.tank", layer, given));
+    let sizes: Vec<f32> = ui.merged_icons().iter().map(|e| e.icon.size).collect();
+    assert_eq!(sizes, [24.0, MINIMUM_ICON_SIZE, MAXIMUM_ICON_SIZE]);
+}
+
+#[test]
+fn the_icon_cap_counts_a_plugins_other_layers_and_only_its_own() {
+    use crate::model::MarkerAnchor;
+    let mut ui = PluginUi::new();
+    let one = icon(MarkerAnchor::Object(1));
+    let a = ui.create_marker_layer("edwards.tank");
+    let b = ui.create_marker_layer("edwards.tank");
+    let other = ui.create_marker_layer("another.plugin");
+    assert!(ui.set_icons("edwards.tank", a, vec![one; MAXIMUM_ICONS - 1]));
+    assert!(ui.set_icons("edwards.tank", b, vec![one]));
+    assert!(!ui.set_icons("edwards.tank", b, vec![one; 2]));
+    assert_eq!(ui.merged_icons().len(), MAXIMUM_ICONS);
+    assert!(ui.set_icons("another.plugin", other, vec![one; MAXIMUM_ICONS]));
+    // Replacing a layer counts its new set, not its old one.
+    assert!(ui.set_icons("edwards.tank", a, vec![one; MAXIMUM_ICONS - 1]));
+}
+
+fn ring(radius: f32, width: f32) -> crate::model::GroundShape {
+    crate::model::GroundShape {
+        anchor: crate::model::MarkerAnchor::Object(5),
+        kind: crate::model::GroundShapeKind::Ring,
+        radius,
+        width,
+        start_degrees: 40.0,
+        sweep_degrees: 90.0,
+        filled: true,
+        faces_object: true,
+        color_rgba: 0xFF00_0080,
+    }
+}
+
+#[test]
+fn a_ring_or_disc_is_a_full_turn_and_unusable_shapes_are_dropped() {
+    use crate::model::{GroundShape, GroundShapeKind, MarkerAnchor};
+    let mut ui = PluginUi::new();
+    let layer = ui.create_marker_layer("edwards.tank");
+    let good = ring(2.0, 0.5);
+    let disc = GroundShape {
+        kind: GroundShapeKind::Disc,
+        width: f32::NAN,
+        ..good
+    };
+    let arc = GroundShape {
+        kind: GroundShapeKind::Arc,
+        filled: false,
+        ..good
+    };
+    let wedge = GroundShape {
+        kind: GroundShapeKind::Arc,
+        width: f32::NAN,
+        ..good
+    };
+    let given = vec![
+        good,
+        disc,
+        arc,
+        wedge,
+        GroundShape {
+            kind: GroundShapeKind::None,
+            ..good
+        },
+        GroundShape {
+            anchor: MarkerAnchor::None,
+            ..good
+        },
+        ring(0.05, 0.01),
+        ring(101.0, 1.0),
+        ring(f32::NAN, 1.0),
+        ring(2.0, 0.0),
+        ring(2.0, 2.5),
+        GroundShape {
+            sweep_degrees: 0.0,
+            ..arc
+        },
+        GroundShape {
+            sweep_degrees: 361.0,
+            ..arc
+        },
+        GroundShape {
+            start_degrees: f32::NAN,
+            ..arc
+        },
+        GroundShape { width: 0.0, ..arc },
+    ];
+    assert!(ui.set_shapes("edwards.tank", layer, given));
+    let shapes = ui.merged_shapes();
+    assert_eq!(shapes.len(), 4);
+    let (r, d, a, w) = (shapes[0], shapes[1], shapes[2], shapes[3]);
+    assert_eq!((r.start_degrees, r.sweep_degrees), (0.0, 360.0));
+    assert!(!r.filled && !r.faces_object);
+    assert_eq!(
+        (d.width, d.start_degrees, d.sweep_degrees),
+        (0.0, 0.0, 360.0)
+    );
+    assert!(d.filled && !d.faces_object);
+    assert_eq!(
+        (a.start_degrees, a.sweep_degrees, a.width),
+        (40.0, 90.0, 0.5)
+    );
+    assert!(!a.filled && a.faces_object);
+    assert_eq!(w.width, 0.0);
+    assert!(w.filled);
+}
+
+#[test]
+fn a_shapes_limits_themselves_are_accepted() {
+    use crate::model::{GroundShape, GroundShapeKind};
+    let mut ui = PluginUi::new();
+    let layer = ui.create_marker_layer("edwards.tank");
+    let arc = GroundShape {
+        kind: GroundShapeKind::Arc,
+        filled: false,
+        sweep_degrees: 360.0,
+        ..ring(MAXIMUM_SHAPE_RADIUS, MAXIMUM_SHAPE_RADIUS)
+    };
+    let given = vec![
+        arc,
+        ring(MINIMUM_SHAPE_RADIUS, MINIMUM_SHAPE_RADIUS),
+        ring(MAXIMUM_SHAPE_RADIUS, MAXIMUM_SHAPE_RADIUS),
+    ];
+    assert!(ui.set_shapes("edwards.tank", layer, given));
+    assert_eq!(ui.merged_shapes().len(), 3);
+}
+
+#[test]
+fn setting_one_kind_of_marker_leaves_the_other_alone() {
+    use crate::model::MarkerAnchor;
+    let mut ui = PluginUi::new();
+    let layer = ui.create_marker_layer("edwards.tank");
+    assert!(ui.set_icons("edwards.tank", layer, vec![icon(MarkerAnchor::Object(5))]));
+    assert!(ui.set_shapes("edwards.tank", layer, vec![ring(2.0, 0.5)]));
+    assert!(ui.set_shapes("edwards.tank", layer, vec![]));
+    assert_eq!(ui.merged_icons().len(), 1);
+    assert!(ui.set_shapes("edwards.tank", layer, vec![ring(2.0, 0.5)]));
+    assert!(ui.set_icons("edwards.tank", layer, vec![]));
+    assert_eq!(ui.merged_shapes().len(), 1);
+}
+
+#[test]
+fn the_shape_cap_counts_a_plugins_other_layers_apart_from_its_icons() {
+    use crate::model::MarkerAnchor;
+    let mut ui = PluginUi::new();
+    let a = ui.create_marker_layer("edwards.tank");
+    let b = ui.create_marker_layer("edwards.tank");
+    let one = ring(2.0, 0.5);
+    assert!(ui.set_icons(
+        "edwards.tank",
+        a,
+        vec![icon(MarkerAnchor::Object(1)); MAXIMUM_ICONS]
+    ));
+    assert!(ui.set_shapes("edwards.tank", a, vec![one; MAXIMUM_SHAPES - 1]));
+    assert!(ui.set_shapes("edwards.tank", b, vec![one]));
+    assert!(!ui.set_shapes("edwards.tank", b, vec![one; 2]));
+    assert_eq!(ui.merged_shapes().len(), MAXIMUM_SHAPES);
+    assert!(!ui.set_shapes("another.plugin", b, vec![one]));
+    assert!(
+        ui.snapshot()
+            .iter()
+            .any(|c| matches!(c, UiChange::Shapes(s) if s.len() == MAXIMUM_SHAPES))
+    );
+    ui.clear_object_markers();
+    assert!(ui.merged_shapes().is_empty());
+    assert!(ui.set_shapes("edwards.tank", a, vec![one]));
+    assert!(ui.remove_marker_layer("edwards.tank", a));
+    assert!(ui.merged_shapes().is_empty());
+}
+
+#[test]
+fn clearing_markers_empties_the_layers_and_they_stay_usable() {
+    use crate::model::MarkerAnchor;
+    let mut ui = PluginUi::new();
+    let layer = ui.create_marker_layer("edwards.tank");
+    assert!(ui.set_icons("edwards.tank", layer, vec![icon(MarkerAnchor::Object(5))]));
+    drop(ui.take_changes());
+    ui.clear_object_markers();
+    assert!(ui.merged_icons().is_empty());
+    assert!(matches!(
+        ui.take_changes().as_slice(),
+        [UiChange::Icons(i), UiChange::Shapes(s)] if i.is_empty() && s.is_empty()
+    ));
+    ui.clear_object_markers();
+    assert!(ui.take_changes().is_empty());
+    assert!(ui.set_icons("edwards.tank", layer, vec![icon(MarkerAnchor::Object(5))]));
+    assert_eq!(ui.merged_icons().len(), 1);
+}
+
+/// Leaving the world takes down what hangs on an object, whose id means
+/// nothing on the next stay, and keeps what sits at a fixed position, which
+/// is the same place in the world after a relog: markers at positions stay,
+/// as lines and triangles do.
+#[test]
+fn clearing_object_markers_keeps_markers_lines_and_triangles_at_positions() {
+    use crate::model::{MapPoint, MarkerAnchor};
+    let mut ui = PluginUi::new();
+    let here = MarkerAnchor::Position {
+        point: MapPoint {
+            east_west: 40.0,
+            north_south: 12.5,
+            elevation: 0.3,
+        },
+        is_outdoor: true,
+    };
+    let layer = ui.create_marker_layer("edwards.tank");
+    assert!(ui.set_icons(
+        "edwards.tank",
+        layer,
+        vec![icon(MarkerAnchor::Object(5)), icon(here)]
+    ));
+    let on_object = ring(2.0, 0.5);
+    let at_position = crate::model::GroundShape {
+        anchor: here,
+        ..on_object
+    };
+    assert!(ui.set_shapes("edwards.tank", layer, vec![on_object, at_position]));
+    let lines = ui.create_line_layer("edwards.tank");
+    let line = WorldLine {
+        start: MapPoint::default(),
+        end: MapPoint::default(),
+        color_rgb: 0xFF0000,
+        follow_terrain: false,
+        width_metres: 0.25,
+    };
+    assert!(ui.set_lines("edwards.tank", lines, vec![line]));
+    let triangles = ui.create_triangle_layer("edwards.tank");
+    let triangle = WorldTriangle {
+        corners: [MapPoint::default(); 3],
+        colors_rgba: [0xFF00_0080; 3],
+    };
+    assert!(ui.set_triangles("edwards.tank", triangles, vec![triangle]));
+    drop(ui.take_changes());
+
+    ui.clear_object_markers();
+    let icons = ui.merged_icons();
+    assert_eq!(icons.len(), 1);
+    assert_eq!(icons[0].icon.anchor, here);
+    let shapes = ui.merged_shapes();
+    assert_eq!(shapes.len(), 1);
+    assert_eq!(shapes[0].anchor, here);
+    assert_eq!(ui.merged_lines().len(), 1);
+    assert_eq!(ui.merged_triangles().len(), 1);
+    assert!(matches!(
+        ui.take_changes().as_slice(),
+        [UiChange::Icons(i), UiChange::Shapes(s)] if i.len() == 1 && s.len() == 1
+    ));
+    // Nothing on an object is left, so a second clear changes nothing.
+    ui.clear_object_markers();
+    assert!(ui.take_changes().is_empty());
+}
+
+/// Leaving the world takes every plugin's labels down; the plugins stay and
+/// show labels again on the next stay.
+#[test]
+fn clearing_labels_takes_every_plugins_labels_down_and_leaves_lines() {
+    let mut ui = PluginUi::new();
+    let line = WorldLine {
+        start: crate::model::MapPoint::default(),
+        end: crate::model::MapPoint::default(),
+        color_rgb: 0xFF0000,
+        follow_terrain: false,
+        width_metres: 0.25,
+    };
+    let layer = ui.create_line_layer("edwards.tank");
+    assert!(ui.set_lines("edwards.tank", layer, vec![line]));
+    ui.show_labels("edwards.tank", vec![label(5)]);
+    ui.show_labels("another.plugin", vec![label(6)]);
+    drop(ui.take_changes());
+
+    ui.clear_labels();
+    assert!(ui.merged_labels().is_empty());
+    assert_eq!(ui.merged_lines().len(), 1);
+    let changes = ui.take_changes();
+    assert!(matches!(changes.as_slice(), [UiChange::Labels(l)] if l.is_empty()));
+
+    ui.clear_labels();
+    assert!(ui.take_changes().is_empty());
+
+    assert!(ui.show_labels("edwards.tank", vec![label(7)]));
+    assert_eq!(ui.merged_labels().len(), 1);
 }
 
 #[test]
@@ -934,7 +1487,7 @@ fn the_theme_is_classic_until_a_window_tells_and_outlives_the_window() {
 
 #[test]
 fn a_plugins_file_icon_rides_with_its_windows_and_goes_with_it() {
-    // OpenAC RetailUiRuntime.ResolvePluginFileIcon: the shelf button of
+    // OpenAC RetailUiRuntime.ResolvePluginFileIcon: the dock slot of
     // every window a plugin registers gets the plugin's icon.png; another
     // plugin's windows do not, and an unloaded plugin's icon is forgotten.
     let mut ui = PluginUi::new();

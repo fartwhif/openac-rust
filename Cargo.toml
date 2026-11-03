@@ -5,7 +5,7 @@ exclude = ["vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.7"
+version = "0.1.10"
 edition = "2024"
 rust-version = "1.95"
 publish = false
@@ -48,8 +48,11 @@ ctrlc = { version = "3.5", features = ["termination"] }
 # rendering. Pure Rust, no build script.
 glam = { version = "0.34.1", default-features = false, features = ["std"] }
 # Windowing and GPU (ac-render). Features are chosen so nothing in the graph compiles C or C++;
-# keep it that way when changing them.
-winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle"] }
+# keep it that way when changing them. On a Wayland desktop that leaves the title bar to the
+# program (GNOME), `wayland-csd-adwaita` draws it with the title's text, rasterised by the
+# pure-Rust `ab_glyph` in the desktop's font (found by running `fc-match`; nothing is linked) or
+# in the Cantarell font the decorations bundle (SIL OFL 1.1, see NOTICE.md).
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen", "wayland-csd-adwaita"] }
 # Keeping the screen awake while fullscreen on Linux (ac-render): the Wayland idle-inhibit protocol
 # on the window's own connection, and the X11 screen saver through the Xlib loader. All three are
 # winit's own crates, already in the graph with these features; nothing is linked (libwayland and
@@ -122,13 +125,13 @@ wasmtime = { version = "=48.0.5", default-features = false, features = ["runtime
 # wasm32-unknown-unknown. Its backtracking step limit stands in for .NET's match timeout.
 # These are its default features, spelled out.
 fancy-regex = { version = "0.19.2", default-features = false, features = ["std", "unicode", "perf", "variable-lookbehinds"] }
-# The bundled Noto Sans of the modern plugin themes (ac-ui): fontdue turns the glyph outlines
+# The bundled Noto Sans of the modern plugin themes (ac-ui) and plugin canvas fonts (ac-plugin-ui): fontdue turns the glyph outlines
 # into coverage pixels (OpenAC uses StbTrueTypeSharp). Pure
 # Rust, no build script. Default features off: no `simd` (x86 intrinsics) and no `hashbrown`.
 # ttf-parser is fontdue's own parser, named here so the atlas reads the font's metrics as
-# stb_truetype does (the glyf header boxes, hhea).
+# stb_truetype does (the glyf header boxes, hhea), and `opentype-layout` reads kerning from GPOS.
 fontdue = { version = "0.9.4", default-features = false }
-ttf-parser = { version = "0.25.1", default-features = false }
+ttf-parser = { version = "0.25.1", default-features = false, features = ["opentype-layout"] }
 # The client's terminal rendering mode (`openac --ui ratatui`): ratatui draws the session's
 # feed, status and objects as terminal widgets, and crossterm is its keyboard and terminal
 # backend (raw mode, alternate screen). Both are pure Rust, no build script compiles C or C++;

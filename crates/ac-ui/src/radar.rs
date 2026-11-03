@@ -159,7 +159,7 @@ pub fn is_showable(behavior: RadarBehavior, has_physics_object: bool) -> bool {
 /// What the radar reads about an object (from its public description).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectTraits {
-    /// Valid (the description's invalid bit is clear).
+    /// Shown in the UI (the description's UI-hidden bit, 0x80, is clear).
     pub is_valid: bool,
     /// The weenie's own blip colour (0: none).
     pub blip_color_override: u8,
@@ -216,7 +216,7 @@ impl ObjectTraits {
         color_override: u8,
     ) -> Self {
         Self {
-            is_valid: bitfield & 0x8000_0000 == 0,
+            is_valid: bitfield & 0x0000_0080 == 0,
             blip_color_override: color_override,
             is_portal: bitfield & 0x0004_0000 != 0,
             is_vendor: bitfield & 0x0000_0200 != 0,
@@ -245,6 +245,14 @@ pub struct RelationshipTraits {
     pub player_is_player_killer: bool,
     /// The player is PK-lite.
     pub player_is_pk_lite: bool,
+}
+
+/// True when an object whose allegiance's monarch is `object_monarch` is in
+/// the allegiance of a player whose monarch is `player_monarch`: it has a
+/// monarch, and it is the player's (0: no monarch).
+#[must_use]
+pub fn is_allegiance_member(object_monarch: u32, player_monarch: u32) -> bool {
+    object_monarch != 0 && object_monarch == player_monarch
 }
 
 /// The shape of an object's blip.
@@ -616,6 +624,24 @@ mod tests {
     }
 
     #[test]
+    fn an_object_hidden_from_the_ui_gets_no_blip() {
+        // A trap hidden from the UI (bit 0x80 of the description) is left
+        // off the radar; the top bit of the field is no such mark.
+        let trap = ObjectTraits::from_public_weenie_description(0x10, 0x0000_0094, 0);
+        assert!(!trap.is_valid);
+        assert_eq!(
+            blip_shape(&trap, &RelationshipTraits::default()),
+            BlipShape::Undef
+        );
+        let top_bit = ObjectTraits::from_public_weenie_description(0x10, 0x8000_0014, 0);
+        assert!(top_bit.is_valid);
+        assert_eq!(
+            blip_shape(&top_bit, &RelationshipTraits::default()),
+            BlipShape::Plus
+        );
+    }
+
+    #[test]
     fn colors_follow_the_retail_priority() {
         let player = ObjectTraits {
             is_player: true,
@@ -671,6 +697,39 @@ mod tests {
             y: -12.26,
         };
         assert_eq!(south_west.combined_text(), "12.3S,0.0W");
+    }
+
+    #[test]
+    fn allegiance_membership_is_a_shared_nonzero_monarch() {
+        assert!(is_allegiance_member(0x5000_0777, 0x5000_0777));
+        assert!(!is_allegiance_member(0x5000_0777, 0x5000_0778));
+        assert!(!is_allegiance_member(0x5000_0777, 0));
+        // Neither in an allegiance: not "the same allegiance".
+        assert!(!is_allegiance_member(0, 0));
+    }
+
+    #[test]
+    fn an_allegiance_member_is_a_box_below_the_fellowship() {
+        let player = ObjectTraits {
+            is_player: true,
+            is_player_killer: true,
+            ..ObjectTraits::default()
+        };
+        let member = RelationshipTraits {
+            is_allegiance_member: true,
+            player_is_player_killer: true,
+            ..RelationshipTraits::default()
+        };
+        // Before the player-killer threat.
+        assert_eq!(blip_shape(&player, &member), BlipShape::Box);
+        let fellow_member = RelationshipTraits {
+            is_fellowship_member: true,
+            ..member
+        };
+        assert_eq!(
+            blip_shape(&player, &fellow_member),
+            BlipShape::InvertedTriangle
+        );
     }
 
     #[test]

@@ -123,6 +123,18 @@ pub fn yaw_of(orientation: Quat) -> f32 {
     forward.y.atan2(forward.x)
 }
 
+/// `angle` wrapped to (-π, π], radians.
+#[must_use]
+pub fn wrap_angle(angle: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let wrapped = (angle + PI).rem_euclid(TAU) - PI;
+    if wrapped <= -PI {
+        wrapped + TAU
+    } else {
+        wrapped
+    }
+}
+
 /// Translation and rotation smoothing of the chase camera: each frame the
 /// eye moves `stiffness * dt * 10` of the way to where it should be. The
 /// player's "camera stiffness" setting replaces it ([`ChaseTuning`]).
@@ -149,6 +161,11 @@ pub struct ChaseTuning {
     pub invert_mouse_look_y_axis: bool,
     /// The camera heads along the slope the player moves on.
     pub align_to_slope: bool,
+    /// Modern mouse turning: a right-button drag over the world turns the
+    /// view around the character, and the character turns to face it.
+    pub modern_mouse_turning: bool,
+    /// With modern mouse turning, both buttons held run forward.
+    pub both_mouse_buttons_run_forward: bool,
 }
 
 impl Default for ChaseTuning {
@@ -165,6 +182,8 @@ impl From<&ac_host::settings::CameraTurningSettings> for ChaseTuning {
             mouse_look_sensitivity: s.mouse_look_sensitivity,
             invert_mouse_look_y_axis: s.invert_mouse_look_y_axis,
             align_to_slope: s.align_to_slope,
+            modern_mouse_turning: s.modern_mouse_turning,
+            both_mouse_buttons_run_forward: s.both_mouse_buttons_run_forward,
         }
     }
 }
@@ -234,9 +253,24 @@ pub const MAXIMUM_VERTICAL_COMPONENT: f32 = 450.0;
 /// The boom reaches at most 1.8 m below the pivot.
 pub const MINIMUM_VERTICAL_COMPONENT: f32 = -1.8;
 
-/// The default view: 2.5 m behind and 0.75 m above the pivot.
+/// The default view before its scale: 2.5 m behind and 0.75 m above the
+/// pivot.
 const DEFAULT_BACK: f32 = 2.5;
 const DEFAULT_UP: f32 = 0.75;
+/// In the game world the default view is scaled by 1.1, so it sits 2.75 m
+/// behind and 0.825 m above the pivot (a 2.87 m boom). Only the default
+/// view is scaled: the look-down, map and first-person views are not.
+pub const DEFAULT_VIEW_SCALE: f32 = 1.1;
+
+/// The default view's boom, `(back, up)` in meters, scale applied.
+#[must_use]
+pub fn default_view_offset() -> (f32, f32) {
+    (
+        DEFAULT_BACK * DEFAULT_VIEW_SCALE,
+        DEFAULT_UP * DEFAULT_VIEW_SCALE,
+    )
+}
+
 /// The look-down view's boom: 2 m back.
 const LOOK_DOWN_BACK: f32 = 2.0;
 /// The map view's boom: 450 m back.
@@ -330,6 +364,11 @@ pub struct ChaseCamera {
     /// Rotates asked for in the first-person view since the frame last
     /// took them (they turn the character).
     pending_first_person_rotate: f32,
+    /// Modern mouse turning holds the view: the yaw it looks along (radians
+    /// from +x, counter-clockwise), whatever the character faces.
+    held_view: Option<f32>,
+    /// The character's facing at the last update.
+    subject_yaw: f32,
 }
 
 /// One first-person rotate turns the character this many compass degrees.
@@ -347,9 +386,10 @@ struct SavedView {
 
 impl Default for ChaseCamera {
     fn default() -> Self {
+        let (back, up) = default_view_offset();
         Self {
-            distance: 2.61,
-            pitch: 0.291,
+            distance: back.hypot(up),
+            pitch: up.atan2(back),
             yaw_offset: 0.0,
             pivot_height: 1.5,
             tuning: ChaseTuning::default(),
@@ -368,6 +408,8 @@ impl Default for ChaseCamera {
             last_mouse_delta: (0.0, 0.0),
             last_filter_time: 0.0,
             pending_first_person_rotate: 0.0,
+            held_view: None,
+            subject_yaw: 0.0,
         }
     }
 }
@@ -405,11 +447,24 @@ impl ChaseCamera {
         collision: Option<ChaseCollision<'_>>,
     ) {
         let pivot = subject.position + Vec3::new(0.0, 0.0, self.pivot_height);
-        let tracked = compute_tracked_heading(pivot, subject.tracked_target);
+        self.subject_yaw = subject.yaw;
+        // A held view looks where it was turned, whatever the character
+        // faces: the swing is what lies between them, and neither a combat
+        // target nor the slope turns it.
+        let held = self.held_view;
+        if let Some(view) = held {
+            self.yaw_offset = wrap_angle(view - subject.yaw);
+        }
+        let tracked = if held.is_some() {
+            None
+        } else {
+            compute_tracked_heading(pivot, subject.tracked_target)
+        };
 
         // Look-down, map mode and a wide orbit see the flat facing; the
         // head view always tilts.
-        let alignment = self.tuning.align_to_slope
+        let alignment = held.is_none()
+            && self.tuning.align_to_slope
             && !self.looking_down
             && !self.map_mode
             && (self.in_head
@@ -430,11 +485,14 @@ impl ChaseCamera {
         }
         let average = average_velocity(&self.velocity_ring, self.velocity_count);
 
-        // Look-down and map mode bake the orbit into the heading.
-        let heading_yaw = if !self.in_head && self.target_direction_local.is_some() {
-            subject.yaw + self.yaw_offset
-        } else {
-            subject.yaw
+        // Look-down and map mode bake the orbit into the heading; a held
+        // view in the head looks along the view.
+        let heading_yaw = match held {
+            Some(view) if self.in_head => view,
+            _ if !self.in_head && self.target_direction_local.is_some() => {
+                subject.yaw + self.yaw_offset
+            }
+            _ => subject.yaw,
         };
         let heading = tracked.unwrap_or_else(|| {
             compute_heading(
@@ -454,7 +512,9 @@ impl ChaseCamera {
             desired_pose(pivot, heading, self.distance, self.pitch, self.yaw_offset)
         };
 
-        let sought_eye = if self.initialised {
+        // A held view sits rigidly where the mouse put it; in the head the
+        // look still eases.
+        let sought_eye = if self.initialised && (held.is_none() || self.in_head) {
             // The game's camera stiffness sets only the rotation in first
             // person.
             let t_alpha = if self.in_head {
@@ -625,11 +685,71 @@ impl ChaseCamera {
         if !adjustment.is_finite() || adjustment == 0.0 {
             return;
         }
+        // The mouse owns a held view: the orbit keys leave it alone.
+        if self.held_view.is_some() {
+            return;
+        }
         if self.in_head {
             self.pending_first_person_rotate += adjustment;
             return;
         }
         self.yaw_offset += adjustment * OFFSET_ANGLE_RADIANS;
+    }
+
+    /// The player's camera settings. Turning modern mouse turning on or off
+    /// puts the swing back to zero (behind the character).
+    pub fn set_tuning(&mut self, tuning: ChaseTuning) {
+        if tuning.modern_mouse_turning != self.tuning.modern_mouse_turning {
+            self.yaw_offset = 0.0;
+        }
+        self.tuning = tuning;
+    }
+
+    /// Modern mouse turning takes the view: from now it looks along the
+    /// yaw it looks along now (the character's facing and the swing), and
+    /// it stays there while the character turns, until it is turned
+    /// ([`Self::turn_held_view`]) or let go ([`Self::release_view`]). It
+    /// follows the character rigidly while held (no easing), so it turns
+    /// with the mouse at once; in the first-person view the look still
+    /// eases. The orbit keys leave a held view alone, and neither a combat
+    /// target nor the slope turns it.
+    pub fn hold_view(&mut self) {
+        if self.held_view.is_none() {
+            let swing = if self.in_head { 0.0 } else { self.yaw_offset };
+            self.held_view = Some(wrap_angle(self.subject_yaw + swing));
+        }
+    }
+
+    /// Turn the held view by `radians` (positive turns it left).
+    pub fn turn_held_view(&mut self, radians: f32) {
+        if let Some(view) = self.held_view.as_mut()
+            && radians.is_finite()
+        {
+            *view = wrap_angle(*view + radians);
+        }
+    }
+
+    /// The yaw the held view looks along, while one is held.
+    #[must_use]
+    pub fn held_view_yaw(&self) -> Option<f32> {
+        self.held_view
+    }
+
+    /// Let go of the held view: the camera stays where it is, as a swing
+    /// from the character's facing, and follows the character again.
+    pub fn release_view(&mut self) {
+        if let Some(view) = self.held_view.take()
+            && !self.in_head
+        {
+            self.yaw_offset = wrap_angle(view - self.subject_yaw);
+        }
+    }
+
+    /// The character's facing at the last update (radians from +x,
+    /// counter-clockwise).
+    #[must_use]
+    pub fn subject_yaw(&self) -> f32 {
+        self.subject_yaw
     }
 
     /// The rotate collected in the first-person view since the last call,
@@ -686,7 +806,18 @@ impl ChaseCamera {
         self.adjust_pitch(invert * y * sensitivity * MOUSE_ORBIT_SCALE);
     }
 
-    /// Back to the default view: 2.5 m back, 0.75 m up, no swing.
+    /// A character entered the world: the camera starts over as it did at
+    /// the first entry, in the default view (2.75 m back, 0.825 m up, no
+    /// swing, not looking down, no map, not first person) with its eye
+    /// placed afresh on the next update. The player's camera settings stay.
+    pub fn reset_for_world_entry(&mut self) {
+        *self = Self {
+            tuning: self.tuning,
+            ..Self::default()
+        };
+    }
+
+    /// Back to the default view: 2.75 m back, 0.825 m up, no swing.
     pub fn set_default_view(&mut self) {
         self.looking_down = false;
         self.map_mode = false;
@@ -694,7 +825,12 @@ impl ChaseCamera {
         self.target_direction_local = None;
         self.yaw_offset = 0.0;
         self.pivot_height = 1.5;
-        self.set_viewer_offset(DEFAULT_BACK, DEFAULT_UP);
+        // A held view comes back behind the character too.
+        if self.held_view.is_some() {
+            self.held_view = Some(self.subject_yaw);
+        }
+        let (back, up) = default_view_offset();
+        self.set_viewer_offset(back, up);
     }
 
     /// The first-person view: the eye 0.18 m ahead of the pivot, looking
@@ -705,6 +841,9 @@ impl ChaseCamera {
         self.in_head = true;
         self.target_direction_local = None;
         self.yaw_offset = 0.0;
+        if self.held_view.is_some() {
+            self.held_view = Some(self.subject_yaw);
+        }
         self.distance = FIRST_PERSON_FORWARD;
         self.pitch = 0.0;
         self.initialised = false;
@@ -1211,6 +1350,10 @@ pub struct PlayerModeFacts {
     pub controller_ready: bool,
     /// The world around the character is shown: the login reveal is over.
     pub world_ready: bool,
+    /// How many times a character has entered the world in what the
+    /// window has seen of the session: a new count is a new entry (a log
+    /// in after a log out), even when no frame saw the character gone.
+    pub world_entry: u64,
 }
 
 /// The one-shot trigger that puts the camera into player mode on its own
@@ -1323,14 +1466,21 @@ impl CameraController {
     }
 
     /// This frame's facts about the player. A character entering the world
-    /// (or one already in it when the window attaches) arms the player-mode
-    /// trigger, which puts the chase camera in charge once the character
-    /// can be followed; a character leaving the world cancels it and falls
-    /// back to orbiting. Fly mode is left alone.
+    /// (or one already in it when the window attaches) puts the chase
+    /// camera back in its default view, as the game does when it creates
+    /// the player, and arms the player-mode trigger, which puts the chase
+    /// camera in charge once the character can be followed; a character
+    /// leaving the world cancels it and falls back to orbiting. Fly mode is
+    /// left alone.
     pub fn follow_player(&mut self, facts: PlayerModeFacts) {
         let was_in_world = self.facts.live_in_world;
+        let entered =
+            facts.live_in_world && (!was_in_world || facts.world_entry != self.facts.world_entry);
         self.facts = facts;
-        if facts.live_in_world && !was_in_world {
+        if entered {
+            // Every entry starts the chase camera over in the default view,
+            // whatever the last character left it at.
+            self.chase.reset_for_world_entry();
             self.auto_entry.arm();
         } else if !facts.live_in_world && was_in_world {
             self.auto_entry.cancel();
@@ -1938,11 +2088,27 @@ mod tests {
     }
 
     #[test]
-    fn default_view_is_two_and_a_half_back_and_three_quarters_up() {
-        let mut cam = ChaseCamera::default();
+    fn default_view_is_two_and_three_quarters_back_and_0_825_up() {
+        // The game's default view: 2.5 m back and 0.75 m up, scaled by 1.1
+        // in the game world.
+        let mut cam = ChaseCamera {
+            distance: 7.0,
+            pitch: 0.5,
+            ..ChaseCamera::default()
+        };
         cam.set_default_view();
-        assert!(close(cam.distance * cam.pitch.cos(), 2.5, 1e-5));
-        assert!(close(cam.distance * cam.pitch.sin(), 0.75, 1e-5));
+        assert!(close(cam.distance * cam.pitch.cos(), 2.75, 1e-5));
+        assert!(close(cam.distance * cam.pitch.sin(), 0.825, 1e-5));
+    }
+
+    #[test]
+    fn the_chase_camera_starts_in_the_scaled_default_view() {
+        let cam = ChaseCamera::default();
+        assert!(close(cam.distance * cam.pitch.cos(), 2.75, 1e-5));
+        assert!(close(cam.distance * cam.pitch.sin(), 0.825, 1e-5));
+        assert!(close(cam.distance, 2.871_15, 1e-4));
+        // The scale lengthens the boom but keeps its angle (16.7 degrees).
+        assert!(close(cam.pitch, 0.75f32.atan2(2.5), 1e-6));
     }
 
     #[test]
@@ -2000,12 +2166,14 @@ mod tests {
         player_present: true,
         controller_ready: true,
         world_ready: true,
+        world_entry: 1,
     };
     const GONE: PlayerModeFacts = PlayerModeFacts {
         live_in_world: false,
         player_present: false,
         controller_ready: false,
         world_ready: false,
+        world_entry: 1,
     };
 
     // ── the player-mode trigger: OpenAC `AutoEnterPlayerModeTests` ──────
@@ -2160,6 +2328,64 @@ mod tests {
         assert_eq!(c.mode(), CameraMode::Orbit, "cancelled, not re-fired");
     }
 
+    /// Whether the chase camera sits in its default view: 2.75 m back and
+    /// 0.825 m up (the game's 2.5 m and 0.75 m scaled by 1.1), no swing,
+    /// no look-down, map or first-person view.
+    fn in_default_view(c: &ChaseCamera) -> bool {
+        close(c.distance * c.pitch.cos(), 2.75, 1e-5)
+            && close(c.distance * c.pitch.sin(), 0.825, 1e-5)
+            && c.yaw_offset == 0.0
+            && !c.is_looking_down()
+            && !c.is_map_mode()
+            && !c.is_in_head()
+    }
+
+    /// The game puts the camera back in its default view whenever it makes
+    /// the player (each entry into the world): a camera zoomed out and
+    /// turned around the character, or in the map view, before a log out
+    /// starts the next log in, the same character or another, in the
+    /// default view. The player's camera settings stay.
+    #[test]
+    fn every_entry_into_the_world_starts_the_chase_camera_in_its_default_view() {
+        for map in [false, true] {
+            let mut c = CameraController::new(OrbitCamera::default());
+            c.follow_player(READY);
+            assert!(in_default_view(&c.chase));
+            c.chase.tuning.stiffness = 0.25;
+            c.zoom(6.0);
+            c.chase.yaw_offset = 2.0;
+            if map {
+                c.chase.toggle_map_mode_view();
+            }
+            c.follow_player(READY);
+            assert!(!in_default_view(&c.chase), "kept while in the world");
+            c.follow_player(GONE);
+            assert!(!in_default_view(&c.chase), "kept at character selection");
+            c.follow_player(PlayerModeFacts {
+                world_entry: 2,
+                ..READY
+            });
+            assert!(in_default_view(&c.chase), "map {map}: reset by the log in");
+            assert_eq!(c.chase.tuning.stiffness, 0.25, "the settings stay");
+        }
+    }
+
+    /// A log out and log in the window saw no frame of (it was minimised,
+    /// say) is still a new entry: the entry count moved on.
+    #[test]
+    fn an_entry_seen_only_by_its_count_resets_the_view_too() {
+        let mut c = CameraController::new(OrbitCamera::default());
+        c.follow_player(READY);
+        c.zoom(6.0);
+        c.follow_player(READY);
+        assert!(!in_default_view(&c.chase), "the same entry keeps the view");
+        c.follow_player(PlayerModeFacts {
+            world_entry: 2,
+            ..READY
+        });
+        assert!(in_default_view(&c.chase));
+    }
+
     #[test]
     fn the_camera_follows_the_player_and_toggles_fly() {
         let mut c = CameraController::new(OrbitCamera::default());
@@ -2193,6 +2419,11 @@ mod tests {
     #[test]
     fn only_the_chase_cameras_map_view_is_the_overhead_view() {
         let mut c = CameraController::new(OrbitCamera::default());
+        // In the world, before the chase camera takes over.
+        c.follow_player(PlayerModeFacts {
+            world_ready: false,
+            ..READY
+        });
         c.chase.toggle_map_mode_view();
         assert!(c.chase.is_map_mode());
         assert!(!c.is_overhead_view(), "orbiting");

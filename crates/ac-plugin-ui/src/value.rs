@@ -466,16 +466,21 @@ impl Rgba {
     }
 }
 
+/// What comes before a literal's colour for light themes.
+pub(crate) const LIGHT_COLOR_MARKER: &str = "|light:";
+
 /// A colour attribute's literal: `#AARRGGBB` (exactly nine characters),
-/// the fallback after `|` of a `theme:token|#AARRGGBB` value, otherwise
-/// opaque white.
+/// the fallback after `|` of a `theme:token|#AARRGGBB` value, the first
+/// colour of a `#AARRGGBB|light:#AARRGGBB` pair, otherwise opaque white.
 #[must_use]
 pub fn parse_color(text: Option<&str>) -> Rgba {
     let mut text = text;
-    if let Some(t) = text
-        && t.starts_with("theme:")
-    {
-        text = t.split_once('|').map(|(_, fallback)| fallback);
+    if let Some(t) = text {
+        if t.starts_with("theme:") {
+            text = t.split_once('|').map(|(_, fallback)| fallback);
+        } else if let Some((first, _)) = t.split_once(LIGHT_COLOR_MARKER) {
+            text = Some(first);
+        }
     }
     match text {
         Some(t) if t.len() == 9 && t.starts_with('#') => {
@@ -483,6 +488,17 @@ pub fn parse_color(text: Option<&str>) -> Rgba {
         }
         _ => Rgba::WHITE,
     }
+}
+
+/// A literal's colour for light themes, the part after `|light:`; none when
+/// it has none. A `theme:` colour never has one: the theme gives its colour.
+#[must_use]
+pub fn light_color(text: &str) -> Option<Rgba> {
+    if text.starts_with("theme:") {
+        return None;
+    }
+    let (_, light) = text.split_once(LIGHT_COLOR_MARKER)?;
+    Some(parse_color(Some(light)))
 }
 
 /// A bound colour: a 32-bit `0xAARRGGBB` (signed or unsigned) or the
@@ -552,6 +568,17 @@ mod tests {
             Rgba::new(0.0, 0.0, 0.0, 128.0 / 255.0)
         );
         assert_eq!(parse_color(Some("theme:text")), Rgba::WHITE);
+        assert_eq!(
+            parse_color(Some("#FF112233|light:#FF445566")),
+            Rgba::argb(0xFF11_2233)
+        );
+        assert_eq!(
+            light_color("#FF112233|light:#FF445566"),
+            Some(Rgba::argb(0xFF44_5566))
+        );
+        assert_eq!(light_color("#FF112233|light:pink"), Some(Rgba::WHITE));
+        assert_eq!(light_color("#FF112233"), None);
+        assert_eq!(light_color("theme:text|#FF112233|light:#FF445566"), None);
         assert_eq!(bound_color(Some(&UiValue::Int(-1))), Rgba::WHITE);
         assert_eq!(bound_color(Some(&UiValue::Bool(true))), Rgba::WHITE);
     }

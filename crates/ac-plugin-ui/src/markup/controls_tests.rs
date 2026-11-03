@@ -294,9 +294,19 @@ fn an_expander_holds_children_and_checks_its_attributes() {
         Element::Expander {
             open: true,
             expanded: None,
+            framed: true,
             ..
         }
     ));
+    let plain = build(r#"<expander h="100" border="false"/>"#).unwrap();
+    assert!(matches!(
+        plain.nodes[0].element,
+        Element::Expander { framed: false, .. }
+    ));
+    assert_eq!(
+        refused(r#"<expander h="100" border="yes"/>"#),
+        r#"<expander border="yes"> must be true or false"#
+    );
     for body in [
         r#"<expander x="8" y="8" w="200" h="10" text="A"/>"#,
         r#"<expander h="100" expanded="{NotBool}"/>"#,

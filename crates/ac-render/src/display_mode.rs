@@ -12,11 +12,56 @@
 //! answers ([`follow_resize`]): the chosen size once the window is shown
 //! windowed (and not maximized) again.
 
+use winit::dpi::{LogicalSize, PhysicalSize, Size};
 use winit::window::{Fullscreen, Window};
 
 use ac_host::settings::DisplaySettings;
 
-use crate::platform::DisplayProtocol;
+use crate::platform::{DisplayProtocol, HostOs};
+use crate::ui_scale::UiScale;
+
+/// What the window's size, the resolution menu and the resolution picks
+/// are counted in. The drawing surface is always in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeUnit {
+    /// Framebuffer pixels (Windows, Linux).
+    Pixels,
+    /// Points (macOS), the unit the UI is laid out in there: a Retina
+    /// display has two pixels a point, and a size counted in pixels would
+    /// give a window, and the UI in it, half the size picked.
+    Points,
+}
+
+/// The unit `os` counts window sizes and resolution picks in.
+#[must_use]
+pub const fn size_unit(os: HostOs) -> SizeUnit {
+    match os {
+        HostOs::MacOs => SizeUnit::Points,
+        HostOs::Windows | HostOs::Linux => SizeUnit::Pixels,
+    }
+}
+
+impl SizeUnit {
+    /// The size to ask a window for: `width` x `height` in this unit.
+    #[must_use]
+    pub fn request(self, width: u32, height: u32) -> Size {
+        match self {
+            Self::Pixels => PhysicalSize::new(width, height).into(),
+            Self::Points => LogicalSize::new(f64::from(width), f64::from(height)).into(),
+        }
+    }
+
+    /// `pixels` (a window's, a monitor's or a mode's size) in this unit;
+    /// `scale_factor` (the monitor's pixels a point) is asked only when
+    /// counting in points. Points are whole, as the UI's size is.
+    #[must_use]
+    pub fn from_pixels(self, pixels: (u32, u32), scale_factor: impl FnOnce() -> f64) -> (u32, u32) {
+        match self {
+            Self::Pixels => pixels,
+            Self::Points => UiScale::for_window(HostOs::MacOs, scale_factor()).ui_size(pixels),
+        }
+    }
+}
 
 /// How the windowing system makes a window fullscreen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,9 +100,9 @@ pub const fn request_took(kind: FullscreenKind, entering: bool, reported_fullscr
 
 /// The window's size and maximized state.
 pub trait WindowSizeSurface {
-    /// Inner size, physical pixels.
+    /// Inner size, in the window's [`SizeUnit`].
     fn size(&self) -> (u32, u32);
-    /// Ask for an inner size.
+    /// Ask for an inner size, in the window's [`SizeUnit`].
     fn set_size(&mut self, width: u32, height: u32);
     /// The window is maximized.
     fn is_maximized(&self) -> bool;
@@ -110,9 +155,9 @@ pub enum Awaiting {
     /// Leaving is asked for; once the window is shown windowed after being
     /// shown fullscreen, it is given this size.
     Windowed {
-        /// Inner width, physical pixels.
+        /// Inner width, in the window's [`SizeUnit`].
         width: u32,
-        /// Inner height, physical pixels.
+        /// Inner height, in the window's [`SizeUnit`].
         height: u32,
         /// The window has been shown fullscreen since the leave was asked
         /// for. A leave asked for before an unanswered fullscreen was shown
@@ -127,9 +172,9 @@ pub enum Awaiting {
     /// honoured: un-maximizing is asked for, and once shown so the window
     /// is given this size.
     Unmaximizing {
-        /// Inner width, physical pixels.
+        /// Inner width, in the window's [`SizeUnit`].
         width: u32,
-        /// Inner height, physical pixels.
+        /// Inner height, in the window's [`SizeUnit`].
         height: u32,
     },
 }
@@ -139,9 +184,9 @@ pub enum Awaiting {
 /// chosen size for a window shown windowed again after fullscreen, and
 /// un-maximized first when shown maximized).
 ///
-/// Returns the size the drawing surface follows: the window's size now,
-/// not the resize's, since a size asked for here may take at once with no
-/// resize of its own (Wayland). Lines for the log go to `log`.
+/// Returns the window's size now (in its [`SizeUnit`]), not the resize's,
+/// since a size asked for here may take at once with no resize of its own
+/// (Wayland). Lines for the log go to `log`.
 pub fn follow_resize(
     awaiting: &mut Awaiting,
     surface: &mut dyn WindowSizeSurface,
@@ -409,20 +454,28 @@ fn fullscreen_monitor<M>(
     })
 }
 
-/// The window as both the size surface and the mode switcher.
+/// The window as both the size surface and the mode switcher, its sizes
+/// and modes counted in this system's [`SizeUnit`] (OpenAC's window
+/// library counts them in points on macOS, as its window size is).
 #[derive(Debug)]
 pub struct WinitDisplay<'a>(pub &'a Window);
+
+impl WinitDisplay<'_> {
+    fn unit() -> SizeUnit {
+        size_unit(HostOs::current())
+    }
+}
 
 impl WindowSizeSurface for WinitDisplay<'_> {
     fn size(&self) -> (u32, u32) {
         let s = self.0.inner_size();
-        (s.width, s.height)
+        Self::unit().from_pixels((s.width, s.height), || self.0.scale_factor())
     }
 
     fn set_size(&mut self, width: u32, height: u32) {
         let _ = self
             .0
-            .request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+            .request_inner_size(Self::unit().request(width, height));
     }
 
     fn is_maximized(&self) -> bool {
@@ -447,12 +500,15 @@ impl DisplayModeSwitcher for WinitDisplay<'_> {
         match self.0.fullscreen()? {
             Fullscreen::Exclusive(mode) => {
                 let s = mode.size();
-                Some((s.width, s.height))
+                Some(
+                    Self::unit().from_pixels((s.width, s.height), || mode.monitor().scale_factor()),
+                )
             }
             // The monitor keeps its own mode, and that is the window's size.
             Fullscreen::Borderless(monitor) => {
-                let s = monitor.or_else(|| self.0.current_monitor())?.size();
-                Some((s.width, s.height))
+                let monitor = monitor.or_else(|| self.0.current_monitor())?;
+                let s = monitor.size();
+                Some(Self::unit().from_pixels((s.width, s.height), || monitor.scale_factor()))
             }
         }
     }
@@ -473,7 +529,8 @@ impl DisplayModeSwitcher for WinitDisplay<'_> {
                     .video_modes()
                     .filter(|m| {
                         let s = m.size();
-                        (s.width, s.height) == (width, height)
+                        Self::unit().from_pixels((s.width, s.height), || monitor.scale_factor())
+                            == (width, height)
                     })
                     .max_by_key(winit::monitor::VideoModeHandle::refresh_rate_millihertz)
                     .ok_or_else(|| {
@@ -505,7 +562,7 @@ impl DisplayModeSwitcher for WinitDisplay<'_> {
         if kind == FullscreenKind::ModeSwitch {
             let _ = self
                 .0
-                .request_inner_size(winit::dpi::PhysicalSize::new(width, height));
+                .request_inner_size(Self::unit().request(width, height));
         }
         if !request_took(kind, false, self.0.fullscreen().is_some()) {
             return Err("the window is still fullscreen".into());
@@ -1126,6 +1183,79 @@ mod tests {
         apply_late(&display(true, "1600x900"), &mut s, &mut c, &mut aw);
         assert_eq!(c.calls.last().map(String::as_str), Some("enter:1600x900"));
         assert_eq!(aw, Awaiting::Fullscreen);
+    }
+
+    /// Window sizes and resolution picks are points on macOS, as OpenAC's
+    /// window library counts them there, and pixels elsewhere.
+    #[test]
+    fn a_mac_counts_window_sizes_in_points_and_the_rest_in_pixels() {
+        assert_eq!(size_unit(HostOs::MacOs), SizeUnit::Points);
+        for os in [HostOs::Windows, HostOs::Linux] {
+            assert_eq!(size_unit(os), SizeUnit::Pixels, "{os:?}");
+        }
+    }
+
+    #[test]
+    fn a_size_is_asked_for_in_its_unit() {
+        assert_eq!(
+            SizeUnit::Pixels.request(1280, 720),
+            Size::Physical(PhysicalSize::new(1280, 720))
+        );
+        assert_eq!(
+            SizeUnit::Points.request(1280, 720),
+            Size::Logical(LogicalSize::new(1280.0, 720.0))
+        );
+    }
+
+    /// Pixels stay as the window reports them, whatever the monitor's
+    /// scale: the monitor is not even asked.
+    #[test]
+    fn pixels_are_read_as_they_are() {
+        for pixels in [(0, 0), (1, 1), (1280, 720), (3024, 1964), (u32::MAX, 7)] {
+            assert_eq!(
+                SizeUnit::Pixels.from_pixels(pixels, || unreachable!("no scale for pixels")),
+                pixels
+            );
+        }
+    }
+
+    #[test]
+    fn points_are_the_pixels_over_the_scale() {
+        assert_eq!(
+            SizeUnit::Points.from_pixels((3024, 1964), || 2.0),
+            (1512, 982)
+        );
+        assert_eq!(
+            SizeUnit::Points.from_pixels((1280, 720), || 1.0),
+            (1280, 720)
+        );
+        // A factor that is not a scale counts as one, as the UI's does.
+        assert_eq!(
+            SizeUnit::Points.from_pixels((1280, 720), || f64::NAN),
+            (1280, 720)
+        );
+    }
+
+    /// The default window on a 2x Retina screen: asked for in points, it
+    /// is 2560 x 1440 pixels, reads back as the size picked, and its UI is
+    /// laid out at 1280 x 720 units, past the 800 x 600 the retail layout
+    /// is made for. Asked for in pixels it was 640 x 360 points.
+    #[test]
+    fn the_default_window_on_a_retina_mac_is_the_size_picked_in_points() {
+        let scale = 2.0;
+        let unit = size_unit(HostOs::MacOs);
+        let pixels = unit.request(1280, 720).to_physical::<u32>(scale);
+        assert_eq!((pixels.width, pixels.height), (2560, 1440));
+        assert_eq!(unit.from_pixels((2560, 1440), || scale), (1280, 720));
+        let ui = UiScale::for_window(HostOs::MacOs, scale).ui_size((2560, 1440));
+        assert_eq!(ui, (1280, 720));
+
+        let in_pixels = SizeUnit::Pixels
+            .request(1280, 720)
+            .to_physical::<u32>(scale);
+        let ui =
+            UiScale::for_window(HostOs::MacOs, scale).ui_size((in_pixels.width, in_pixels.height));
+        assert_eq!(ui, (640, 360));
     }
 
     /// A mode switch is done when the request returns: nothing is awaited.

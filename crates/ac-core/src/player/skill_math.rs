@@ -93,7 +93,7 @@ pub fn calculate(
     let before = augmentations.before_enchantments(skill_id);
     let unenchanted = intrinsic_level.max(0).saturating_add(before);
     let enchanted_base = enchanted_intrinsic_level.max(0).saturating_add(before);
-    let enchanted = enchant_skill(enchantment, enchanted_base.cast_unsigned());
+    let enchanted = enchant_skill(&enchantment, enchanted_base.cast_unsigned());
     let effective = enchanted.saturating_add(augmentations.after_enchantments(advancement_class));
     SkillValue {
         unenchanted_level: unenchanted,

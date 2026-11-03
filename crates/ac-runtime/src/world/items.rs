@@ -271,6 +271,16 @@ impl World {
         });
     }
 
+    /// A re-sent description of a held object, which the game deletes and
+    /// creates again: merged into the record, and the object placed first
+    /// in the container the description names.
+    pub(super) fn ingest_recreated_description(&mut self, create: &CreateObject) {
+        let data = weenie_data(create);
+        self.with_items(|table, events| {
+            table.ingest_recreated(&data, events);
+        });
+    }
+
     /// A newer incarnation: the old record goes and the new description is
     /// installed fresh, dropping every quality the old one had.
     pub(super) fn replace_description(&mut self, create: &CreateObject, generation: u16) {

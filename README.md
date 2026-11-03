@@ -28,7 +28,7 @@ game, in modern Rust.
   in one process, with zero or more windows. A window can open onto any
   running session and close again without the session noticing; a session
   without a window keeps playing headless.
-- **Renders** with [wgpu](https://wgpu.rs) (Direct3D 12 or Vulkan) in a
+- **Renders** with [wgpu](https://wgpu.rs) (Direct3D 12, Vulkan or Metal) in a
   [winit](https://github.com/rust-windowing/winit) window, with the original
   game's own interface rebuilt from its data files.
 - **Talks** to [ACEmulator](https://github.com/ACEmulator/ACE) servers over
@@ -52,7 +52,8 @@ reports are welcome.
 
 **Platforms.** Windows 10 and 11 (64-bit) is where it is played most. Linux
 (64-bit, X11 or Wayland) builds and runs, with less time in front of players.
-macOS is not distributed yet.
+macOS on Apple silicon (macOS 14 or later) builds and runs on Metal; it is
+the newest platform.
 
 **Found a bug?** Open a
 [GitHub issue](https://github.com/eriknihlen/openac-rust/issues) with the
@@ -68,13 +69,18 @@ unzip it anywhere, and run the launcher:
 |---|---|---|
 | Windows | `openac-win-x64.zip` | `openac-launcher.exe` |
 | Linux | `openac-linux-x64.zip` | `./openac-launcher` |
+| macOS (Apple silicon) | `OpenAC-<version>-osx-arm64.zip` | `OpenAC.app` |
 
-The zip holds both programs; the launcher starts the `openac` beside it.
+The zip holds both programs; the launcher starts the `openac` beside it. On
+macOS they are inside `OpenAC.app`; move it to Applications and open it. The
+app is signed ad hoc, not with an Apple Developer ID, so macOS blocks the
+first start of a downloaded copy: allow it under System Settings, Privacy &
+Security ("Open Anyway").
 
 You will need:
 
 - A GPU and driver with **Direct3D 12** (Windows) or **Vulkan** (Windows or
-  Linux).
+  Linux); on macOS, **Metal** (every Apple-silicon Mac).
 - **Your own Asheron's Call data files** (`client_portal.dat`,
   `client_cell_1.dat`, `client_highres.dat`, `client_local_English.dat`).
   The launcher asks for their folder on first run; `openac` looks in
@@ -91,7 +97,8 @@ Install Rust with [rustup](https://rustup.rs). The repository's
 
 A C compiler is needed too (the plugin engine compiles two small C files):
 on Windows the Visual Studio Build Tools ("Desktop development with C++"),
-on Linux your distribution's compiler. Linux also needs the OpenSSL and ALSA
+on Linux your distribution's compiler, on macOS the Xcode command-line tools
+(`xcode-select --install`). Linux also needs the OpenSSL and ALSA
 development headers and `pkg-config`; on Debian or Ubuntu:
 
 ```bash
@@ -108,8 +115,9 @@ cargo build --release
 
 The programs land in `target/release/`: `openac` (the client),
 `openac-launcher` (the launcher), `actool` (a data-file inspector) and
-`plugincheck` (the plugin validator). Run the launcher, or the client on its
-own:
+`plugincheck` (the plugin validator); on macOS, `scripts/bundle-macos.sh`
+builds the launcher and the client into `OpenAC.app`. Run the launcher, or the
+client on its own:
 
 ```bash
 # The password comes only from the environment.

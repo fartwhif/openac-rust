@@ -40,10 +40,10 @@ impl MarkupIcons for NoIcons {
     }
 }
 
-struct NoShelfIcons;
+struct NoDockIcons;
 
-impl shelf::ShelfIcons for NoShelfIcons {
-    fn file(&mut self, _owner: &str, _icon: &ac_plugin_ui::PluginIcon) -> Option<Icon> {
+impl dock::DockIcons for NoDockIcons {
+    fn file(&mut self, _icon: &ac_plugin_ui::PluginIcon) -> Option<Icon> {
         None
     }
     fn surface(&mut self, _id: u32) -> Option<Icon> {
@@ -469,7 +469,10 @@ fn font_window(
     let mut host = UiHost::new();
     let outbox: PluginOutbox = Rc::new(RefCell::new(Vec::new()));
     let c = build_panel(&mut host.root, &view, Some(Arc::clone(classic)), outbox)
-        .with_modern_font(Some(Arc::clone(modern)));
+        .with_modern_fonts(Some(ModernFonts {
+            regular: Arc::clone(modern),
+            semibold: Arc::clone(modern),
+        }));
     let root = host.root.root();
     host.root.add_child(root, c.root);
     host.root
@@ -481,9 +484,13 @@ fn font_window(
 /// Two fonts as OpenAC's test makes them: the bundled font at 16 and at
 /// 12 pixels.
 fn bundled_fonts() -> (Arc<UiFont>, Arc<UiFont>) {
-    use crate::bundled_font::bake;
-    let modern = bake(16.0).unwrap().create_font(TextureRef::Runtime(1));
-    let classic = bake(12.0).unwrap().create_font(TextureRef::Runtime(2));
+    use crate::bundled_font::{Weight, bake};
+    let modern = bake(16.0, Weight::Regular)
+        .unwrap()
+        .create_font(TextureRef::Runtime(1));
+    let classic = bake(12.0, Weight::Regular)
+        .unwrap()
+        .create_font(TextureRef::Runtime(2));
     (Arc::new(modern), Arc::new(classic))
 }
 
@@ -520,6 +527,71 @@ fn theme_font_switch_restores_classic_font() {
     c.sync(&mut host.root, &view, 3, &mut NoIcons, PluginTheme::Classic);
     assert!(same(font_of(&host, label).as_ref(), &classic));
     assert!(same(field_font(&host).as_ref(), &classic));
+}
+
+/// On a high-density display a themed window's text draws from the sharper
+/// bake and nothing moves; a Classic window's text draws exactly as it does
+/// without one.
+#[test]
+fn only_a_themed_windows_text_takes_the_sharper_bake_and_nothing_moves() {
+    use crate::bundled_font::{Weight, bake};
+    use crate::draw::{DrawCmd, DrawList, NoSprites};
+    use crate::font::{SharpFont, SharpFonts};
+
+    const MARKUP: &str = r#"<panel theme="plugin" x="10" y="10" w="200" h="100" title="Title">
+  <label name="L" x="1" y="20" text="Buff Bot" />
+  <button name="B" x="1" y="40" w="80" h="24" text="Go" />
+</panel>"#;
+    const SHARP: TextureRef = TextureRef::Runtime(9);
+    let (modern, classic) = bundled_fonts();
+    let twin = bake(32.0, Weight::Regular).unwrap().create_font(SHARP);
+    let fonts = Arc::new(SharpFonts::from([(
+        modern.id,
+        SharpFont {
+            font: Arc::new(twin),
+            scale: 2.0,
+        },
+    )]));
+    let textures = |list: &DrawList| -> Vec<TextureRef> {
+        list.commands()
+            .filter_map(|c| match c {
+                DrawCmd::Glyphs { texture, .. } => Some(*texture),
+                _ => None,
+            })
+            .collect()
+    };
+    let screen = (640.0, 480.0);
+
+    let (mut host, mut c, view) = font_window(MARKUP, &classic, &modern);
+    c.sync(&mut host.root, &view, 1, &mut NoIcons, PluginTheme::Moss);
+    let places = |host: &UiHost, c: &PluginPanelController| {
+        ["L", "B"].map(|n| {
+            let id = named(&host.root, c.root, n).unwrap();
+            let e = host.root.element(id).unwrap();
+            (e.left, e.top, e.width, e.height)
+        })
+    };
+    host.root.draw(screen, &NoSprites);
+    let before = places(&host, &c);
+    let standard = host.root.draw(screen, &NoSprites);
+    assert!(!textures(&standard).is_empty());
+    assert!(!textures(&standard).contains(&SHARP));
+
+    host.root.set_sharp_fonts(Some(Arc::clone(&fonts)));
+    // Told of the bake, a standard display still draws the font's own glyphs.
+    assert_eq!(host.root.draw(screen, &NoSprites), standard);
+    host.root.set_pixels_per_unit(2.0);
+    let dense = host.root.draw(screen, &NoSprites);
+    assert!(textures(&dense).iter().all(|t| *t == SHARP));
+    assert_eq!(places(&host, &c), before);
+
+    // Under Classic the window keeps its own font, which has no sharper bake.
+    c.sync(&mut host.root, &view, 2, &mut NoIcons, PluginTheme::Classic);
+    let with_bake = host.root.draw(screen, &NoSprites);
+    host.root.set_sharp_fonts(None);
+    let without = host.root.draw(screen, &NoSprites);
+    assert_eq!(with_bake, without);
+    assert!(!textures(&with_bake).contains(&SHARP));
 }
 
 /// OpenAC `MarkupDocument.Build`: the title label takes `controls.ini`'s
@@ -561,7 +633,7 @@ fn the_title_takes_the_controls_ini_colour_where_no_theme_colours_it() {
 
 /// OpenAC `PluginMarkupTheme`'s font bindings: under a modern theme the
 /// buttons, tabs, toggles, menus (and their captions), logs and lists of a
-/// themed window draw in the bundled font, a meter and the shelf's
+/// themed window draw in the bundled font, a meter and the dock's
 /// minimize button keep theirs; a window that does not opt in keeps its
 /// font under every theme.
 #[test]
@@ -662,7 +734,15 @@ fn a_canvas_holds_the_pointer_from_press_to_release_and_reports_a_lost_press() {
     let mut layer = canvas::CanvasLayer::mount(&mut host.root, &mut band);
     let outbox: PluginOutbox = Rc::new(RefCell::new(Vec::new()));
     let mut no_image = |_: &str, _: u32| None;
-    layer.sync(&mut host.root, &band, &view, &mut no_image, None, &outbox);
+    layer.sync(
+        &mut host.root,
+        &band,
+        &view,
+        &mut no_image,
+        &mut |_| unreachable!("no fonts"),
+        None,
+        &outbox,
+    );
     host.mouse_down(MouseButton::Left, 210, 110, 0);
     host.mouse_move(400, 300);
     host.mouse_up(MouseButton::Left, 400, 300, 0);
@@ -670,7 +750,7 @@ fn a_canvas_holds_the_pointer_from_press_to_release_and_reports_a_lost_press() {
         .borrow_mut()
         .drain(..)
         .filter_map(|i| match i {
-            UiInput::Pointer { canvas, event } if canvas == id => {
+            UiInput::Pointer { canvas, event, .. } if canvas == id => {
                 Some((event.kind, event.x, event.y))
             }
             _ => None,
@@ -688,7 +768,15 @@ fn a_canvas_holds_the_pointer_from_press_to_release_and_reports_a_lost_press() {
     host.mouse_down(MouseButton::Left, 210, 110, 0);
     assert!(state.release_canvas_pointer("test.canvas", id));
     view.apply_all(state.take_changes());
-    layer.sync(&mut host.root, &band, &view, &mut no_image, None, &outbox);
+    layer.sync(
+        &mut host.root,
+        &band,
+        &view,
+        &mut no_image,
+        &mut |_| unreachable!("no fonts"),
+        None,
+        &outbox,
+    );
     host.mouse_up(MouseButton::Left, 210, 110, 0);
     let kinds: Vec<PointerKind> = outbox
         .borrow_mut()
@@ -703,7 +791,15 @@ fn a_canvas_holds_the_pointer_from_press_to_release_and_reports_a_lost_press() {
     host.mouse_down(MouseButton::Left, 210, 110, 0);
     assert!(state.place_canvas("test.canvas", id, Some(false), None, None));
     view.apply_all(state.take_changes());
-    layer.sync(&mut host.root, &band, &view, &mut no_image, None, &outbox);
+    layer.sync(
+        &mut host.root,
+        &band,
+        &view,
+        &mut no_image,
+        &mut |_| unreachable!("no fonts"),
+        None,
+        &outbox,
+    );
     host.pump();
     let kinds: Vec<PointerKind> = outbox
         .borrow_mut()
@@ -716,29 +812,201 @@ fn a_canvas_holds_the_pointer_from_press_to_release_and_reports_a_lost_press() {
     assert_eq!(kinds, vec![PointerKind::Down, PointerKind::Cancelled]);
 }
 
-// ── The shelf under the plugin themes (as in OpenAC) ─────────────────────
+#[test]
+fn a_canvas_is_told_which_modifier_keys_each_pointer_event_came_with() {
+    use crate::event::Modifiers;
+    use crate::overlay::OverlayHost;
+    use ac_plugin_ui::{CanvasAnchor, CanvasDescriptor, PluginUiView, PointerKind};
+    let mut state = PluginUi::new();
+    let owner = UiOwner::new("test.canvas", "Canvas");
+    let id = state
+        .register_canvas(
+            &owner,
+            CanvasDescriptor {
+                canvas_id: "hud".into(),
+                width: 100,
+                height: 50,
+                anchor: CanvasAnchor::TopLeft,
+                offset: (200.0, 100.0),
+                start_visible: true,
+                accepts_pointer_input: true,
+            },
+        )
+        .unwrap();
+    assert!(state.listen_canvas("test.canvas", id, true));
+    let mut view = PluginUiView::new();
+    view.apply_all(state.snapshot());
+    let mut host = UiHost::new();
+    host.root.set_size(800.0, 600.0);
+    let mut band = OverlayHost::mount(&mut host.root);
+    let mut layer = canvas::CanvasLayer::mount(&mut host.root, &mut band);
+    let outbox: PluginOutbox = Rc::new(RefCell::new(Vec::new()));
+    let mut no_image = |_: &str, _: u32| None;
+    layer.sync(
+        &mut host.root,
+        &band,
+        &view,
+        &mut no_image,
+        &mut |_| unreachable!("no fonts"),
+        None,
+        &outbox,
+    );
+
+    // A Ctrl+drag, ending with Ctrl let go before the button comes up.
+    host.set_modifiers(Modifiers::CTRL);
+    host.mouse_down(MouseButton::Left, 210, 110, 0);
+    host.mouse_move(250, 130);
+    host.set_modifiers(Modifiers::NONE);
+    host.mouse_up(MouseButton::Left, 250, 130, 0);
+    // The wheel with Shift and Alt, and a plain click.
+    host.set_modifiers(Modifiers::SHIFT | Modifiers::ALT);
+    host.mouse_move(210, 110);
+    host.root.on_scroll(1);
+    host.set_modifiers(Modifiers::NONE);
+    host.mouse_down(MouseButton::Left, 210, 110, 0);
+    host.mouse_up(MouseButton::Left, 210, 110, 0);
+    host.pump();
+
+    let events: Vec<(PointerKind, u8)> = outbox
+        .borrow_mut()
+        .drain(..)
+        .filter_map(|i| match i {
+            UiInput::Pointer { event, .. } => Some((event.kind, event.modifiers)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            (PointerKind::Down, 2),
+            (PointerKind::Move, 2),
+            (PointerKind::Up, 0),
+            (PointerKind::Wheel, 5),
+            (PointerKind::Down, 0),
+            (PointerKind::Up, 0),
+        ]
+    );
+}
 
 #[test]
-fn a_right_click_on_a_shelf_entry_asks_for_appearance_without_toggling_the_plugin() {
+fn a_canvas_dragged_through_the_session_follows_the_pointer_without_overshooting() {
+    // A plugin moves its canvas by where the pointer is from the grabbed
+    // point, as a HUD does. The session and the window each see the other's
+    // news a frame late, which is what a live drag measures.
+    use crate::overlay::OverlayHost;
+    use ac_plugin_ui::{CanvasAnchor, CanvasDescriptor, PluginUiView, PointerKind, UiChange};
+    use std::collections::VecDeque;
+    let mut state = PluginUi::new();
+    let owner = UiOwner::new("test.canvas", "Canvas");
+    let id = state
+        .register_canvas(
+            &owner,
+            CanvasDescriptor {
+                canvas_id: "hud".into(),
+                width: 100,
+                height: 50,
+                anchor: CanvasAnchor::TopLeft,
+                offset: (200.0, 100.0),
+                start_visible: true,
+                accepts_pointer_input: true,
+            },
+        )
+        .unwrap();
+    assert!(state.listen_canvas("test.canvas", id, true));
+    let mut view = PluginUiView::new();
+    view.apply_all(state.snapshot());
+    state.take_changes();
+    let mut host = UiHost::new();
+    host.root.set_size(800.0, 600.0);
+    let mut band = OverlayHost::mount(&mut host.root);
+    let mut layer = canvas::CanvasLayer::mount(&mut host.root, &mut band);
+    let outbox: PluginOutbox = Rc::new(RefCell::new(Vec::new()));
+    let mut no_image = |_: &str, _: u32| None;
+    layer.sync(
+        &mut host.root,
+        &band,
+        &view,
+        &mut no_image,
+        &mut |_| unreachable!("no fonts"),
+        None,
+        &outbox,
+    );
+
+    let mut to_session: VecDeque<Vec<UiInput>> = VecDeque::new();
+    let mut to_window: VecDeque<Vec<UiChange>> = VecDeque::new();
+    let mut offset = (200.0_f32, 100.0_f32);
+    let mut grab = None;
+    let mut worst = 0.0_f32;
+    host.mouse_down(MouseButton::Left, 210, 110, 0);
+    for frame in 0..120 {
+        // Moving for a second, then held still for the rest.
+        let step = frame.min(60);
+        let pointer = (210 + step * 4, 110 + step * 2);
+        host.mouse_move(pointer.0, pointer.1);
+        to_session.push_back(outbox.borrow_mut().drain(..).collect());
+        if to_session.len() > 1 {
+            for input in to_session.pop_front().unwrap() {
+                state.input(input);
+            }
+        }
+        for (_, event) in state.take_events() {
+            let event = state.pointer_as_placed_now(event);
+            let ac_plugin_ui::UiEvent::Pointer { event, .. } = event else {
+                continue;
+            };
+            match (event.kind, grab) {
+                (PointerKind::Down, _) => grab = Some((event.x, event.y)),
+                (PointerKind::Move, Some((gx, gy))) => {
+                    offset = (offset.0 + event.x - gx, offset.1 + event.y - gy);
+                    assert!(state.place_canvas("test.canvas", id, None, None, Some(offset)));
+                }
+                _ => {}
+            }
+        }
+        to_window.push_back(state.take_changes());
+        if to_window.len() > 1 {
+            view.apply_all(to_window.pop_front().unwrap());
+            layer.sync(
+                &mut host.root,
+                &band,
+                &view,
+                &mut no_image,
+                &mut |_| unreachable!("no fonts"),
+                None,
+                &outbox,
+            );
+        }
+        // The canvas keeps the grabbed point under the pointer, at most late.
+        let target = (pointer.0 as f32 - 10.0, pointer.1 as f32 - 10.0);
+        worst = worst.max(offset.0 - target.0).max(offset.1 - target.1);
+    }
+    assert_eq!(worst, 0.0, "the canvas ran ahead of the pointer");
+    assert_eq!(offset, (440.0, 220.0));
+}
+
+// ── The dock under the plugin themes (as in OpenAC) ──────────────────────
+
+#[test]
+fn a_right_click_on_a_dock_slot_asks_for_appearance_without_toggling_the_plugin() {
     // PluginSidePanelThemeTests.RightClickOnEntryOpensAppearanceWithoutTogglingPlugin.
-    use super::shelf::{self, PluginShelf};
+    use super::dock::{self, PluginDock};
     for theme in [PluginTheme::Classic, PluginTheme::Moss, PluginTheme::Brass] {
         let (state, _) = session();
         let mut host = UiHost::new();
         host.root.set_size(800.0, 600.0);
         let outbox: PluginOutbox = Rc::new(RefCell::new(Vec::new()));
-        let mut shelf_controller = PluginShelf::build(&mut host.root, None, Rc::clone(&outbox));
-        let frame = shelf_controller.root;
+        let mut dock_controller = PluginDock::build(&mut host.root, None, None, Rc::clone(&outbox));
+        let frame = dock_controller.root;
         let top = host.root.root();
         host.root.add_child(top, frame);
         host.root
-            .register_window(shelf::WINDOW, frame, Some(frame), 0)
+            .register_window(dock::WINDOW, frame, Some(frame), 0)
             .unwrap();
         let panels: Vec<PanelView> = state.panels().cloned().collect();
-        shelf_controller.set_theme(&mut host.root, theme);
-        shelf_controller.sync(&mut host.root, &panels, &mut NoShelfIcons);
-        let button = shelf_controller.button(panels[0].id).unwrap();
-        host.attach_controller(shelf::WINDOW, Box::new(shelf_controller))
+        dock_controller.set_theme(&mut host.root, theme);
+        dock_controller.sync(&mut host.root, &panels, &mut NoDockIcons);
+        let button = dock_controller.slot(panels[0].id).unwrap();
+        host.attach_controller(dock::WINDOW, Box::new(dock_controller))
             .unwrap();
         let (x, y) = host.root.screen_position(button);
         let e = host.root.element(button).unwrap();
@@ -747,7 +1015,7 @@ fn a_right_click_on_a_shelf_entry_asks_for_appearance_without_toggling_the_plugi
         host.mouse_up(MouseButton::Right, x, y, 0);
         host.pump();
         let asked = host
-            .with_controller::<PluginShelf, _>(shelf::WINDOW, |c, _| c.take_appearance_request())
+            .with_controller::<PluginDock, _>(dock::WINDOW, |c, _| c.take_appearance_request())
             .unwrap();
         assert!(asked, "{theme:?}");
         assert!(outbox.borrow().is_empty(), "the plugin is not toggled");

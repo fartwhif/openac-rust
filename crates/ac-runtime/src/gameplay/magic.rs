@@ -12,8 +12,8 @@ use ac_core::player::{AttributeKind, VitalKind, skill_names};
 use ac_core::properties::{PropertyBool, PropertyInt};
 use ac_core::spells::{
     ActiveEnchantmentRecord, BUCKET_ADDITIVE, BUCKET_COOLDOWN, BUCKET_MULTIPLICATIVE, BUCKET_VITAE,
-    ComponentObject, SpellComponentWorld, SpellMetadata, SpellTargetCandidate, Spellbook, evaluate,
-    get_vitae_multiplier,
+    ComponentObject, SpellComponentRequirements, SpellComponentWorld, SpellFormulaDefinition,
+    SpellMetadata, SpellTargetCandidate, Spellbook, evaluate, get_vitae_multiplier,
 };
 use ac_proto::PlayerEnchantment;
 use ac_proto::{GameEventEnvelope, GameEventType, PlayerDescription, ProtoError, magic};
@@ -483,19 +483,26 @@ pub const EXPIRY_TEXT_TYPE: LogTextType = LogTextType::Magic;
 #[derive(Debug)]
 pub struct ComponentWorld<'a>(pub &'a World);
 
+impl<'a> ComponentWorld<'a> {
+    fn table(&self) -> TableComponentWorld<'a> {
+        TableComponentWorld {
+            objects: self.0.items(),
+            player: self.0.player_guid().unwrap_or(0),
+        }
+    }
+}
+
 impl SpellComponentWorld for ComponentWorld<'_> {
     fn player_id(&self) -> u32 {
-        self.0.player_guid().unwrap_or(0)
+        self.table().player_id()
     }
 
     fn player_bool(&self, key: PropertyBool) -> Option<bool> {
-        let player = self.0.item(self.player_id())?;
-        player.properties.bools.get(&key.0).copied()
+        self.table().player_bool(key)
     }
 
     fn player_int(&self, key: PropertyInt) -> Option<i32> {
-        let player = self.0.item(self.player_id())?;
-        player.properties.ints.get(&key.0).copied()
+        self.table().player_int(key)
     }
 
     fn objects(&self) -> impl Iterator<Item = ComponentObject> + '_ {
@@ -503,8 +510,66 @@ impl SpellComponentWorld for ComponentWorld<'_> {
     }
 
     fn object(&self, object_id: u32) -> Option<ComponentObject> {
-        self.0.item(object_id).map(component_object)
+        self.table().object(object_id)
     }
+}
+
+/// The component check's view of a copy of the item table (a window's).
+#[derive(Debug, Clone, Copy)]
+pub struct TableComponentWorld<'a> {
+    /// The item table.
+    pub objects: &'a ac_core::items::ClientObjectTable,
+    /// The player's object id (0 before the character entered).
+    pub player: u32,
+}
+
+impl SpellComponentWorld for TableComponentWorld<'_> {
+    fn player_id(&self) -> u32 {
+        self.player
+    }
+
+    fn player_bool(&self, key: PropertyBool) -> Option<bool> {
+        let player = self.objects.get(self.player)?;
+        player.properties.bools.get(&key.0).copied()
+    }
+
+    fn player_int(&self, key: PropertyInt) -> Option<i32> {
+        let player = self.objects.get(self.player)?;
+        player.properties.ints.get(&key.0).copied()
+    }
+
+    fn objects(&self) -> impl Iterator<Item = ComponentObject> + '_ {
+        self.objects.objects().map(component_object)
+    }
+
+    fn object(&self, object_id: u32) -> Option<ComponentObject> {
+        self.objects.get(object_id).map(component_object)
+    }
+}
+
+/// An examined spell's components in formula order, each with whether
+/// the player carries one: the formula the player would cast it with
+/// (scarabs and prismatic tapers when the school's focus is carried, the
+/// school is infused or components are switched off; otherwise the
+/// account's personalised recipe), empty slots dropped.
+#[must_use]
+pub fn examine_components(
+    requirements: &SpellComponentRequirements,
+    world: &impl SpellComponentWorld,
+    account_name: &str,
+    spell: &SpellMetadata,
+) -> Vec<(u32, bool)> {
+    let formula = SpellFormulaDefinition {
+        formula_version: spell.formula_version,
+        component_ids: spell.formula_components.clone(),
+        school: spell.school_id.0,
+    };
+    requirements
+        .appropriate_formula_for(world, &formula, account_name)
+        .into_iter()
+        .filter(|&id| id != 0)
+        .map(|id| (id, requirements.is_component_owned(world, id)))
+        .collect()
 }
 
 fn component_object(item: &ac_core::items::ClientObject) -> ComponentObject {

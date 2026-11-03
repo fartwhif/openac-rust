@@ -212,6 +212,13 @@ pub struct CameraTurningSettings {
     /// The configuration page's own "use mouse turning" preference (the
     /// character option of the same name is the server's).
     pub use_mouse_turning: bool,
+    /// Modern mouse turning (an OpenAC option, off by default): dragging
+    /// with the right button pressed over the world turns the view around
+    /// the character, and the character turns to face where it looks.
+    pub modern_mouse_turning: bool,
+    /// With modern mouse turning on, holding both mouse buttons (pressed
+    /// over the world) runs forward (an OpenAC option, off by default).
+    pub both_mouse_buttons_run_forward: bool,
 }
 
 impl Default for CameraTurningSettings {
@@ -223,6 +230,8 @@ impl Default for CameraTurningSettings {
             align_to_slope: true,
             invert_mouse_look_y_axis: false,
             use_mouse_turning: false,
+            modern_mouse_turning: false,
+            both_mouse_buttons_run_forward: false,
         }
     }
 }
@@ -239,6 +248,8 @@ impl CameraTurningSettings {
             align_to_slope: false,
             invert_mouse_look_y_axis: true,
             use_mouse_turning: false,
+            modern_mouse_turning: false,
+            both_mouse_buttons_run_forward: false,
         }
     }
 }
@@ -324,12 +335,29 @@ pub struct PluginUiSettings {
     /// The theme's name as saved (`Classic`, `Moss`, `Brass`); the reader
     /// of the name decides what an unknown one means.
     pub theme: String,
+    /// Where the plugin dock sits, as saved (`floating`,
+    /// `floating-horizontal`, `left`, `right`, `top`, `bottom`); the reader of
+    /// the name decides what an unknown one means.
+    pub dock: String,
+    /// The plugin dock's size, as saved (`smaller`, `default`, `bigger`); the
+    /// reader of the name decides what an unknown one means.
+    pub dock_size: String,
+    /// How the plugin dock opens, as saved (`click`, `hover`); the reader of the
+    /// name decides what an unknown one means.
+    pub dock_opens: String,
+    /// How many windows the plugin dock shows at most before the rest scroll;
+    /// 0 or less for as many as the screen has room for.
+    pub dock_slots: i32,
 }
 
 impl Default for PluginUiSettings {
     fn default() -> Self {
         Self {
             theme: "Classic".to_owned(),
+            dock: "floating".to_owned(),
+            dock_size: "default".to_owned(),
+            dock_opens: "click".to_owned(),
+            dock_slots: 0,
         }
     }
 }
@@ -337,6 +365,10 @@ impl Default for PluginUiSettings {
 fn read_plugin_ui(m: &[Member]) -> Result<PluginUiSettings, Unreadable> {
     Ok(PluginUiSettings {
         theme: crate::settings::read_string(m, "theme", "Classic"),
+        dock: crate::settings::read_string(m, "dock", "floating"),
+        dock_size: crate::settings::read_string(m, "dockSize", "default"),
+        dock_opens: crate::settings::read_string(m, "dockOpens", "click"),
+        dock_slots: crate::settings::read_int(m, "dockSlots", 0)?,
     })
 }
 
@@ -412,6 +444,12 @@ fn read_camera(c: &[Member]) -> Result<CameraTurningSettings, Unreadable> {
         align_to_slope: read_bool(c, "alignToSlope", d.align_to_slope),
         invert_mouse_look_y_axis: read_bool(c, "invertMouseLookYAxis", d.invert_mouse_look_y_axis),
         use_mouse_turning: read_bool(c, "useMouseTurning", d.use_mouse_turning),
+        modern_mouse_turning: read_bool(c, "modernMouseTurning", d.modern_mouse_turning),
+        both_mouse_buttons_run_forward: read_bool(
+            c,
+            "bothMouseButtonsRunForward",
+            d.both_mouse_buttons_run_forward,
+        ),
     })
 }
 
@@ -555,9 +593,14 @@ impl SettingsStore {
             ("adjustmentSpeed", float_text(c.adjustment_speed)),
             ("alignToSlope", bool_text(c.align_to_slope)),
             (
+                "bothMouseButtonsRunForward",
+                bool_text(c.both_mouse_buttons_run_forward),
+            ),
+            (
                 "invertMouseLookYAxis",
                 bool_text(c.invert_mouse_look_y_axis),
             ),
+            ("modernMouseTurning", bool_text(c.modern_mouse_turning)),
             ("mouseLookSensitivity", float_text(c.mouse_look_sensitivity)),
             ("stiffness", float_text(c.stiffness)),
             ("useMouseTurning", bool_text(c.use_mouse_turning)),
@@ -591,7 +634,22 @@ impl SettingsStore {
     pub fn save_plugin_ui(&self, p: &PluginUiSettings) -> std::io::Result<()> {
         let mut theme = String::new();
         crate::json::write_string(&mut theme, &p.theme);
-        self.save_section("pluginUi", &object_text(&[("theme", theme)]))
+        let mut dock = String::new();
+        crate::json::write_string(&mut dock, &p.dock);
+        let mut dock_size = String::new();
+        crate::json::write_string(&mut dock_size, &p.dock_size);
+        let mut dock_opens = String::new();
+        crate::json::write_string(&mut dock_opens, &p.dock_opens);
+        self.save_section(
+            "pluginUi",
+            &object_text(&[
+                ("theme", theme),
+                ("dock", dock),
+                ("dockSize", dock_size),
+                ("dockOpens", dock_opens),
+                ("dockSlots", p.dock_slots.to_string()),
+            ]),
+        )
     }
 
     /// Every client-side section at once, with the warnings of those that

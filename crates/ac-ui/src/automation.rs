@@ -1028,6 +1028,8 @@ fn source(p: &[&str], start: usize) -> Option<ItemDragSource> {
             "shortcut" | "shortcutbar" | "toolbar" => Some(ItemDragSource::ShortcutBar),
             "equipment" | "equip" | "paperdoll" => Some(ItemDragSource::Equipment),
             "ground" => Some(ItemDragSource::Ground),
+            "salvage" => Some(ItemDragSource::Salvage),
+            "vendor" => Some(ItemDragSource::Vendor),
             _ => None,
         })
 }

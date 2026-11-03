@@ -16,9 +16,11 @@ use crate::draw::{Color, RenderContext};
 use crate::event::{Key, Modifiers, UiEvent, kind};
 use crate::font::UiFont;
 use crate::root::UiRoot;
+use crate::shapes::CornerRadii;
 use crate::tree::{Element, ElementId, Widget};
 use crate::widgets::Field;
 
+use super::style;
 use super::{Palette, PluginOutbox};
 
 /// Where a control's handlers go: its panel and the outbox, and for a
@@ -90,6 +92,10 @@ pub const FOCUS: Color = Color::rgba(1.0, 0.82, 0.25, 1.0);
 pub const CLASSIC_ARROW: Color = Color::rgba(0.80, 0.74, 0.55, 1.0);
 /// The classic caption colour.
 pub const CLASSIC_CAPTION: Color = Color::rgba(0.86, 0.84, 0.74, 1.0);
+/// A Classic expander's frame.
+pub const CLASSIC_FRAME: Color = Color::rgba(0.46, 0.41, 0.28, 1.0);
+/// The band behind a Classic expander's header.
+pub const CLASSIC_BAND: Color = Color::rgba(0.0, 0.0, 0.0, 0.30);
 /// The alpha a disabled control fades to.
 pub const DISABLED_ALPHA: f32 = super::widgets::DISABLED_ALPHA;
 
@@ -201,15 +207,20 @@ pub fn draw_check_box(
     state: Option<bool>,
     palette: Option<&Palette>,
 ) {
-    let fill = palette.map_or(CLASSIC_FILL, |p| p.field);
-    let border = match palette {
-        Some(p) if state == Some(false) => p.border,
-        Some(p) => p.accent,
-        None => UNLIT_INNER,
-    };
-    let mark = palette.map_or(LIT_INNER, |p| p.accent);
-    rc.fill(x, y, CHECK_BOX_SIZE, CHECK_BOX_SIZE, fill);
-    rc.rect_outline(x, y, CHECK_BOX_SIZE, CHECK_BOX_SIZE, border, 1.0);
+    if let Some(p) = palette {
+        match state {
+            Some(on) => style::check(rc, p, x, y, on),
+            None => {
+                let (size, radius) = (CHECK_BOX_SIZE, style::SMALL_RADIUS);
+                style::surface(rc, x, y, size, size, radius, p.accent, p.accent);
+                rc.smooth_line(x + 3.0, y + 5.5, x + 8.0, y + 5.5, p.field, 1.5);
+            }
+        }
+        return;
+    }
+    let mark = LIT_INNER;
+    rc.fill(x, y, CHECK_BOX_SIZE, CHECK_BOX_SIZE, CLASSIC_FILL);
+    rc.rect_outline(x, y, CHECK_BOX_SIZE, CHECK_BOX_SIZE, UNLIT_INNER, 1.0);
     match state {
         None => rc.fill(x + 3.0, y + 4.0, 5.0, 3.0, mark),
         Some(true) => {
@@ -298,7 +309,10 @@ impl Widget for MarkupCheckbox {
         let (w, h) = size(ui, me);
         let live = enabled(ui, me);
         if self.focused {
-            rc.rect_outline(0.0, 0.0, w, h, FOCUS, 1.0);
+            match &self.palette {
+                Some(p) => style::focus_ring(rc, p, w, h, style::SMALL_RADIUS),
+                None => rc.rect_outline(0.0, 0.0, w, h, FOCUS, 1.0),
+            }
         }
         let y = ((h - CHECK_BOX_SIZE) * 0.5).max(1.0);
         if !live {
@@ -382,6 +396,14 @@ fn draw_radio_glyph(
     });
     let well = a(palette.map_or(CLASSIC_FILL, |p| p.field));
     let mark = a(palette.map_or(LIT_INNER, |p| p.accent));
+    if palette.is_some() {
+        rc.fill_ellipse(x, y, 11.0, 11.0, ring);
+        rc.fill_ellipse(x + 1.0, y + 1.0, 9.0, 9.0, well);
+        if selected {
+            rc.fill_ellipse(x + 3.0, y + 3.0, 5.0, 5.0, mark);
+        }
+        return;
+    }
     rc.fill(x + 3.0, y, 5.0, 1.0, ring);
     rc.fill(x + 1.0, y + 1.0, 9.0, 2.0, ring);
     rc.fill(x, y + 3.0, 11.0, 5.0, ring);
@@ -560,7 +582,27 @@ impl Widget for MarkupRadio {
         let text = fade(self.color, live);
         let outline = self.palette.is_none();
         let p = self.palette.as_ref();
-        if self.segmented {
+        if let (true, Some(p)) = (self.segmented, p) {
+            // A rounded track, the chosen option a pill inside it.
+            let (field, edge) = (fade(p.field, live), fade(p.border, live));
+            style::surface(rc, 0.0, 0.0, w, h, style::CONTROL_RADIUS, field, edge);
+            for (i, item) in self.items.iter().enumerate() {
+                let (x, y, cw, ch) = self.cell(i, w, h);
+                if i as i32 == self.selected {
+                    rc.fill_rounded_rect(
+                        x + 2.0,
+                        y + 2.0,
+                        cw - 4.0,
+                        ch - 4.0,
+                        CornerRadii::all(style::SMALL_RADIUS),
+                        fade(p.selected, live),
+                    );
+                }
+                rc.push_clip(x, y, cw, ch);
+                caption_centred(rc, self.font.as_ref(), item, (x, y, cw, ch), text, false);
+                rc.pop_clip();
+            }
+        } else if self.segmented {
             let face = fade(p.map_or(SEGMENT_FACE, |p| p.field), live);
             let chosen = fade(p.map_or(SEGMENT_SELECTED, |p| p.selected), live);
             let border = fade(p.map_or(UNLIT_INNER, |p| p.border), live);
@@ -603,7 +645,13 @@ impl Widget for MarkupRadio {
             }
         }
         if self.focused {
-            rc.rect_outline(0.0, 0.0, w, h, FOCUS, 1.0);
+            match p {
+                Some(p) if self.segmented => {
+                    style::focus_ring(rc, p, w, h, style::CONTROL_RADIUS);
+                }
+                Some(p) => style::focus_ring(rc, p, w, h, style::SMALL_RADIUS),
+                None => rc.rect_outline(0.0, 0.0, w, h, FOCUS, 1.0),
+            }
         }
     }
 }
@@ -858,12 +906,40 @@ impl Widget for MarkupNumber {
         let (w, h) = size(ui, me);
         let live = enabled(ui, me);
         let valid = self.spec.is_valid_text(&self.inner.text());
-        self.inner.text_color = fade(if valid { self.text_color } else { NUMBER_ERROR }, live);
+        let color = if valid { self.text_color } else { NUMBER_ERROR };
+        let x = w - SPIN_WIDTH;
+        let half = (h * 0.5).floor();
+        if let Some(p) = self.palette {
+            // The field stops at the spin buttons, which are ghosts beside it:
+            // a pressed face, and chevrons.
+            self.inner.text_color = color;
+            if !live {
+                rc.push_alpha(style::DISABLED_ALPHA);
+            }
+            self.inner.draw_detached(x.max(0.0), h, rc);
+            if !live {
+                rc.pop_alpha();
+            }
+            let face = fade(style::pressed(style::hover(&p, p.field)), live);
+            let radii = CornerRadii::all(style::SMALL_RADIUS);
+            if self.spin > 0 {
+                rc.fill_rounded_rect(x + 1.0, 1.0, SPIN_WIDTH - 2.0, half - 1.0, radii, face);
+            } else if self.spin < 0 {
+                let height = h - half - 1.0;
+                rc.fill_rounded_rect(x + 1.0, half, SPIN_WIDTH - 2.0, height, radii, face);
+            }
+            let chevron = fade(p.muted, live);
+            let cx = x + (SPIN_WIDTH - 6.0) * 0.5;
+            let up = (half * 0.5).floor() - 1.5;
+            style::chevron_up(rc, cx, up, 6.0, 3.0, chevron);
+            let down = (half + (h - half) * 0.5).floor() - 1.5;
+            style::chevron(rc, cx, down, 6.0, 3.0, chevron);
+            return;
+        }
+        self.inner.text_color = fade(color, live);
         rc.push_clip(0.0, 0.0, (w - SPIN_WIDTH).max(0.0), h);
         self.inner.draw(ui, me, rc);
         rc.pop_clip();
-        let x = w - SPIN_WIDTH;
-        let half = (h * 0.5).floor();
         let p = self.palette.as_ref();
         let face = fade(p.map_or(SPIN_FACE, |p| p.field), live);
         let pressed = fade(p.map_or(SPIN_PRESSED, |p| p.selected), live);
@@ -1106,19 +1182,20 @@ impl Widget for MarkupHotkey {
         let live = enabled(ui, me);
         let p = self.palette.as_ref();
         let focus = p.map_or(FOCUS, |p| p.accent);
-        rc.fill(
-            0.0,
-            0.0,
-            w,
-            h,
-            fade(p.map_or(HOTKEY_BACKGROUND, |p| p.field), live),
-        );
-        let edge = if self.focused || self.capturing {
-            focus
+        let lit = self.focused || self.capturing;
+        if let Some(p) = p {
+            if !live {
+                rc.push_alpha(style::DISABLED_ALPHA);
+            }
+            style::field(rc, p, w, h, p.field, lit);
+            if !live {
+                rc.pop_alpha();
+            }
         } else {
-            p.map_or(UNLIT_INNER, |p| p.border)
-        };
-        rc.rect_outline(0.0, 0.0, w, h, fade(edge, live), 1.0);
+            rc.fill(0.0, 0.0, w, h, fade(HOTKEY_BACKGROUND, live));
+            let edge = if lit { focus } else { UNLIT_INNER };
+            rc.rect_outline(0.0, 0.0, w, h, fade(edge, live), 1.0);
+        }
         let bound = ac_plugin_ui::hotkeys::Chord::parse_hotkey_text(&self.value).is_some();
         let color = if self.capturing {
             focus

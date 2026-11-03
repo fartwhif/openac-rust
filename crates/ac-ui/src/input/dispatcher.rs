@@ -62,6 +62,12 @@ pub struct InputDispatcher {
     combat_scope: Option<InputScope>,
     camera_alternate_scope: bool,
     held_hold_chords: Vec<KeyChord>,
+    /// The keys and buttons whose press the dispatcher took and that have
+    /// not come up since: only these hold an action. A press the interface
+    /// kept (a text field, a capture, the pointer over a window) holds
+    /// nothing, and one taken before a field got the keyboard holds until
+    /// it is released.
+    pressed: HashSet<InputKey>,
     automation_held: HashSet<InputAction>,
     mouse_click_travel: HashMap<u8, f32>,
     active: bool,
@@ -82,6 +88,7 @@ impl InputDispatcher {
             combat_scope: None,
             camera_alternate_scope: false,
             held_hold_chords: Vec::new(),
+            pressed: HashSet::new(),
             automation_held: HashSet::new(),
             mouse_click_travel: HashMap::new(),
             active: true,
@@ -106,12 +113,14 @@ impl InputDispatcher {
     }
 
     /// Stop dispatching: nothing fires until [`Self::activate`]; capture,
-    /// held chords, automation holds and click candidates are forgotten.
+    /// held chords and keys, automation holds and click candidates are
+    /// forgotten (a key still down holds nothing until pressed again).
     pub fn deactivate(&mut self) {
         self.active = false;
         self.capturing = false;
         self.capture_modifier_candidate = None;
         self.held_hold_chords.clear();
+        self.pressed.clear();
         self.automation_held.clear();
         self.mouse_click_travel.clear();
         self.camera_alternate_scope = false;
@@ -267,12 +276,15 @@ impl InputDispatcher {
     }
 
     /// An action is held now: one of its chords is down with exactly its
-    /// modifiers (a bare chord stays held with Shift added) and resolves
-    /// to it in the active scopes; or automation holds it. Nothing is held
-    /// while the UI has the keyboard.
+    /// modifiers (a bare chord stays held with Shift added), its key's press
+    /// was taken here, and it resolves to the action in the active scopes;
+    /// or automation holds it. A held action ends when its key comes up,
+    /// not when a text field takes the keyboard: the character running on
+    /// a held key keeps running while the chat entry has the keyboard, and
+    /// a key typed into the entry moves nothing.
     #[must_use]
     pub fn is_action_held(&self, action: InputAction, devices: &dyn InputDevices) -> bool {
-        if !self.active || action == InputAction::None || devices.want_capture_keyboard() {
+        if !self.active || action == InputAction::None {
             return false;
         }
         if self.automation_held.contains(&action) {
@@ -280,6 +292,7 @@ impl InputDispatcher {
         }
         self.bindings.all().iter().any(|b| {
             b.action == action
+                && self.pressed.contains(&b.chord.key)
                 && is_chord_held(b.chord, devices)
                 && self
                     .find_active_held(b.chord, b.activation, devices)
@@ -427,6 +440,7 @@ impl InputDispatcher {
         if devices.want_capture_keyboard() {
             return;
         }
+        self.pressed.insert(InputKey::Key(key));
         let chord = keyboard_chord(key, modifiers);
         self.current_physical_chord = Some(chord);
         let presses = self.find_active_bindings(chord, ActivationType::Press);
@@ -450,6 +464,7 @@ impl InputDispatcher {
         if !self.active {
             return;
         }
+        self.pressed.remove(&InputKey::Key(key));
         if self.capturing {
             if self.capture_modifier_candidate == Some(key) {
                 self.capturing = false;
@@ -508,6 +523,7 @@ impl InputDispatcher {
         if devices.want_capture_mouse() {
             return;
         }
+        self.pressed.insert(InputKey::Mouse(button));
         let chord = KeyChord::mouse(button, modifiers);
         let presses = self.find_active_bindings(chord, ActivationType::Press);
         self.fire_all(&presses, ActivationType::Press);
@@ -546,6 +562,7 @@ impl InputDispatcher {
         if !self.active {
             return;
         }
+        self.pressed.remove(&InputKey::Mouse(button));
         let chord = KeyChord::mouse(button, modifiers);
         let travel = self.mouse_click_travel.remove(&button);
         let releases = self.find_active_bindings(chord, ActivationType::Release);

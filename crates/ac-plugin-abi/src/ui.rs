@@ -14,17 +14,23 @@ use crate::wire_record;
 pub const EVENT_TAG: u32 = 100;
 
 /// Writes a fieldless-or-tuple enum's `Wire` from one list: each variant's
-/// tag and its fields in order.
+/// tag and its fields in order. A field a later API minor version added goes
+/// last, after a `;` and `since (MAJOR, MINOR)`: a plugin built for an older
+/// version writes and reads the variant without it, and it reads as its
+/// default ([`Wire::read_at`]), so such a plugin still loads.
 macro_rules! wire_enum {
     (
         $(#[$meta:meta])*
         pub enum $name:ident ($what:literal) {
-            $( $(#[$vmeta:meta])* $variant:ident $( ( $($field:ident : $ty:ty),* ) )? = $tag:literal ),* $(,)?
+            $( $(#[$vmeta:meta])* $variant:ident $( (
+                $($field:ident : $ty:ty),*
+                $(; since ($smaj:literal, $smin:literal) $later:ident : $lty:ty)?
+            ) )? = $tag:literal ),* $(,)?
         }
     ) => {
         $(#[$meta])*
         pub enum $name {
-            $( $(#[$vmeta])* $variant $( ( $($ty),* ) )?, )*
+            $( $(#[$vmeta])* $variant $( ( $($ty,)* $($lty)? ) )?, )*
         }
 
         impl Wire for $name {
@@ -32,24 +38,90 @@ macro_rules! wire_enum {
                 $(
                     .tag($tag as u64)
                     .name(stringify!($variant))
-                    $( $( .name(stringify!($field)).of(<$ty as Wire>::SHAPE) )* )?
+                    $(
+                        $( .name(stringify!($field)).of(<$ty as Wire>::SHAPE) )*
+                        $( .name(stringify!($later)).of(<$lty as Wire>::SHAPE) )?
+                    )?
                 )*
                 .finish();
             fn encode(&self, w: &mut Writer) {
                 match self {
-                    $( Self::$variant $( ( $($field),* ) )? => {
+                    $( Self::$variant $( ( $($field,)* $($later)? ) )? => {
                         ($tag as u8).encode(w);
-                        $( $( $field.encode(w); )* )?
+                        $(
+                            $( $field.encode(w); )*
+                            $( $later.encode(w); )?
+                        )?
                     } )*
                 }
             }
             fn read(r: &mut Reader<'_>) -> Self {
                 match u8::read(r) {
-                    $( $tag => Self::$variant $( ( $( <$ty as Wire>::read(r) ),* ) )?, )*
+                    $( $tag => Self::$variant $( (
+                        $( <$ty as Wire>::read(r), )*
+                        $( <$lty as Wire>::read(r) )?
+                    ) )?, )*
                     tag => {
                         r.fail(DecodeError::UnknownTag { what: $what, tag: u32::from(tag) });
                         // A stand-in: the first variant, read from the
                         // failed reader (no bytes left).
+                        wire_enum!(@first r; $( $variant $( ( $($field : $ty),* ) )? );*)
+                    }
+                }
+            }
+            const VERSIONED: bool = false
+                $( $(
+                    $( || <$ty as Wire>::VERSIONED )*
+                    $( || $crate::__wire_marked!(($smaj, $smin)) || <$lty as Wire>::VERSIONED )?
+                )? )*;
+            fn shape_at(version: $crate::ApiVersion) -> u64 {
+                let _ = version;
+                #[allow(unused_mut)]
+                let mut shape = $crate::wire::Shape::new("enum");
+                $(
+                    shape = shape.tag($tag as u64).name(stringify!($variant));
+                    $(
+                        $( shape = shape.name(stringify!($field)).of(<$ty as Wire>::shape_at(version)); )*
+                        $(
+                            if $crate::__wire_since!(($smaj, $smin)).is_at_most(version) {
+                                shape = shape.name(stringify!($later)).of(<$lty as Wire>::shape_at(version));
+                            }
+                        )?
+                    )?
+                )*
+                shape.finish()
+            }
+            fn encode_at(&self, version: $crate::ApiVersion, w: &mut Writer) {
+                let _ = version;
+                match self {
+                    $( Self::$variant $( ( $($field,)* $($later)? ) )? => {
+                        ($tag as u8).encode(w);
+                        $(
+                            $( $field.encode_at(version, w); )*
+                            $(
+                                if $crate::__wire_since!(($smaj, $smin)).is_at_most(version) {
+                                    $later.encode_at(version, w);
+                                }
+                            )?
+                        )?
+                    } )*
+                }
+            }
+            fn read_at(r: &mut Reader<'_>, version: $crate::ApiVersion) -> Self {
+                let _ = version;
+                match u8::read(r) {
+                    $( $tag => Self::$variant $( (
+                        $( <$ty as Wire>::read_at(r, version), )*
+                        $(
+                            if $crate::__wire_since!(($smaj, $smin)).is_at_most(version) {
+                                <$lty as Wire>::read_at(r, version)
+                            } else {
+                                ::core::default::Default::default()
+                            }
+                        )?
+                    ) )?, )*
+                    tag => {
+                        r.fail(DecodeError::UnknownTag { what: $what, tag: u32::from(tag) });
                         wire_enum!(@first r; $( $variant $( ( $($field : $ty),* ) )? );*)
                     }
                 }
@@ -313,13 +385,13 @@ wire_record! {
         pub window_id: String,
         /// The caption.
         pub title: String,
-        /// Initials on the shelf button when there is no icon.
+        /// Initials on the dock slot when there is no icon.
         pub icon_text: Option<String>,
-        /// The shelf icon (a full image id or a bare index; 0 none).
+        /// The dock icon (a full image id or a bare index; 0 none).
         pub icon_surface_id: u32,
         /// Open at once.
         pub start_visible: bool,
-        /// A button on the plugin shelf.
+        /// A slot on the plugin dock.
         pub show_in_side_panel: bool,
         /// The markup.
         pub markup: String,
@@ -329,6 +401,9 @@ wire_record! {
         pub bindings: Vec<TypedBindingDecl>,
         /// The item type of every items list.
         pub item_types: Vec<ItemTypeDecl>,
+        /// The window's own dock icon: a `.png` in the plugin's folder, by a
+        /// path relative to it, tried ahead of the plugin's `icon.png`.
+        since (1, 4) pub icon_file: Option<String>,
     }
 }
 
@@ -719,13 +794,13 @@ wire_record! {
         pub window_id: String,
         /// The caption.
         pub title: String,
-        /// Initials on the shelf button when there is no icon.
+        /// Initials on the dock slot when there is no icon.
         pub icon_text: Option<String>,
-        /// The shelf icon (a full image id or a bare index; 0 none).
+        /// The dock icon (a full image id or a bare index; 0 none).
         pub icon_surface_id: u32,
         /// Open at once.
         pub start_visible: bool,
-        /// A button on the plugin shelf.
+        /// A slot on the plugin dock.
         pub show_in_side_panel: bool,
         /// The markup.
         pub markup: String,
@@ -733,6 +808,9 @@ wire_record! {
         pub binding_type: String,
         /// Every binding name the markup may use.
         pub bindings: Vec<BindingDecl>,
+        /// The window's own dock icon: a `.png` in the plugin's folder, by a
+        /// path relative to it, tried ahead of the plugin's `icon.png`.
+        since (1, 4) pub icon_file: Option<String>,
     }
 }
 
@@ -883,8 +961,12 @@ wire_enum! {
         StrokeRect(rect: Rect, color: Color, thickness: f32) = 2,
         /// A line: from x, from y, to x, to y, colour, thickness.
         Line(x0: f32, y0: f32, x1: f32, y1: f32, color: Color, thickness: f32) = 3,
-        /// Text at x, y (top-left), colour, outline.
-        Text(text: String, x: f32, y: f32, color: Color, outline: bool) = 4,
+        /// Text at x, y (top-left), colour, outline, in one of the plugin's
+        /// fonts ([`crate::Import::UiFontBundled`], [`crate::Import::UiFontLoad`];
+        /// 0: the interface font). Text in a font the plugin no longer holds
+        /// draws nothing. The font came with API 1.4: an older plugin's text
+        /// is in the interface font.
+        Text(text: String, x: f32, y: f32, color: Color, outline: bool; since (1, 4) font: u32) = 4,
         /// An image handle over a rectangle, tinted.
         Image(image: u32, rect: Rect, tint: Color) = 5,
         /// An image over a rectangle turned (radians, clockwise) and scaled
@@ -1074,6 +1156,166 @@ wire_record! {
 }
 
 wire_record! {
+    /// A filled triangle in the world: flat between its corners,
+    /// see-through by its colours' alpha, drawn from both sides and unlit.
+    /// Hills and walls in front of it hide it; it writes no depth, so
+    /// overlapping triangles blend. It does not follow the ground: one
+    /// meant to lie on it is lifted a little (about 0.1 m) by the plugin.
+    /// API 1.3.
+    pub struct WorldTriangle {
+        /// The first corner.
+        pub a: MapPoint,
+        /// The second corner.
+        pub b: MapPoint,
+        /// The third corner.
+        pub c: MapPoint,
+        /// Corner `a`'s colour, `0xRRGGBBAA`; its alpha is how opaque the
+        /// fill is there.
+        pub color_a: u32,
+        /// Corner `b`'s colour, blended across the face.
+        pub color_b: u32,
+        /// Corner `c`'s colour.
+        pub color_c: u32,
+    }
+}
+
+wire_record! {
+    /// A layer's triangles ([`crate::Import::UiTrianglesSet`]); reply
+    /// `bool`. API 1.3.
+    pub struct TriangleSet {
+        /// The layer.
+        pub layer: u32,
+        /// Its triangles from now on. Refused (false, the layer keeps what
+        /// it had) when they and the plugin's other layers' triangles come to
+        /// more than 65,536.
+        pub triangles: Vec<WorldTriangle>,
+    }
+}
+
+wire_enum! {
+    /// What a world marker is pinned to. API 1.3.
+    #[derive(Debug, Clone, PartialEq, Default)]
+    pub enum MarkerAnchor ("marker anchor") {
+        /// Nothing: a marker pinned to nothing is dropped.
+        #[default]
+        None = 0,
+        /// An object, by its id. While the client does not hold it the
+        /// marker is not drawn, and it comes back when it does.
+        Object(object_id: u32) = 1,
+        /// A fixed position, and whether it is on the landscape rather than
+        /// inside a building or dungeon.
+        Position(point: MapPoint, is_outdoor: bool) = 2,
+    }
+}
+
+wire_record! {
+    /// An image hung in the world at a constant size on the screen. It is
+    /// drawn after the world, like a label, so walls and hills do not hide
+    /// it unless it asks with `hidden_by_world`. API 1.3.
+    pub struct WorldIcon {
+        /// Over an object, the client lays its icons out in rows above its
+        /// head and its labels; at a position, the icon is centred on it.
+        pub anchor: MarkerAnchor,
+        /// The image, one of this plugin's own handles. One that is
+        /// released is not drawn.
+        pub image: u32,
+        /// The side of the square the image is fitted into, interface points
+        /// (scaled with the interface by the player's UI Scale; at 100% a
+        /// pixel, two on a Retina Mac), kept to 8..=128; an icon whose size is
+        /// not a finite number is dropped.
+        pub size: f32,
+        /// Multiplied into the image, `0xRRGGBBAA`: white leaves it as it
+        /// is, and the alpha is the icon's opacity.
+        pub tint_rgba: u32,
+        /// A thin frame around the image, `0xRRGGBBAA`.
+        pub border_rgba: Option<u32>,
+        /// Shown up to this many metres away, fading over the last fifth;
+        /// an icon whose range is not a positive finite number is dropped.
+        pub max_range: f32,
+        /// The whole icon goes while walls, doors, hills or anything else in
+        /// the world stands between the camera and its anchor. It comes and
+        /// goes a frame or two after the view changes.
+        pub hidden_by_world: bool,
+    }
+}
+
+wire_record! {
+    /// A marker layer's icons ([`crate::Import::UiMarkersSetIcons`]); reply
+    /// `bool`: false, and the layer keeps what it had, when the plugin has
+    /// no such layer or this set and its other layers' icons come to more
+    /// than 256. API 1.3.
+    pub struct IconSet {
+        /// The layer.
+        pub layer: u32,
+        /// Its icons from now on.
+        pub icons: Vec<WorldIcon>,
+    }
+}
+
+wire_enum! {
+    /// What form a ground shape takes. API 1.3.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+    pub enum GroundShapeKind ("ground shape kind") {
+        /// Nothing: a shape of no kind is dropped.
+        #[default]
+        None = 0,
+        /// A band all the way round the anchor, from the radius less the
+        /// width out to the radius.
+        Ring = 1,
+        /// A circle around the anchor, filled from its centre.
+        Disc = 2,
+        /// Part of a circle: a wedge filled from the centre, or a band like
+        /// a ring's.
+        Arc = 3,
+    }
+}
+
+wire_record! {
+    /// A shape lying on the ground around an anchor: a ring under a target,
+    /// a disc over an area, a wedge in front of a creature. Drawn in the
+    /// world, so walls and hills hide it, and outdoors it follows the slope
+    /// of the land. API 1.3.
+    pub struct GroundShape {
+        /// Around an object's feet, following it, or around a fixed position.
+        pub anchor: MarkerAnchor,
+        /// What form it takes.
+        pub kind: GroundShapeKind,
+        /// The outer radius, metres, 0.1 to 100; a shape outside that is
+        /// dropped.
+        pub radius: f32,
+        /// How wide a ring's or unfilled arc's band is, metres, inward from
+        /// the radius: more than zero and at most the radius, or the shape
+        /// is dropped. Not used by discs and filled arcs.
+        pub width: f32,
+        /// Where an arc starts, as a compass bearing in degrees (0 north, 90
+        /// east); with `faces_object`, from the way the object faces.
+        pub start_degrees: f32,
+        /// How far round an arc goes, clockwise from its start, in degrees:
+        /// more than 0 and at most 360, or the arc is dropped.
+        pub sweep_degrees: f32,
+        /// An arc filled from the centre, a wedge, rather than a band.
+        pub filled: bool,
+        /// An arc over an object turns with it.
+        pub faces_object: bool,
+        /// Its colour, `0xRRGGBBAA`; the alpha is how opaque it is.
+        pub color_rgba: u32,
+    }
+}
+
+wire_record! {
+    /// A marker layer's ground shapes
+    /// ([`crate::Import::UiMarkersSetShapes`]); reply `bool`: false, and the
+    /// layer keeps what it had, when the plugin has no such layer or this
+    /// set and its other layers' shapes come to more than 256. API 1.3.
+    pub struct ShapeSet {
+        /// The layer.
+        pub layer: u32,
+        /// Its shapes from now on.
+        pub shapes: Vec<GroundShape>,
+    }
+}
+
+wire_record! {
     /// A projectile marker (OpenAC `PluginProjectileDebugSample`).
     pub struct ProjectileSample {
         /// Where the step ended.
@@ -1172,18 +1414,103 @@ wire_record! {
     }
 }
 
-wire_enum! {
-    /// A plugin theme the player can pick under Appearance (OpenAC
-    /// `PluginUiThemeKind`).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    pub enum ThemeKind ("theme kind") {
-        /// The client's own black and gold; themed windows draw unthemed.
-        #[default]
-        Classic = 0,
-        /// Charcoal with moss-green accents.
-        Moss = 1,
-        /// Warm graphite with brass accents.
-        Brass = 2,
+/// A plugin theme the player can pick under Appearance (OpenAC
+/// `PluginUiThemeKind`). The kinds after [`Self::Brass`] came with API 1.4:
+/// a plugin built for an older version is told [`Self::Moss`] under any of
+/// them, with the theme's real name and colours, so it still draws in them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeKind {
+    /// The client's own black and gold; themed windows draw unthemed.
+    #[default]
+    Classic,
+    /// Charcoal with moss-green accents.
+    Moss,
+    /// Warm graphite with brass accents.
+    Brass,
+    /// Dark violet with lavender accents.
+    LavenderDusk,
+    /// Blue slate with orange accents.
+    Ember,
+    /// Dark warm grey with coral-red accents.
+    Bloodmoon,
+    /// Blue-black with icy cyan accents.
+    Glacier,
+    /// A light theme: paper with ink text and rust accents.
+    Parchment,
+}
+
+/// The API version that added the theme kinds after [`ThemeKind::Brass`].
+const THEME_KINDS_SINCE: crate::ApiVersion = crate::ApiVersion::new(1, 4);
+
+impl ThemeKind {
+    /// The kind a plugin built for API `version` reads for this one.
+    #[must_use]
+    pub fn known_at(self, version: crate::ApiVersion) -> Self {
+        match self {
+            Self::Classic | Self::Moss | Self::Brass => self,
+            _ if THEME_KINDS_SINCE.is_at_most(version) => self,
+            _ => Self::Moss,
+        }
+    }
+}
+
+impl Wire for ThemeKind {
+    const SHAPE: u64 = crate::wire::Shape::new("enum")
+        .tag(0)
+        .name("Classic")
+        .tag(1)
+        .name("Moss")
+        .tag(2)
+        .name("Brass")
+        .tag(3)
+        .name("LavenderDusk")
+        .tag(4)
+        .name("Ember")
+        .tag(5)
+        .name("Bloodmoon")
+        .tag(6)
+        .name("Glacier")
+        .tag(7)
+        .name("Parchment")
+        .finish();
+    const VERSIONED: bool = true;
+    fn shape_at(version: crate::ApiVersion) -> u64 {
+        if THEME_KINDS_SINCE.is_at_most(version) {
+            return Self::SHAPE;
+        }
+        crate::wire::Shape::new("enum")
+            .tag(0)
+            .name("Classic")
+            .tag(1)
+            .name("Moss")
+            .tag(2)
+            .name("Brass")
+            .finish()
+    }
+    fn encode(&self, w: &mut Writer) {
+        (*self as u8).encode(w);
+    }
+    fn read(r: &mut Reader<'_>) -> Self {
+        match u8::read(r) {
+            0 => Self::Classic,
+            1 => Self::Moss,
+            2 => Self::Brass,
+            3 => Self::LavenderDusk,
+            4 => Self::Ember,
+            5 => Self::Bloodmoon,
+            6 => Self::Glacier,
+            7 => Self::Parchment,
+            tag => {
+                r.fail(DecodeError::UnknownTag {
+                    what: "theme kind",
+                    tag: u32::from(tag),
+                });
+                Self::Classic
+            }
+        }
+    }
+    fn encode_at(&self, version: crate::ApiVersion, w: &mut Writer) {
+        self.known_at(version).encode(w);
     }
 }
 
@@ -1208,6 +1535,16 @@ wire_record! {
     }
 }
 
+impl ThemePalette {
+    /// Whether the face is pale: a light palette, meant for dark text and
+    /// art.
+    #[must_use]
+    pub fn is_light(&self) -> bool {
+        let b = &self.background;
+        0.2126 * f64::from(b.r) + 0.7152 * f64::from(b.g) + 0.0722 * f64::from(b.b) > 127.5
+    }
+}
+
 wire_record! {
     /// The plugin theme the player picked ([`crate::Import::UiTheme`],
     /// [`crate::Event::ThemeChanged`]; OpenAC `PluginUiThemeInfo`), so a
@@ -1216,12 +1553,126 @@ wire_record! {
         /// Which theme.
         pub kind: ThemeKind,
         /// What the Appearance picker calls it: "Classic", "Charcoal +
-        /// moss" or "Warm graphite + brass".
+        /// moss", "Warm graphite + brass", "Lavender Dusk", "Ember",
+        /// "Bloodmoon", "Glacier" or "Parchment".
         pub display_name: String,
         /// Its colours; none under Classic, where themed windows draw
         /// unthemed.
         pub palette: Option<ThemePalette>,
     }
+}
+
+impl ThemeInfo {
+    /// Whether the theme is light: a pale face meant for dark text and art.
+    /// False under Classic.
+    #[must_use]
+    pub fn is_light(&self) -> bool {
+        self.palette.as_ref().is_some_and(ThemePalette::is_light)
+    }
+}
+
+wire_enum! {
+    /// The weights the client's bundled font comes in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum FontWeight ("font weight") {
+        /// Body text.
+        #[default]
+        Regular = 0,
+        /// The weight themed window titles are set in.
+        SemiBold = 1,
+    }
+}
+
+/// The most distinct fonts one plugin may hold.
+pub const FONT_MAXIMUM_COUNT: u32 = 16;
+/// The most memory one plugin's own fonts may take: the files and their
+/// atlases, and the atlases of bundled fonts it alone holds, bytes.
+pub const FONT_MAXIMUM_BYTES: u64 = 16 * 1024 * 1024;
+/// The largest font file a plugin may hand over, bytes.
+pub const FONT_MAXIMUM_FILE_BYTES: usize = 15 * 1024 * 1024;
+/// The most characters one font may prepare.
+pub const FONT_MAXIMUM_GLYPHS: u32 = 2048;
+/// The smallest size a font may be asked for, pixels.
+pub const FONT_MINIMUM_PIXEL_SIZE: f32 = 6.0;
+/// The largest size a font may be asked for, pixels.
+pub const FONT_MAXIMUM_PIXEL_SIZE: f32 = 64.0;
+
+wire_record! {
+    /// The bundled font in a weight at a size ([`crate::Import::UiFontBundled`]).
+    pub struct BundledFontRequest {
+        /// The size, pixels.
+        pub pixel_size: f32,
+        /// The weight.
+        pub weight: FontWeight,
+    }
+}
+
+wire_record! {
+    /// An inclusive range of code points.
+    pub struct CodepointRange {
+        /// The first.
+        pub first: u32,
+        /// The last.
+        pub last: u32,
+    }
+}
+
+wire_record! {
+    /// A font the plugin ships ([`crate::Import::UiFontLoad`]).
+    pub struct FontLoadRequest {
+        /// The plugin's own name for the file, unique within the plugin.
+        pub name: String,
+        /// The TrueType or OpenType file.
+        pub bytes: Vec<u8>,
+        /// The size, pixels.
+        pub pixel_size: f32,
+        /// The characters to prepare, where the font has them; none: U+0020 to
+        /// U+024F, U+0370 to U+052F and U+2000 to U+206F.
+        pub ranges: Vec<CodepointRange>,
+    }
+}
+
+wire_record! {
+    /// What a font request is answered with; all zero when it was refused.
+    pub struct FontInfo {
+        /// The client's number for it; 0 means no font.
+        pub handle: u32,
+        /// The size prepared: the size asked for, to the nearest quarter
+        /// pixel.
+        pub pixel_size: f32,
+        /// How far apart two lines sit, pixels.
+        pub line_height: f32,
+        /// How far below the top of a line the baseline sits, pixels.
+        pub ascent: f32,
+    }
+}
+
+wire_record! {
+    /// Text to measure in a font ([`crate::Import::UiFontMeasure`]).
+    pub struct FontMeasure {
+        /// The font.
+        pub font: u32,
+        /// The text.
+        pub text: String,
+    }
+}
+
+/// The sizes themed windows are drawn with, in interface pixels, so a canvas
+/// drawn to match uses the same ones. A plugin takes the values of the SDK it
+/// was built with.
+pub mod theme_metrics {
+    /// The corner radius of a themed window.
+    pub const WINDOW_RADIUS: f32 = 10.0;
+    /// The corner radius of a button, input or other control.
+    pub const CONTROL_RADIUS: f32 = 6.0;
+    /// The height of a themed window's title band.
+    pub const HEADER_HEIGHT: f32 = 24.0;
+    /// The width of a switch's track.
+    pub const SWITCH_WIDTH: f32 = 26.0;
+    /// The height of a switch's track.
+    pub const SWITCH_HEIGHT: f32 = 14.0;
+    /// The diameter of a switch's knob.
+    pub const SWITCH_KNOB: f32 = 8.0;
 }
 
 wire_record! {
@@ -1283,6 +1734,7 @@ mod tests {
                     kind: BindingKind::TextList,
                 },
             ],
+            icon_file: Some("icons/demo.png".into()),
         };
         assert_eq!(
             PanelRegistration::from_bytes(&registration.to_bytes()),
@@ -1305,7 +1757,7 @@ mod tests {
                     },
                     1.5,
                 ),
-                PaintCmd::Text("hi".into(), 1.0, 2.0, Color::default(), true),
+                PaintCmd::Text("hi".into(), 1.0, 2.0, Color::default(), true, 9),
                 PaintCmd::ImageTransformed(
                     7,
                     Rect::default(),

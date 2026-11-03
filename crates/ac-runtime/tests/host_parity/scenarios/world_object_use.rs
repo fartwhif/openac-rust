@@ -51,7 +51,7 @@ fn using_a_corpse_several_metres_off_looks_the_same_on_both_clients() {
         record(transcript, "use", &used);
         let is_busy = busy(arm);
         transcript.record("busy", is_busy);
-        let out = arm.record_outbound(transcript);
+        let out = arm.record_outbound_while_walking(transcript);
         assert_eq!(used.status, ItemStatus::Started, "{}", arm.name());
         assert!(is_busy);
         assert!(sent(&out, USE_ACTION).is_empty(), "{}: {out:?}", arm.name());
@@ -60,7 +60,7 @@ fn using_a_corpse_several_metres_off_looks_the_same_on_both_clients() {
         arm.wait(std::time::Duration::from_millis(150));
         let is_busy = busy(arm);
         transcript.record("busy", is_busy);
-        let out = arm.record_outbound(transcript);
+        let out = arm.record_outbound_while_walking(transcript);
         assert!(is_busy);
         assert!(sent(&out, USE_ACTION).is_empty());
     });
@@ -116,7 +116,7 @@ fn two_uses_in_a_row_are_refused_the_same_on_both_clients() {
         record(transcript, "second", &second);
         let is_busy = busy(arm);
         transcript.record("busy", is_busy);
-        let out = arm.record_outbound(transcript);
+        let out = arm.record_outbound_while_walking(transcript);
         assert_eq!(second.status, ItemStatus::Busy, "{}", arm.name());
         assert!(is_busy);
         assert!(sent(&out, USE_ACTION).is_empty());

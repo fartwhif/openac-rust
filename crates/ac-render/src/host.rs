@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -25,11 +26,13 @@ use crate::surface::{AdapterSummary, AttachedWindow, GraphicsOptions};
 /// What to open on attach.
 #[derive(Debug, Clone)]
 pub struct WindowSpec {
-    /// The title bar text.
+    /// The title bar text until the window's first refresh; from then on
+    /// the window titles itself ([`crate::title`]: the character's name in
+    /// the world, else the program and its version).
     pub title: String,
-    /// Inner width in physical pixels.
+    /// Inner width: pixels, points on macOS (as the resolution picks).
     pub width: u32,
-    /// Inner height in physical pixels.
+    /// Inner height: pixels, points on macOS (as the resolution picks).
     pub height: u32,
     /// The color every frame is cleared to (the sky until a sky is drawn).
     pub clear_color: wgpu::Color,
@@ -150,6 +153,8 @@ enum HostCommand {
     Mixer(String),
     UiType(String, bool),
     UiScript(crate::ui::window::UiScript),
+    /// Answered by raising the counter: the event loop is still turning.
+    Ping(Arc<AtomicU64>),
     Shutdown,
 }
 
@@ -208,6 +213,8 @@ pub struct HostHandle {
     proxy: EventLoopProxy<HostCommand>,
     /// The host has the dats: every window it opens draws the world.
     draws_world: bool,
+    /// Pings the event loop has answered.
+    answered_pings: Arc<AtomicU64>,
 }
 
 impl HostHandle {
@@ -315,6 +322,20 @@ impl HostHandle {
         self.send(HostCommand::Shutdown)
     }
 
+    /// Asks the event loop to answer: [`HostHandle::answered_pings`] rises
+    /// once it has. The loop answers while it turns, minimized or not (a
+    /// command wakes it); a hung loop does not, which is how a stuck game
+    /// window is told apart.
+    pub fn ping(&self) -> Result<(), HostClosed> {
+        self.send(HostCommand::Ping(Arc::clone(&self.answered_pings)))
+    }
+
+    /// How many pings the event loop has answered.
+    #[must_use]
+    pub fn answered_pings(&self) -> u64 {
+        self.answered_pings.load(Ordering::Relaxed)
+    }
+
     fn send(&self, command: HostCommand) -> Result<(), HostClosed> {
         self.proxy.send_event(command).map_err(|_| HostClosed)
     }
@@ -348,6 +369,7 @@ impl WindowHost {
             // Its windows draw the world exactly when it has the dats
             // (`run` builds their world settings from them).
             draws_world: options.dat_dir.is_some(),
+            answered_pings: Arc::default(),
         };
         let (events, receiver) = mpsc::channel();
         Ok((
@@ -699,6 +721,10 @@ impl ApplicationHandler<HostCommand> for HostApp {
                 AttachInput::AttachRequested
             }
             HostCommand::Detach => AttachInput::DetachRequested,
+            HostCommand::Ping(answered) => {
+                answered.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             HostCommand::Zoom(steps) => {
                 if let Some(window) = self.window.as_mut() {
                     window.zoom(steps);

@@ -521,7 +521,10 @@ fn trade_note_denominations(dats: &DatCollection) -> Result<HashMap<u32, i32>, T
 
 /// Each school's focus weenie class: the master map names the category's
 /// map, whose slot names the focus map.
-fn magic_packs(dats: &DatCollection) -> Result<HashMap<u32, u32>, TablesError> {
+///
+/// # Errors
+/// When a map cannot be read.
+pub fn magic_packs(dats: &DatCollection) -> Result<HashMap<u32, u32>, TablesError> {
     let master_id = dats.portal.header().master_map_id.cast_unsigned();
     if master_id == 0 {
         return Ok(HashMap::new());

@@ -80,12 +80,23 @@ under their permissive terms (MIT).
 
 ## Noto Sans
 
-The game client embeds unmodified Noto Sans Regular from the Noto project
-(compiled into `crates/ac-ui`). Copyright 2018 The Noto Project Authors.
+The game client embeds unmodified Noto Sans Regular and SemiBold from the Noto
+project (compiled into `crates/ac-plugin-ui`). Copyright 2018 The Noto Project Authors.
 Licensed under the SIL Open Font License 1.1. See
 [the full license](assets/fonts/NotoSans/OFL.txt) and
 [the pinned source and checksum](assets/fonts/NotoSans/README.md). Release
 packages include a copy as `licenses/NotoSans-OFL.txt`.
+
+## Cantarell
+
+On Linux, the Wayland window decorations (`sctk-adwaita`, through winit)
+embed unmodified Cantarell Regular 0.0.5 for the title bar's text when the
+desktop's own font cannot be found; it is compiled into the Linux `openac`
+and `openac-launcher` executables only. Copyright (c) 2009-2011, Understanding Limited; Copyright (c)
+2010-2011, Jakub Steiner. Licensed under the SIL Open Font License 1.1. See
+[the full license](assets/fonts/Cantarell/OFL.txt) and
+[its source](assets/fonts/Cantarell/README.md). Release packages include a
+copy as `licenses/Cantarell-OFL.txt`.
 
 ## Launcher fonts (egui)
 
@@ -120,7 +131,7 @@ Windows and Linux are under these licenses:
 |---|---|
 | MIT OR Apache-2.0 (and the same with Zlib, BSD-2-Clause or 0BSD as further options) | wgpu, glam, egui, arboard, bytemuck, miniz_oxide, sha2, native-tls, zerocopy, most others |
 | MIT | tracing, fancy-regex, generic-array, schannel, nix, openssl-sys, the Wayland client crates |
-| Apache-2.0 | winit, cpal, openssl (the Rust bindings) |
+| Apache-2.0 | winit, cpal, openssl (the Rust bindings), ab_glyph (Linux window decorations' title text) |
 | Apache-2.0 WITH LLVM-exception | wasmtime, cranelift, regalloc2, pulley-interpreter |
 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT | wasmparser, wasm-encoder, rustix, linux-raw-sys |
 | MIT OR Unlicense | memchr, aho-corasick |

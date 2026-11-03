@@ -672,6 +672,127 @@ fn a_temporary_pregame_viewport_does_not_change_the_characters_arrangement() {
     assert_ne!(dir.text(), before);
 }
 
+// ── The plugin dock ─────────────────────────────────────────────────────
+
+/// A plugin dock on a new host, as the window mounts it.
+fn dock_host() -> UiHost {
+    use ac_ui::plugin::dock::{PluginDock, WINDOW};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut host = host(1280.0, 720.0);
+    let dock = PluginDock::build(
+        &mut host.root,
+        None,
+        None,
+        Rc::new(RefCell::new(Vec::new())),
+    );
+    let frame = dock.root;
+    let top = host.root.root();
+    host.root.add_child(top, frame);
+    host.root
+        .register_window(WINDOW, frame, Some(frame), 0)
+        .unwrap();
+    host.attach_controller(WINDOW, Box::new(dock)).unwrap();
+    host.pump();
+    host.take_outputs();
+    host
+}
+
+#[test]
+fn the_plugin_dock_remembers_being_minimized_per_character_and_keeps_its_saved_name() {
+    use ac_ui::plugin::dock::{PluginDock, WINDOW};
+    assert_eq!(WINDOW, "plugin-shelf");
+    let dir = Dir::new();
+    let minimized = |host: &mut UiHost| {
+        host.with_controller::<PluginDock, _>(WINDOW, |c, _| c.is_minimized())
+            .unwrap()
+    };
+    {
+        let mut host = dock_host();
+        let mut p = persist(&mut host, Some(dir.store()), "Alice", (1280, 720));
+        p.set_gameplay_active(&mut host, true);
+        p.restore_all(&mut host);
+        assert!(!minimized(&mut host));
+        let tile = host
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.layout().tile)
+            .unwrap();
+        // The dock is hidden with no plugin windows; the state is the point.
+        host.root.show_window(WINDOW);
+        let frame = host.root.window(WINDOW).unwrap().frame;
+        let at = host.root.element(frame).map(|e| (e.left, e.top)).unwrap();
+        let (x, y) = ((at.0 + tile.x + 4.0) as i32, (at.1 + tile.y + 4.0) as i32);
+        host.mouse_move(x, y);
+        host.mouse_down(ac_ui::event::MouseButton::Left, x, y, 0);
+        host.mouse_up(ac_ui::event::MouseButton::Left, x, y, 0);
+        host.tick(0.016, 16, None);
+        assert!(minimized(&mut host));
+        p.follow(&mut host);
+    }
+    // A new run for the same character comes back minimized.
+    let mut host = dock_host();
+    let mut p = persist(&mut host, Some(dir.store()), "Alice", (1280, 720));
+    p.set_gameplay_active(&mut host, true);
+    p.restore_all(&mut host);
+    assert!(minimized(&mut host));
+    // Another character has its own.
+    p.set_character(&mut host, "Bob");
+    p.restore_all(&mut host);
+    assert!(!minimized(&mut host));
+}
+
+#[test]
+fn a_saved_rail_restores_to_its_edge_with_its_place_along_it() {
+    use ac_ui::plugin::dock::{DockMode, PluginDock, WINDOW};
+    let dir = Dir::new();
+    {
+        let mut host = dock_host();
+        host.with_controller::<PluginDock, _>(WINDOW, |c, ui| c.set_mode(ui, DockMode::Right));
+        let mut p = persist(&mut host, Some(dir.store()), "Alice", (1280, 720));
+        p.set_gameplay_active(&mut host, true);
+        p.restore_all(&mut host);
+        host.root.move_window(WINDOW, 300.0, 222.0);
+        p.follow(&mut host);
+    }
+    // The saved mode comes first in a new run, then the place.
+    let mut host = dock_host();
+    host.with_controller::<PluginDock, _>(WINDOW, |c, ui| c.set_mode(ui, DockMode::Right));
+    let mut p = persist(&mut host, Some(dir.store()), "Alice", (1280, 720));
+    p.set_gameplay_active(&mut host, true);
+    p.restore_all(&mut host);
+    host.tick(0.016, 16, None);
+    let (left, top, width, _) = geometry(&host, WINDOW);
+    assert_eq!(width, 46.0);
+    assert_eq!((left, top), (1280.0 - 46.0, 222.0));
+}
+
+#[test]
+fn a_limit_on_the_docks_slots_leaves_its_saved_place_and_size_alone() {
+    use ac_ui::plugin::dock::{PluginDock, WINDOW};
+    let dir = Dir::new();
+    {
+        let mut host = dock_host();
+        host.with_controller::<PluginDock, _>(WINDOW, |c, ui| c.set_slot_limit(ui, Some(2)));
+        let mut p = persist(&mut host, Some(dir.store()), "Alice", (1280, 720));
+        p.set_gameplay_active(&mut host, true);
+        p.restore_all(&mut host);
+        host.root.move_window(WINDOW, 300.0, 222.0);
+        p.follow(&mut host);
+    }
+    // The limit is a client setting, so it comes first in a new run, then the
+    // place, and the saved height of the dock is never taken for one.
+    let mut host = dock_host();
+    let mut p = persist(&mut host, Some(dir.store()), "Alice", (1280, 720));
+    p.set_gameplay_active(&mut host, true);
+    p.restore_all(&mut host);
+    host.tick(0.016, 16, None);
+    let limit = host
+        .with_controller::<PluginDock, _>(WINDOW, |c, _| c.slot_limit())
+        .unwrap();
+    assert_eq!(limit, None);
+    let (left, top, _, _) = geometry(&host, WINDOW);
+    assert_eq!((left, top), (300.0, 222.0));
+}
+
 // ── .SidePanels ─────────────────────────────────────────────────────────
 
 fn side_panel_size_survives_a_map_switch_and_a_fresh_login(chosen: f32) {

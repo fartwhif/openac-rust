@@ -8,6 +8,8 @@ use crate::draw::{Color, RenderContext, TextureRef};
 use crate::event::{UiEvent, kind};
 use crate::geometry::PixelRect;
 use crate::layout_policy::LayoutPolicy;
+use crate::plugin::Palette;
+use crate::plugin::style;
 use crate::root::{ElementMessage, UiRoot};
 use crate::text::Scrollable;
 use crate::tree::{Element, ElementId, Widget};
@@ -54,6 +56,8 @@ pub struct Scrollbar {
     pub plain_border_color: Color,
     /// Plain thumb colour.
     pub plain_nub_color: Color,
+    /// The plugin theme the plain look draws in (none: flat).
+    pub theme_palette: Option<Palette>,
     /// Fill share of a slider (`None`: no fill).
     pub scalar_fill: Option<f32>,
     /// Fill image of a slider.
@@ -144,6 +148,7 @@ impl Default for Scrollbar {
             plain_track_color: Color::rgba(0.0, 0.0, 0.0, 0.6),
             plain_border_color: Color::rgba(0.46, 0.37, 0.16, 1.0),
             plain_nub_color: Color::rgba(0.72, 0.62, 0.34, 1.0),
+            theme_palette: None,
             scalar_fill: None,
             scalar_fill_sprite: 0,
             scalar_range_sprite: 0,
@@ -483,6 +488,41 @@ impl Scrollbar {
             let dw = nw.min(w);
             let dx = x + (w - dw) * 0.5;
             rc.sprite(t, dx, y, dw, h, (0.0, 0.0, dw / nw, h / nh), Color::WHITE);
+        }
+    }
+
+    /// The themed plain look. A slider's thumb is centred on the thumb its
+    /// hit test uses, so it is dragged where it is drawn; a bar that follows
+    /// a scroll model draws its thumb where the model's hit test puts it.
+    fn draw_themed(
+        &self,
+        p: &Palette,
+        model: Option<&Scrollable>,
+        (w, h): (f32, f32),
+        rc: &mut RenderContext<'_>,
+    ) {
+        let active = self.dragging_thumb || self.hovered_thumb;
+        let axis = if self.horizontal { w } else { h };
+        let start = axis_extent(self.decrement_button_extent, axis);
+        let len = (axis - start - axis_extent(self.increment_button_extent, axis)).max(0.0);
+        match model.filter(|_| !self.scalar) {
+            Some(m) => {
+                let (at, extent) = self.model_thumb_rect(m, start, len);
+                if self.horizontal {
+                    style::scroll_thumb_horizontal(rc, p, at, 0.0, extent, h, active);
+                } else {
+                    style::scroll_thumb(rc, p, 0.0, at, w, extent, active);
+                }
+            }
+            None => {
+                let thumb = self.scalar_thumb_extent(axis);
+                let at = (axis - thumb).max(0.0) * self.scalar_position;
+                if self.horizontal {
+                    style::slider(rc, p, w, h, at + thumb * 0.5, active);
+                } else {
+                    style::scroll_thumb(rc, p, 0.0, at, w, thumb, active);
+                }
+            }
         }
     }
 
@@ -910,6 +950,10 @@ impl Widget for Scrollbar {
             return;
         }
         if !self.retail_art {
+            if let Some(p) = self.theme_palette {
+                self.draw_themed(&p, model.as_ref(), (w, h), rc);
+                return;
+            }
             // A model-backed bar (a scrolling group, a log) has no scalar
             // position: its thumb goes where the model puts it, flat, inset 3.
             match model {

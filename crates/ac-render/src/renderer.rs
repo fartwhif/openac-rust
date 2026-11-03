@@ -13,6 +13,7 @@
 mod atlas_upload;
 pub(crate) mod atmosphere;
 mod detail;
+pub(crate) mod icon_probes;
 mod particles;
 pub(crate) mod pipelines;
 mod portal;
@@ -21,6 +22,7 @@ mod sink;
 mod viewport;
 mod world_lines;
 pub(crate) mod world_pipelines;
+mod world_triangles;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +53,7 @@ use crate::animation::pose::rest_poses;
 use crate::animation::source::{AnimationSource, ContentAnimationSource};
 use crate::animation::{AnimationPresenter, FiredHook, HookOwner, StaticKey};
 use crate::appearance::AppearanceKey;
+use crate::appearance_residency::FIRST_SURFACE_HANDLE;
 use crate::assets::{
     GfxObjData, LandblockData, NearData, StaticInstance, SubMeshRange, SurfaceData,
 };
@@ -136,10 +139,6 @@ type Bounds = Option<(Vec3, Vec3)>;
 /// chase camera's sweep sphere).
 const VIEWER_SPHERE_RADIUS: f32 = crate::camera_collision::VIEWER_SPHERE_RADIUS;
 
-/// Handles of substituted surfaces start here (see the loader); they are
-/// never released.
-const FIRST_SURFACE_HANDLE: u32 = 0x1000_0000;
-
 /// Settings of the world renderer.
 #[derive(Debug, Clone)]
 pub struct WorldSettings {
@@ -178,6 +177,14 @@ pub struct WorldStats {
     pub meshes: usize,
     /// Surface textures on the GPU.
     pub surfaces: usize,
+    /// Server objects' looks held (appearances), as of the last sweep.
+    pub appearances: usize,
+    /// Their part variants, as of the last sweep.
+    pub variants: usize,
+    /// Recoloured surface textures on the GPU, as of the last sweep.
+    pub recoloured_surfaces: usize,
+    /// Their bytes.
+    pub recoloured_surface_bytes: u64,
     /// CPU time of the last frame's preparation (loader uploads, the walk,
     /// instance lists), microseconds.
     pub prepare_micros: u64,
@@ -438,6 +445,11 @@ fn held_draws(own_state: u32, holder_draws: bool) -> bool {
 
 /// The renderer. See the module documentation.
 pub(crate) struct WorldRenderer {
+    /// The texture detail the world's textures are made at.
+    texture_detail: crate::texture_detail::WorldTextureDetail,
+    /// The particle range setting's multiplier of every emitter's authored
+    /// degrade distance.
+    particle_range: f32,
     loader: Loader,
     failure: Option<String>,
     near_radius: u32,
@@ -509,8 +521,6 @@ pub(crate) struct WorldRenderer {
     lights: WindowLights,
     /// Bounds and lights of each model.
     model_info: crate::IdMap<u32, ModelInfo>,
-    /// Bounds of each appearance's parts.
-    appearance_bounds: HashMap<AppearanceKey, Option<(Vec3, Vec3)>>,
     /// The player's cell and whether it is sealed (no view outside).
     player_cell_sealed: Option<(u32, bool)>,
     /// The frame's clear colour (the fog colour once the sky is known).
@@ -572,14 +582,14 @@ pub(crate) struct WorldRenderer {
     portal_vertices_capacity: usize,
     /// The plugins' world lines as this frame draws them.
     world_lines: world_lines::WorldLinesGpu,
+    world_triangles: world_triangles::WorldTrianglesGpu,
+    icon_probes: icon_probes::IconProbes,
 
     models: crate::IdMap<u32, Option<Vec<MeshRef>>>,
     requested_models: crate::model_requests::ModelRequests,
-    /// Server objects' models drawn with their appearance.
-    appearances: HashMap<AppearanceKey, Option<Vec<MeshRef>>>,
-    requested_appearances: HashSet<AppearanceKey>,
-    /// Part surface substitutions: variant id to (surface id, handle).
-    variants: HashMap<u32, Vec<(u32, u32)>>,
+    /// Server objects' models drawn with their appearance, their part
+    /// variants and which recoloured surfaces they own.
+    looks: crate::appearance_residency::HeldLooks,
     meshes: crate::IdMap<MeshKey, GfxGpu>,
     /// GfxObjs and surfaces asked for again after a release.
     requested_gfx: HashSet<u32>,
@@ -738,6 +748,11 @@ impl WorldRenderer {
                 texture_entry(2, wgpu::TextureViewDimension::D2Array),
                 sampler_entry(3),
                 uniform_entry(4, wgpu::ShaderStages::FRAGMENT),
+                // The landscape detail texture, its sampler and the detail
+                // tilings.
+                texture_entry(5, wgpu::TextureViewDimension::D2),
+                sampler_entry(6),
+                uniform_entry(7, wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let material_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -761,7 +776,10 @@ impl WorldRenderer {
             device,
             queue,
             &detail_layout,
-            display.building_detail_textures,
+            detail::DetailOptions {
+                building: display.building_detail_textures,
+                landscape: display.landscape_detail_textures,
+            },
         );
         let quality = crate::quality::resolve(display, &settings.quality_overrides);
         let samples = usable_sample_count(quality.msaa_samples, msaa_supported);
@@ -828,10 +846,13 @@ impl WorldRenderer {
         // WebGPU guarantees four samples for half-float targets; the window
         // tells the adapter's own counts (`set_hdr_sample_counts`).
         let hdr_msaa_supported = msaa_supported.iter().copied().filter(|&n| n == 4).collect();
+        let texture_detail = crate::texture_detail::WorldTextureDetail::from_display(display);
         let mut renderer = Self {
+            texture_detail,
+            particle_range: crate::quality::particle_range_multiplier(display.particle_range),
             loader: Loader::spawn(
                 Arc::clone(&settings.content),
-                crate::texture_detail::WorldTextureDetail::from_display(display),
+                texture_detail,
                 device
                     .features()
                     .contains(wgpu::Features::TEXTURE_COMPRESSION_BC),
@@ -875,7 +896,6 @@ impl WorldRenderer {
             ambient_region: None,
             lights: WindowLights::new(),
             model_info: crate::IdMap::default(),
-            appearance_bounds: HashMap::new(),
             player_cell_sealed: None,
             clear: None,
             camera: None,
@@ -923,11 +943,11 @@ impl WorldRenderer {
             ),
             portal_vertices_capacity,
             world_lines: world_lines::WorldLinesGpu::default(),
+            world_triangles: world_triangles::WorldTrianglesGpu::default(),
+            icon_probes: icon_probes::IconProbes::default(),
             models: crate::IdMap::default(),
             requested_models: crate::model_requests::ModelRequests::default(),
-            appearances: HashMap::new(),
-            requested_appearances: HashSet::new(),
-            variants: HashMap::new(),
+            looks: crate::appearance_residency::HeldLooks::default(),
             meshes: crate::IdMap::default(),
             requested_gfx: HashSet::new(),
             requested_surfaces: HashSet::new(),
@@ -1080,6 +1100,21 @@ impl WorldRenderer {
         self.stats
     }
 
+    /// Objects the loaded landblocks place: statics, scenery, buildings
+    /// and the statics of their interior cells (server objects not
+    /// included).
+    pub(crate) fn loaded_objects(&self) -> usize {
+        self.residents
+            .values()
+            .filter_map(|r| r.near.as_ref())
+            .map(|n| {
+                n.statics.len()
+                    + n.buildings.len()
+                    + n.cells.iter().map(|c| c.statics.len()).sum::<usize>()
+            })
+            .sum()
+    }
+
     /// Follow a new window size.
     pub(crate) fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         if self.size == (width, height) || width == 0 || height == 0 {
@@ -1092,18 +1127,32 @@ impl WorldRenderer {
     }
 
     /// Run with the quality `display` resolves to (the effective display
-    /// settings): the streaming window, the work budget, anti-aliasing and
-    /// the terrain's filtering follow at once (texture detail is fixed when
-    /// the world starts).
+    /// settings): the streaming window, the work budget, anti-aliasing, the
+    /// terrain's filtering, the particle range and the texture detail
+    /// follow at once (a new texture detail has the loader make the terrain
+    /// atlas and every world texture again, which replace the old ones as
+    /// they arrive).
     pub(crate) fn apply_display(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         display: &ac_host::settings::DisplaySettings,
     ) {
+        let texture_detail = crate::texture_detail::WorldTextureDetail::from_display(display);
+        if texture_detail != self.texture_detail {
+            self.texture_detail = texture_detail;
+            self.loader
+                .request(LoadRequest::TextureDetail(texture_detail));
+        }
+        self.particle_range = crate::quality::particle_range_multiplier(display.particle_range);
         self.degrade.degrade_distance = display.degrade_distance;
-        self.detail
-            .set_enabled(queue, display.building_detail_textures);
+        self.detail.set_options(
+            queue,
+            detail::DetailOptions {
+                building: display.building_detail_textures,
+                landscape: display.landscape_detail_textures,
+            },
+        );
         self.degrade.keep_distant_buildings = display.keep_distant_buildings;
         self.automatic_degrades = display.automatic_degrades;
         self.graphics_performance = display.graphics_performance;
@@ -1191,9 +1240,10 @@ impl WorldRenderer {
         fly: FlyInput,
     ) {
         let started = Instant::now();
-        // The plugins' lines are set again for this frame's camera, after
-        // the camera has moved.
+        // The plugins' lines and triangles are set again for this frame's
+        // camera, after the camera has moved.
         self.world_lines.clear();
+        self.world_triangles.clear();
         self.pump_loader(device, queue);
         self.ensure_effects();
 
@@ -1224,6 +1274,7 @@ impl WorldRenderer {
                 .is_some_and(|m| m.body.is_some()),
             // Player mode waits for the end of the login presentation.
             world_ready: self.reveal.is_complete() && !self.presents_login(),
+            world_entry: scene.map_or(0, Scene::world_entries),
         });
         if let Some((pos, _)) = player {
             let block = LandblockCoord::of_cell(pos.cell_id);
@@ -2095,6 +2146,7 @@ impl WorldRenderer {
             sky_active: player_outdoors(scene),
             camera: eye,
             source,
+            particle_range: self.particle_range,
         });
     }
 
@@ -2332,7 +2384,21 @@ impl WorldRenderer {
                 |p| (p.visible_cells, p.missing_surfaces, p.missing_gfx),
             );
         let land_cells = std::mem::take(&mut sink.land_cells);
-        let (frame, scratch) = sink.out.finish_keeping();
+        let (mut frame, scratch) = sink.out.finish_keeping();
+        // The landscape is centred on the player's landblock: it and its
+        // neighbours are at full detail, where the landscape detail draws.
+        let full_detail_center = self.region.as_ref().map(|r| {
+            let (x, y) = r.center();
+            LandblockCoord {
+                x: x as u8,
+                y: y as u8,
+            }
+        });
+        crate::draws::mark_full_detail(
+            &mut frame.terrain,
+            &frame.terrain_draws,
+            full_detail_center,
+        );
         // The shadow casters stand in the land cells the walk reached.
         let caster_started = Instant::now();
         let casters = if self.atmosphere.as_ref().is_some_and(|a| a.shadows_on()) {
@@ -2426,13 +2492,7 @@ impl WorldRenderer {
     /// and land cell), asking for models not yet here.
     fn request_missing_models(&mut self, scene: Option<&Scene>) {
         self.server_models_missing.clear();
-        for object in scene.into_iter().flat_map(Scene::objects) {
-            let Some(setup_id) = object.setup_id else {
-                continue;
-            };
-            if object.position.is_none() && object.parent.is_none() {
-                continue;
-            }
+        for (object, setup_id) in drawn_objects(scene) {
             // Held objects do not hold back the login reveal.
             let gates_reveal = object.parent.is_none();
             let key = AppearanceKey::in_world(setup_id, &object.model);
@@ -2445,11 +2505,11 @@ impl WorldRenderer {
                 if self.requested_models.ask(setup_id) {
                     self.loader.request(LoadRequest::Model(setup_id));
                 }
-            } else if self.drawn_by_appearance(&key) && !self.appearances.contains_key(&key) {
+            } else if self.drawn_by_appearance(&key) && !self.looks.contains(&key) {
                 if gates_reveal {
                     self.server_models_missing.push((object.guid, setup_id));
                 }
-                if self.requested_appearances.insert(key.clone()) {
+                if self.looks.ask(&key) {
                     self.loader.request(LoadRequest::Appearance(Box::new(key)));
                 }
             }
@@ -2483,8 +2543,7 @@ impl WorldRenderer {
             let parts = self.models.get(&setup_id).and_then(Option::as_deref)?;
             Some((parts, self.model_info.get(&setup_id).and_then(|i| i.bounds)))
         } else {
-            let parts = self.appearances.get(&key).and_then(Option::as_deref)?;
-            Some((parts, self.appearance_bounds.get(&key).copied().flatten()))
+            self.looks.parts(&key)
         }
     }
 
@@ -2867,46 +2926,60 @@ impl WorldRenderer {
             }
         }
         models.extend(self.viewports.models());
+        let used = looks_in_use(scene, &mut self.viewports);
         let mut gfx: HashSet<u32> = HashSet::new();
-        for id in &models {
-            if let Some(Some(parts)) = self.models.get(id) {
-                gfx.extend(parts.iter().map(|p| p.gfx_obj_id));
-            }
-        }
-        for parts in self.appearances.values().flatten() {
-            gfx.extend(parts.iter().map(|p| p.gfx_obj_id));
-        }
-        // Particle models and textures live emitters draw with.
-        let mut particle_surfaces = HashSet::new();
-        if let Some(effects) = self.effects.as_ref() {
-            gfx.extend(effects.ledger().gfx_objs());
-            particle_surfaces.extend(effects.ledger().surfaces());
-        }
-        for r in self.residents.values() {
-            for b in r.near.iter().flat_map(|n| &n.buildings) {
-                gfx.insert(b.part0.0);
-                gfx.extend(b.levels.iter().map(|l| l.gfx_obj_id));
-            }
-        }
-        let levels: Vec<u32> = gfx
-            .iter()
-            .filter_map(|id| self.meshes.get(&u64::from(*id)))
-            .flat_map(|m| m.degrades.iter().map(|l| l.gfx_obj_id))
-            .collect();
-        gfx.extend(levels);
-        let mut surfaces: HashSet<u32> = HashSet::new();
-        for (key, mesh) in &self.meshes {
-            if *key >> 32 != 0 || gfx.contains(&(*key as u32)) {
-                surfaces.extend(mesh.sub_meshes.iter().map(|s| s.surface_id));
-            }
-        }
-        for map in self.variants.values() {
-            surfaces.extend(map.iter().flat_map(|&(s, h)| [s, h]));
-        }
-        surfaces.extend(particle_surfaces);
+        // Meshes and textures nothing draws stay within their unowned
+        // budgets (OpenAC's residency budgets); the oldest beyond go. Looks
+        // nothing draws any more go, with the variants only they named, and
+        // a recoloured surface no kept look draws with is held in the
+        // texture budget like any other (OpenAC releases a composite
+        // texture's last owner into its unowned budget).
+        // UI Only keeps nothing unowned (OpenAC
+        // `SetUnownedContentRetained(false)`).
+        let retain = !self.ui_only;
+        let swept = crate::appearance_residency::sweep_looks(
+            &mut self.looks,
+            &mut self.unowned_surfaces,
+            |key| used.contains(key),
+            |looks| {
+                for id in &models {
+                    if let Some(Some(parts)) = self.models.get(id) {
+                        gfx.extend(parts.iter().map(|p| p.gfx_obj_id));
+                    }
+                }
+                gfx.extend(looks.all_parts().map(|p| p.gfx_obj_id));
+                // Particle models and textures live emitters draw with.
+                let mut surfaces = HashSet::new();
+                if let Some(effects) = self.effects.as_ref() {
+                    gfx.extend(effects.ledger().gfx_objs());
+                    surfaces.extend(effects.ledger().surfaces());
+                }
+                for r in self.residents.values() {
+                    for b in r.near.iter().flat_map(|n| &n.buildings) {
+                        gfx.insert(b.part0.0);
+                        gfx.extend(b.levels.iter().map(|l| l.gfx_obj_id));
+                    }
+                }
+                let levels: Vec<u32> = gfx
+                    .iter()
+                    .filter_map(|id| self.meshes.get(&u64::from(*id)))
+                    .flat_map(|m| m.degrades.iter().map(|l| l.gfx_obj_id))
+                    .collect();
+                gfx.extend(levels);
+                for (key, mesh) in &self.meshes {
+                    if *key >> 32 != 0 || gfx.contains(&(*key as u32)) {
+                        surfaces.extend(mesh.sub_meshes.iter().map(|s| s.surface_id));
+                    }
+                }
+                surfaces
+            },
+            self.surfaces.iter().map(|(id, s)| (*id, s.bytes)),
+            retain,
+        );
         // Surfaces a kept mesh needs that are not here (released while the
         // mesh was being sent): ask again.
-        let lost: Vec<u32> = surfaces
+        let lost: Vec<u32> = swept
+            .owned
             .iter()
             .copied()
             .filter(|id| *id < FIRST_SURFACE_HANDLE && !self.surfaces.contains_key(id))
@@ -2922,52 +2995,17 @@ impl WorldRenderer {
             .copied()
             .filter(|id| !models.contains(id))
             .collect();
-        // Meshes and textures nothing draws stay within their unowned
-        // budgets (OpenAC's residency budgets); the oldest beyond go.
-        for (key, mesh) in &self.meshes {
-            if *key >> 32 != 0 {
-                continue;
-            }
-            let id = *key as u32;
-            if gfx.contains(&id) {
-                self.unowned_meshes.mark_owned(&id);
-            } else if !self.unowned_meshes.contains(&id) {
-                let bytes = (mesh.vertices.size() + mesh.indices.size()).max(1);
-                let _ = self.unowned_meshes.mark_unowned(id, bytes);
-            }
-        }
-        for (id, surface) in &self.surfaces {
-            if *id >= FIRST_SURFACE_HANDLE {
-                continue;
-            }
-            if surfaces.contains(id) {
-                self.unowned_surfaces.mark_owned(id);
-            } else if !self.unowned_surfaces.contains(id) {
-                let _ = self.unowned_surfaces.mark_unowned(*id, surface.bytes);
-            }
-        }
-        // UI Only keeps nothing unowned (OpenAC
-        // `SetUnownedContentRetained(false)`).
-        let retain = !self.ui_only;
-        let gone_gfx: Vec<u32> = std::iter::from_fn(|| {
-            if retain {
-                self.unowned_meshes.try_take_oldest_over_budget()
-            } else {
-                self.unowned_meshes.try_take_oldest()
-            }
-        })
-        .collect();
-        let gone_surfaces: Vec<u32> = std::iter::from_fn(|| {
-            if retain {
-                self.unowned_surfaces.try_take_oldest_over_budget()
-            } else {
-                self.unowned_surfaces.try_take_oldest()
-            }
-        })
-        .collect();
-        if gone_models.is_empty() && gone_gfx.is_empty() && gone_surfaces.is_empty() {
-            return;
-        }
+        let gone_gfx = self.unowned_meshes.settle(
+            self.meshes
+                .iter()
+                .filter(|(key, _)| *key >> 32 == 0)
+                .map(|(key, mesh)| {
+                    let bytes = (mesh.vertices.size() + mesh.indices.size()).max(1);
+                    (*key as u32, bytes)
+                }),
+            |id| gfx.contains(id),
+            retain,
+        );
         for id in &gone_models {
             self.models.remove(id);
             self.model_info.remove(id);
@@ -2977,15 +3015,24 @@ impl WorldRenderer {
             self.meshes.remove(&u64::from(*id));
             self.requested_gfx.remove(id);
         }
-        for id in &gone_surfaces {
+        for id in &swept.gone_surfaces {
             self.surfaces.remove(id);
             self.requested_surfaces.remove(id);
         }
-        self.loader.request(LoadRequest::Forget {
-            models: gone_models,
-            gfx_objs: gone_gfx,
-            surfaces: gone_surfaces,
-        });
+        // Everything released is forgotten in one request, so the loader
+        // sends each again when next wanted.
+        if let Some(forget) = swept.into_forget(gone_models, gone_gfx) {
+            self.loader.request(forget);
+        }
+        let (count, bytes) = self
+            .surfaces
+            .iter()
+            .filter(|(id, _)| **id >= FIRST_SURFACE_HANDLE)
+            .fold((0, 0), |(n, b), (_, s)| (n + 1, b + s.bytes));
+        self.stats.recoloured_surfaces = count;
+        self.stats.recoloured_surface_bytes = bytes;
+        self.stats.appearances = self.looks.appearance_count();
+        self.stats.variants = self.looks.variant_count();
     }
 
     /// Whether the player's interior cell `cell` can see outside (as last
@@ -3301,6 +3348,8 @@ impl WorldRenderer {
                 Loaded::Icon(icon) => self.icon = Some(icon),
                 Loaded::Surface(surface) => {
                     self.requested_surfaces.remove(&surface.id);
+                    let held = self.surfaces.contains_key(&surface.id);
+                    self.looks.surface_arrived(surface.id, held);
                     self.upload_surface(device, queue, &surface);
                 }
                 Loaded::GfxObj(gfx) => {
@@ -3313,12 +3362,18 @@ impl WorldRenderer {
                     self.models.insert(id, parts);
                     self.model_info.insert(id, info);
                 }
-                Loaded::Variant { id, surfaces } => {
-                    self.variants.insert(id, surfaces);
-                }
+                Loaded::Variant { id, surfaces } => self.looks.variant_arrived(id, surfaces),
                 Loaded::Appearance { key, parts, bounds } => {
-                    self.appearance_bounds.insert((*key).clone(), bounds);
-                    self.appearances.insert(*key, parts);
+                    let surfaces = &self.surfaces;
+                    // One that crossed a forget in flight is refused: the
+                    // loader forgets it and what it named that is gone, and
+                    // the next frame asks for it again.
+                    if let Some(forget) = self
+                        .looks
+                        .appearance_arrived(*key, parts, bounds, |h| surfaces.contains_key(&h))
+                    {
+                        self.loader.request(forget);
+                    }
                 }
                 Loaded::Region {
                     sky,
@@ -3397,6 +3452,18 @@ impl WorldRenderer {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: tiling.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(self.detail.landscape_view()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(self.detail.sampler()),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: self.detail.params().as_entire_binding(),
                 },
             ],
         }));
@@ -3617,14 +3684,7 @@ impl WorldRenderer {
         let handle = if variant == 0 {
             surface_id
         } else {
-            self.variants
-                .get(&variant)
-                .and_then(|map| {
-                    map.binary_search_by_key(&surface_id, |&(s, _)| s)
-                        .ok()
-                        .map(|i| map[i].1)
-                })
-                .unwrap_or(surface_id)
+            self.looks.handle(variant, surface_id).unwrap_or(surface_id)
         };
         self.surfaces.get(&handle)
     }
@@ -3634,6 +3694,17 @@ impl WorldRenderer {
     /// Draw the prepared frame into `target` (which must match the window
     /// size), clearing it to `clear`: the draw stream in order.
     pub(crate) fn draw(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        clear: wgpu::Color,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        self.draw_passes(encoder, target, clear, timestamps);
+        self.icon_probes.resolve(encoder);
+    }
+
+    fn draw_passes(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
@@ -3676,6 +3747,7 @@ impl WorldRenderer {
                 stencil_ops: None,
             }),
             timestamp_writes: timestamps,
+            occlusion_query_set: self.icon_probes.query_set(),
             ..Default::default()
         });
         // Behind portal space the frame is the tunnel's (built in place of
@@ -3688,6 +3760,8 @@ impl WorldRenderer {
         let pipelines = self.plain_pipelines();
         self.draw_steps(&mut pass, &pipelines);
         self.draw_world_lines(&mut pass, &pipelines);
+        self.draw_world_triangles(&mut pass, &pipelines);
+        self.draw_icon_probes(&mut pass, &pipelines);
     }
 
     /// The draw stream in order, with `p`'s pipelines.
@@ -4347,10 +4421,48 @@ impl RevealFacts for RevealState<'_> {
     }
 }
 
+/// The server objects drawn (standing in the world or held by one) and
+/// their models.
+fn drawn_objects(
+    scene: Option<&Scene>,
+) -> impl Iterator<Item = (&ac_runtime::world::ObjectView, u32)> {
+    scene
+        .into_iter()
+        .flat_map(Scene::objects)
+        .filter_map(|object| {
+            let setup_id = object.setup_id?;
+            (object.position.is_some() || object.parent.is_some()).then_some((object, setup_id))
+        })
+}
+
+/// The looks the sweep keeps: those of the server objects drawn (held
+/// objects included) and of the creation previews. Creation is over once a
+/// character is in the world: its previews' looks are let go then.
+fn looks_in_use(
+    scene: Option<&Scene>,
+    viewports: &mut viewport::Viewports,
+) -> HashSet<AppearanceKey> {
+    if scene.is_some_and(Scene::in_world) {
+        viewports.end_creation();
+    }
+    let mut used = scene_appearance_keys(scene);
+    used.extend(viewports.appearance_keys().cloned());
+    used
+}
+
+/// The looks of the server objects drawn (held objects included).
+fn scene_appearance_keys(scene: Option<&Scene>) -> HashSet<AppearanceKey> {
+    drawn_objects(scene)
+        .map(|(object, setup_id)| AppearanceKey::in_world(setup_id, &object.model))
+        .collect()
+}
+
 #[cfg(test)]
 mod atlas_upload_tests;
 #[cfg(test)]
 mod retirement_tests;
+#[cfg(test)]
+mod texture_detail_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4634,5 +4746,98 @@ mod tests {
         for cell in cells {
             assert_eq!(filed[&cell], vec![(HOME, 0), (HOME, 1), (HOME, 2)]);
         }
+    }
+
+    /// A server object recoloured by `texture`, standing in the world
+    /// (`Some(false)`), held by another with no place of its own
+    /// (`Some(true)`), or in a pack (`None`).
+    fn recoloured_object(
+        local_id: u32,
+        texture: u32,
+        held: Option<bool>,
+    ) -> ac_runtime::world::ObjectView {
+        use ac_runtime::world::{EffectFacts, ObjectKey, ObjectView, RadarFacts};
+        ObjectView {
+            key: ObjectKey {
+                local_id,
+                incarnation: 1,
+            },
+            guid: 0x8000_0000 | local_id,
+            name: None,
+            setup_id: Some(0x0200_0001),
+            position: (held == Some(false)).then_some(ac_proto::Position {
+                cell_id: 0xA9B4_0019,
+                origin: ac_proto::Vector3 {
+                    x: 10.0,
+                    y: 20.0,
+                    z: 30.0,
+                },
+                orientation: ac_proto::Quaternion::IDENTITY,
+            }),
+            parent: (held == Some(true)).then_some(ac_proto::PhysicsAttachment {
+                guid: 0x5000_0001,
+                location_id: 1,
+            }),
+            placement: None,
+            rest_placement: 0,
+            scale: None,
+            translucency: None,
+            state: 0,
+            velocity: None,
+            model: ac_proto::ModelData {
+                texture_changes: vec![ac_proto::TextureChange {
+                    part_index: 0,
+                    old_texture: 0x0500_0001,
+                    new_texture: texture,
+                }],
+                ..ac_proto::ModelData::default()
+            },
+            motion_table_id: None,
+            sound_table_id: None,
+            radar: RadarFacts::default(),
+            motion: None,
+            effects: EffectFacts::default(),
+            step_blend: None,
+        }
+    }
+
+    /// The sweep keeps the looks of the objects standing in the world and
+    /// of those they hold (a wielded sword has no place of its own), not
+    /// of what sits in a pack.
+    #[test]
+    fn held_items_keep_their_looks() {
+        let standing = recoloured_object(1, 0x0500_00A0, Some(false));
+        let held = recoloured_object(2, 0x0500_00B0, Some(true));
+        let packed = recoloured_object(3, 0x0500_00C0, None);
+        let mut scene = Scene::default();
+        scene.apply(ac_runtime::session::PresentationEvent::Snapshot(
+            ac_runtime::world::WorldSnapshot {
+                player_guid: None,
+                objects: vec![standing.clone(), held.clone(), packed.clone()],
+            },
+        ));
+        let key =
+            |o: &ac_runtime::world::ObjectView| AppearanceKey::in_world(0x0200_0001, &o.model);
+        let used = scene_appearance_keys(Some(&scene));
+        assert!(used.contains(&key(&standing)));
+        assert!(used.contains(&key(&held)), "a held item keeps its look");
+        assert!(!used.contains(&key(&packed)));
+
+        let mut looks = crate::appearance_residency::HeldLooks::default();
+        for (variant, o) in (1u32..).zip([&standing, &held, &packed]) {
+            looks.variant_arrived(variant, vec![(0x0800_0100, FIRST_SURFACE_HANDLE + variant)]);
+            let part = MeshRef {
+                gfx_obj_id: 0x0100_0001,
+                transform: Mat4::IDENTITY,
+                variant,
+            };
+            let refused = looks.appearance_arrived(key(o), Some(vec![part]), None, |_| true);
+            assert!(refused.is_none());
+        }
+        let released = looks.release_unused(|k| used.contains(k));
+        assert_eq!(released.appearances, vec![key(&packed)]);
+        assert_eq!(released.variants, vec![3]);
+        assert!(looks.contains(&key(&held)));
+        assert_eq!(looks.handle(2, 0x0800_0100), Some(FIRST_SURFACE_HANDLE + 2));
     }
 }

@@ -247,7 +247,8 @@ impl VendorSellRejection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VendorSellCandidate {
     pub owned_by_player: bool,
-    /// Items inside it (a container).
+    /// Objects in its item slots (a container, or the main pack): side
+    /// packs and spell foci take pack slots and are not counted.
     pub contained_item_count: i32,
     pub item_type: u32,
     pub per_unit_value: i32,

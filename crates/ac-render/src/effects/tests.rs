@@ -260,6 +260,23 @@ fn frame_with(
     source: &Setups,
     resident: &dyn Fn(u32) -> bool,
 ) {
+    frame_at_range(
+        effects,
+        scene,
+        source,
+        resident,
+        ac_vfx::EXTENDED_RANGE_MULTIPLIER,
+    );
+}
+
+/// A frame with the particle range setting's multiplier `particle_range`.
+fn frame_at_range(
+    effects: &mut WindowEffects,
+    scene: Option<&Scene>,
+    source: &Setups,
+    resident: &dyn Fn(u32) -> bool,
+    particle_range: f32,
+) {
     let animations = AnimationPresenter::new();
     effects.frame(EffectsFrame {
         dt: 1.0 / 30.0,
@@ -274,6 +291,7 @@ fn frame_with(
         sky_active: false,
         camera: Vec3::ZERO,
         source,
+        particle_range,
     });
 }
 
@@ -703,5 +721,73 @@ fn an_object_first_seen_visible_raises_no_bubbles() {
             .filter(|e| e.attached_object_id == 9)
             .count(),
         0
+    );
+}
+
+/// Whether owner 7's emitters passed the last view test.
+fn owner_7_in_range(fx: &WindowEffects) -> Vec<bool> {
+    fx.vfx()
+        .particles()
+        .emitters()
+        .filter(|e| e.attached_object_id == 7)
+        .map(|e| e.view_eligible)
+        .collect()
+}
+
+/// A completed world view from `viewer` with the object's outdoor cell in
+/// it.
+fn complete_view(fx: &mut WindowEffects, viewer: Vec3) {
+    let view = fx.vfx_mut().visibility_mut();
+    view.begin_frame(viewer);
+    view.use_world_view();
+    view.mark_visible_landscape_cells([CELL]).unwrap();
+    view.complete_frame();
+}
+
+/// The particle range setting is the frame's: "Retail" draws an emitter
+/// out to its authored degrade distance (100 m here), "Extended" out to
+/// twice it (OpenAC `SettingsParticleRangeSource`), and a change applies
+/// on the next frame.
+#[test]
+fn the_particle_range_setting_decides_how_far_emitters_are_drawn() {
+    use ac_host::settings::ParticleRange;
+    let source = setups();
+    let mut fx = effects();
+    let s = scene(vec![view(7, 0x5000_0007, SETUP)]);
+    let range = |r| crate::quality::particle_range_multiplier(r);
+    frame_at_range(
+        &mut fx,
+        Some(&s),
+        &source,
+        &|_| true,
+        range(ParticleRange::Extended),
+    );
+    // The owner stands at (10, 20, 30); the viewer 150 m off along x.
+    let viewer = Vec3::new(160.0, 20.0, 30.0);
+    complete_view(&mut fx, viewer);
+    frame_at_range(
+        &mut fx,
+        Some(&s),
+        &source,
+        &|_| true,
+        range(ParticleRange::Extended),
+    );
+    assert_eq!(
+        owner_7_in_range(&fx),
+        [true],
+        "extended: 150 m is within 200 m"
+    );
+    complete_view(&mut fx, viewer);
+    frame_at_range(
+        &mut fx,
+        Some(&s),
+        &source,
+        &|_| true,
+        range(ParticleRange::Retail),
+    );
+    assert_eq!(
+        owner_7_in_range(&fx),
+        [false],
+        "retail: 150 m is past 100 m"
     );
 }

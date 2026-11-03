@@ -1,7 +1,7 @@
-//! The bundled sans font (Noto Sans Regular, SIL OFL 1.1; the file and its
-//! licence are in `assets/fonts/NotoSans/`): a glyph atlas baked from the
-//! TrueType outlines, used by the modern plugin themes in place of the dat
-//! font, with no operating-system font needed.
+//! The bundled sans font (Noto Sans Regular and SemiBold, SIL OFL 1.1; the
+//! files and their licence are in `assets/fonts/NotoSans/`): a glyph atlas
+//! baked from the TrueType outlines, used by the modern plugin themes in
+//! place of the dat font, with no operating-system font needed.
 //!
 //! The atlas is laid out the way stb_truetype's simple baker lays it out
 //! (OpenAC bakes with it): three code-point ranges, each baked into its own
@@ -12,15 +12,45 @@
 //! coverage inside each box is drawn by `fontdue`, so the pixels themselves
 //! differ slightly from OpenAC's.
 
+use std::sync::Arc;
+
 use ac_dat::objects::FontCharDesc;
 use ttf_parser::{Face, GlyphId};
 
 use crate::draw::TextureRef;
 use crate::font::{Atlas, UiFont};
 
-/// The font file, compiled in.
-pub static NOTO_SANS_REGULAR: &[u8] =
-    include_bytes!("../../../assets/fonts/NotoSans/NotoSans-Regular.ttf");
+pub use ac_plugin_ui::fonts::{NOTO_SANS_REGULAR, NOTO_SANS_SEMIBOLD};
+
+/// The weights of the bundled font.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Weight {
+    /// Body text.
+    #[default]
+    Regular,
+    /// Titles and headings.
+    SemiBold,
+}
+
+impl Weight {
+    /// The font file of this weight.
+    #[must_use]
+    pub fn file(self) -> &'static [u8] {
+        match self {
+            Self::Regular => NOTO_SANS_REGULAR,
+            Self::SemiBold => NOTO_SANS_SEMIBOLD,
+        }
+    }
+
+    /// Added to a bundled font's id, above the bits its size takes, so no
+    /// two weights share a cache key.
+    fn id_offset(self) -> u32 {
+        match self {
+            Self::Regular => 0,
+            Self::SemiBold => 0x0100_0000,
+        }
+    }
+}
 
 /// The size the client loads (pixels from the highest ascender to the
 /// lowest descender).
@@ -34,11 +64,21 @@ pub const ATLAS_SIZE: u32 = 512;
 /// general punctuation and super/subscripts (U+2000..U+206F).
 pub const RANGES: [(u32, u32); 3] = [(32, 560), (0x370, 448), (0x2000, 112)];
 
+/// The smallest size [`bake`] accepts, pixels.
+pub const MINIMUM_PIXEL_HEIGHT: f32 = 8.0;
+
+/// The largest size [`bake`] accepts, pixels.
+pub const MAXIMUM_PIXEL_HEIGHT: f32 = 32.0;
+
+/// A sharper bake's scale goes up in steps this size.
+const SHARP_SCALE_STEP: f32 = 0.25;
+
 /// What a character without a glyph draws as.
 pub const FALLBACK_CHARACTER: char = '?';
 
 /// Font ids for the bundled font start here: a cache key only, never a
-/// dat id (dat fonts are `0x40......`). The size in 1/256 pixels is added.
+/// dat id (dat fonts are `0x40......`). The size in 1/256 pixels and the
+/// weight's offset are added.
 pub const BUNDLED_FONT_ID_BASE: u32 = 0xF000_0000;
 
 /// Why the atlas could not be baked.
@@ -70,6 +110,8 @@ pub struct BakedFont {
     pub height: u32,
     /// The size baked.
     pub pixel_height: f32,
+    /// The weight baked.
+    pub weight: Weight,
     /// Line height, pixels.
     pub line_height: f32,
     /// The baseline below the line top, pixels.
@@ -84,7 +126,7 @@ impl BakedFont {
     #[must_use]
     pub fn create_font(&self, texture: TextureRef) -> UiFont {
         UiFont::new(
-            BUNDLED_FONT_ID_BASE + (self.pixel_height * 256.0) as u32,
+            BUNDLED_FONT_ID_BASE + self.weight.id_offset() + (self.pixel_height * 256.0) as u32,
             Atlas {
                 texture,
                 width: self.width,
@@ -101,24 +143,49 @@ impl BakedFont {
     }
 }
 
-/// Bakes the bundled font at `pixel_height` (8..=32 pixels).
+/// The bundled font in both weights, once its atlases are textures: what
+/// the modern themes draw a window's text in.
+#[derive(Debug, Clone)]
+pub struct ModernFonts {
+    /// Body text.
+    pub regular: Arc<UiFont>,
+    /// Titles and headings.
+    pub semibold: Arc<UiFont>,
+}
+
+/// The scale a sharper bake of a font of `pixel_height` is made at for a
+/// display with `pixels_per_unit`: that density rounded down to a quarter step,
+/// so each texel lands on one framebuffer pixel, and no larger than the largest
+/// bake allows. 1 or below means no sharper bake.
+#[must_use]
+pub fn sharp_scale_for(pixel_height: f32, pixels_per_unit: f32) -> f32 {
+    if !pixels_per_unit.is_finite() {
+        return 1.0;
+    }
+    let limit = pixels_per_unit.min(MAXIMUM_PIXEL_HEIGHT / pixel_height);
+    (limit / SHARP_SCALE_STEP + 1e-3).floor() * SHARP_SCALE_STEP
+}
+
+/// Bakes the bundled font at `pixel_height` (8..=32 pixels) in `weight`.
 ///
 /// # Errors
 ///
 /// The size is out of range, or the atlas or a glyph record cannot hold it.
-pub fn bake(pixel_height: f32) -> Result<BakedFont, BundledFontError> {
-    if !pixel_height.is_finite() || !(8.0..=32.0).contains(&pixel_height) {
+pub fn bake(pixel_height: f32, weight: Weight) -> Result<BakedFont, BundledFontError> {
+    if !pixel_height.is_finite()
+        || !(MINIMUM_PIXEL_HEIGHT..=MAXIMUM_PIXEL_HEIGHT).contains(&pixel_height)
+    {
         return Err(BundledFontError::SizeOutOfRange(pixel_height));
     }
-    let face = Face::parse(NOTO_SANS_REGULAR, 0)
-        .map_err(|e| BundledFontError::Unreadable(e.to_string()))?;
+    let file = weight.file();
+    let face = Face::parse(file, 0).map_err(|e| BundledFontError::Unreadable(e.to_string()))?;
     let hhea = face.tables().hhea;
     let (ascent, descent, gap) = (
         i32::from(hhea.ascender),
         i32::from(hhea.descender),
         i32::from(hhea.line_gap),
     );
-    let baker = Baker::new(&face, pixel_height)?;
+    let baker = Baker::new(file, &face, pixel_height)?;
     let baseline = (ascent as f32 * baker.scale).round_ties_even();
     let page = (ATLAS_SIZE * ATLAS_SIZE) as usize;
     let mut coverage = vec![0u8; page * RANGES.len()];
@@ -143,6 +210,7 @@ pub fn bake(pixel_height: f32) -> Result<BakedFont, BundledFontError> {
         width: ATLAS_SIZE,
         height: ATLAS_SIZE * RANGES.len() as u32,
         pixel_height,
+        weight,
         line_height: ((ascent - descent + gap) as f32 * baker.scale).ceil(),
         ascent: baseline,
         glyphs,
@@ -202,12 +270,12 @@ struct Baker<'a> {
 }
 
 impl<'a> Baker<'a> {
-    fn new(face: &'a Face<'a>, pixel_height: f32) -> Result<Self, BundledFontError> {
+    fn new(file: &[u8], face: &'a Face<'a>, pixel_height: f32) -> Result<Self, BundledFontError> {
         let hhea = face.tables().hhea;
         let scale = pixel_height / (i32::from(hhea.ascender) - i32::from(hhea.descender)) as f32;
         let em = scale * f32::from(face.units_per_em());
         let raster = fontdue::Font::from_bytes(
-            NOTO_SANS_REGULAR,
+            file,
             fontdue::FontSettings {
                 collection_index: 0,
                 // Outlines are flattened for the size they are drawn at.

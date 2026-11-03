@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use super::pipelines::{
-    mesh_pipeline, portal_pipeline, shader, sky_pipeline, terrain_pipeline, world_line_pipeline,
+    icon_probe_pipeline, mesh_pipeline, portal_pipeline, shader, sky_pipeline, terrain_pipeline,
+    world_line_pipeline, world_triangle_pipeline,
 };
 use crate::meshing::{Cull, Translucency};
 
@@ -30,6 +31,10 @@ pub struct WorldPipelines {
     pub viewport_meshes: HashMap<(Translucency, Cull), wgpu::RenderPipeline>,
     /// The plugins' world lines.
     pub world_line: wgpu::RenderPipeline,
+    /// The plugins' world triangles.
+    pub world_triangle: wgpu::RenderPipeline,
+    /// The invisible probes of the icons hidden behind the world.
+    pub icon_probe: wgpu::RenderPipeline,
 }
 
 impl WorldPipelines {
@@ -95,6 +100,8 @@ impl WorldPipelines {
             sky_pipeline(device, format, samples, &sky_shader, &sky_layout, additive)
         });
         let world_line = world_line_pipeline(device, format, samples, layouts.globals);
+        let world_triangle = world_triangle_pipeline(device, format, samples, layouts.globals);
+        let icon_probe = icon_probe_pipeline(device, format, samples, layouts.globals);
         Self {
             terrain,
             portal,
@@ -102,6 +109,8 @@ impl WorldPipelines {
             meshes,
             viewport_meshes,
             world_line,
+            world_triangle,
+            icon_probe,
         }
     }
 }

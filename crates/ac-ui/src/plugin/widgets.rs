@@ -14,10 +14,12 @@ use std::sync::Arc;
 use ac_plugin_ui::list::{self, ColumnPress};
 use ac_plugin_ui::markup::{Column, ColumnHeader, ColumnKind};
 
+use super::style::{self, PointerState};
 use crate::draw::{Color, DEFAULT_OUTLINE_COLOR, RenderContext, TextureRef};
 use crate::event::{Key, UiEvent, kind};
 use crate::font::UiFont;
 use crate::root::{ElementMessage, UiRoot};
+use crate::shapes::CornerRadii;
 use crate::text::Scrollable;
 use crate::tree::{Element, ElementId, Widget};
 use crate::widgets::NineSliceFrame;
@@ -95,6 +97,18 @@ const fn rgb(packed: u32) -> Color {
 }
 
 impl Palette {
+    /// The plugin dock's colours under Classic, its old black and gold. It is
+    /// not a theme: only the dock uses it, and Classic windows still draw
+    /// unthemed.
+    pub const CLASSIC_DOCK: Self = Self {
+        background: Color::rgba(0.0, 0.0, 0.0, 0.88),
+        field: rgb(0x06_0605),
+        border: rgb(0x9E_7A29),
+        text: rgb(0xF0_EBDD),
+        muted: rgb(0xA8_925C),
+        accent: rgb(0xDB_B852),
+        selected: rgb(0x17_300E),
+    };
     /// "Charcoal + moss".
     pub const MOSS: Self = Self {
         background: rgb(0x17_1D1B),
@@ -115,6 +129,63 @@ impl Palette {
         accent: rgb(0xC9_A665),
         selected: rgb(0x51_442D),
     };
+    /// "Lavender Dusk".
+    pub const LAVENDER_DUSK: Self = Self {
+        background: rgb(0x17_141F),
+        field: rgb(0x10_0E17),
+        border: rgb(0x35_2C4A),
+        text: rgb(0xEE_EAF6),
+        muted: rgb(0xA6_9EBA),
+        accent: rgb(0xBB_A0FF),
+        selected: rgb(0x51_2F4A),
+    };
+    /// "Ember".
+    pub const EMBER: Self = Self {
+        background: rgb(0x15_1A21),
+        field: rgb(0x0E_1218),
+        border: rgb(0x2C_3644),
+        text: rgb(0xE8_ECF1),
+        muted: rgb(0x9A_A6B5),
+        accent: rgb(0xFF_9447),
+        selected: rgb(0x1E_3B44),
+    };
+    /// "Bloodmoon".
+    pub const BLOODMOON: Self = Self {
+        background: rgb(0x1C_1617),
+        field: rgb(0x14_0F10),
+        border: rgb(0x43_302F),
+        text: rgb(0xF2_E9E7),
+        muted: rgb(0xB8_A3A0),
+        accent: rgb(0xFF_6B6B),
+        selected: rgb(0x4D_2327),
+    };
+    /// "Glacier".
+    pub const GLACIER: Self = Self {
+        background: rgb(0x11_161C),
+        field: rgb(0x0A_0E13),
+        border: rgb(0x26_323F),
+        text: rgb(0xE4_EEF4),
+        muted: rgb(0x93_A4B3),
+        accent: rgb(0x5E_D6E8),
+        selected: rgb(0x1F_3554),
+    };
+    /// "Parchment", the one light theme.
+    pub const PARCHMENT: Self = Self {
+        background: rgb(0xED_E7DC),
+        field: rgb(0xFA_F7F1),
+        border: rgb(0xC9_BFAE),
+        text: rgb(0x2A_2520),
+        muted: rgb(0x65_5C50),
+        accent: rgb(0xB4_471F),
+        selected: rgb(0xDD_CFB6),
+    };
+
+    /// Whether the face is pale: a light theme, meant for dark text and art.
+    #[must_use]
+    pub fn is_light(&self) -> bool {
+        let b = self.background;
+        0.2126 * b.r + 0.7152 * b.g + 0.0722 * b.b > 0.5
+    }
 
     /// A theme colour by its markup name.
     #[must_use]
@@ -132,7 +203,7 @@ impl Palette {
 }
 
 /// The check box OpenAC draws (`UiCheckLamp`, 11 pixels square), or the
-/// theme's flat box.
+/// theme's rounded one.
 pub fn draw_check(
     rc: &mut RenderContext<'_>,
     x: f32,
@@ -141,18 +212,7 @@ pub fn draw_check(
     palette: Option<&Palette>,
 ) {
     if let Some(p) = palette {
-        rc.fill(x, y, 11.0, 11.0, if checked { p.selected } else { p.field });
-        rc.rect_outline(
-            x,
-            y,
-            11.0,
-            11.0,
-            if checked { p.accent } else { p.border },
-            1.0,
-        );
-        if checked {
-            rc.fill(x + 3.0, y + 3.0, 5.0, 5.0, p.accent);
-        }
+        style::check(rc, p, x, y, checked);
         return;
     }
     let (outer, inner) = if checked {
@@ -242,6 +302,14 @@ fn size(ui: &UiRoot, me: ElementId) -> (f32, f32) {
 
 fn enabled(ui: &UiRoot, me: ElementId) -> bool {
     ui.element(me).is_some_and(|e| e.enabled)
+}
+
+/// Whether a multi-select list's pick adds to the selection (and A selects
+/// every row): Ctrl or the command key (Cmd on a Mac, the Windows key
+/// elsewhere), as in OpenAC `UiSelectModifiers`.
+fn adds_to_selection(modifiers: crate::event::Modifiers) -> bool {
+    use crate::event::Modifiers;
+    modifiers.contains(Modifiers::CTRL) || modifiers.contains(Modifiers::WIN)
 }
 
 /// The outline a tab stop with keyboard focus draws.
@@ -399,6 +467,8 @@ pub struct MarkupButton {
     pub palette: Option<Palette>,
     /// It has keyboard focus as a tab stop.
     pub keyboard_focused: bool,
+    /// Where the pointer and left button are, for the themed look.
+    pub pointer: PointerState,
 }
 
 impl MarkupButton {
@@ -417,6 +487,7 @@ impl MarkupButton {
             tab_selected: None,
             palette: None,
             keyboard_focused: false,
+            pointer: PointerState::default(),
         }
     }
 
@@ -434,6 +505,9 @@ impl MarkupButton {
 
 impl Widget for MarkupButton {
     fn on_event(&mut self, ui: &mut UiRoot, me: ElementId, e: &UiEvent) -> bool {
+        if e.target == Some(me) {
+            self.pointer.observe(e);
+        }
         if let Some(activate) = tab_stop_event(ui, me, e, &mut self.keyboard_focused) {
             if activate {
                 ui.send_message(me, ElementMessage::Clicked { x: 0, y: 0 });
@@ -461,15 +535,35 @@ impl Widget for MarkupButton {
 
     fn draw(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut RenderContext<'_>) {
         let (w, h) = size(ui, me);
-        if self.background.a > 0.0 {
-            rc.fill(0.0, 0.0, w, h, self.background);
+        let live = enabled(ui, me);
+        if let Some(p) = &self.palette {
+            let look = self.pointer.look(live);
+            match self.tab_selected {
+                Some(selected) => style::tab(rc, p, w, h, selected, look),
+                None => style::button(rc, p, (0.0, 0.0, w, h), self.background, self.border, look),
+            }
+            if self.keyboard_focused {
+                style::focus_ring(rc, p, w, h, style::CONTROL_RADIUS);
+            }
+        } else {
+            if self.background.a > 0.0 {
+                rc.fill(0.0, 0.0, w, h, self.background);
+            }
+            if self.border.a > 0.0 {
+                rc.rect_outline(0.0, 0.0, w, h, self.border, 1.0);
+            }
+            if self.keyboard_focused {
+                rc.rect_outline(1.0, 1.0, w - 2.0, h - 2.0, KEYBOARD_FOCUS_OUTLINE, 1.0);
+            }
         }
-        if self.border.a > 0.0 {
-            rc.rect_outline(0.0, 0.0, w, h, self.border, 1.0);
-        }
-        if self.keyboard_focused {
-            rc.rect_outline(1.0, 1.0, w - 2.0, h - 2.0, KEYBOARD_FOCUS_OUTLINE, 1.0);
-        }
+        // A disabled themed control fades all of it, icon and caption too.
+        let fade = |c: Color| {
+            if self.palette.is_some() && !live {
+                style::faded(c)
+            } else {
+                c
+            }
+        };
         let mut icon_column = 0.0;
         if let Some(file) = &self.icon_file {
             file.record();
@@ -482,18 +576,22 @@ impl Widget for MarkupButton {
                 Some(false) => Color::rgba(1.0, 1.0, 1.0, INACTIVE_TAB_ICON_ALPHA),
                 _ => Color::WHITE,
             };
-            draw_icon_tinted(rc, icon, (3.0, (h - extent) * 0.5, extent, extent), tint);
+            draw_icon_tinted(
+                rc,
+                icon,
+                (3.0, (h - extent) * 0.5, extent, extent),
+                fade(tint),
+            );
         }
-        let color = match self.tab_selected {
-            None => self.text_color,
-            Some(_) if !enabled(ui, me) => Color::rgba(0.34, 0.33, 0.29, 1.0),
-            Some(true) => self
-                .palette
-                .map_or(Color::rgba(0.94, 0.76, 0.18, 1.0), |p| p.accent),
-            Some(false) => self
-                .palette
-                .map_or(Color::rgba(0.78, 0.76, 0.67, 1.0), |p| p.muted),
-        };
+        let color = fade(match (self.tab_selected, &self.palette) {
+            (None, _) => self.text_color,
+            (Some(_), Some(p)) if !live => p.muted,
+            (Some(_), None) if !live => Color::rgba(0.34, 0.33, 0.29, 1.0),
+            (Some(true), Some(p)) => p.text,
+            (Some(true), None) => Color::rgba(0.94, 0.76, 0.18, 1.0),
+            (Some(false), Some(p)) => p.muted,
+            (Some(false), None) => Color::rgba(0.78, 0.76, 0.67, 1.0),
+        });
         if !self.text.is_empty() {
             let tw = measure(self.font.as_ref(), &self.text);
             let area = (w - icon_column).max(0.0);
@@ -509,10 +607,8 @@ impl Widget for MarkupButton {
                 self.outline,
             );
         }
-        if self.tab_selected == Some(true) {
-            let underline = self
-                .palette
-                .map_or(Color::rgba(0.77, 0.59, 0.12, 1.0), |p| p.accent);
+        if self.tab_selected == Some(true) && self.palette.is_none() {
+            let underline = Color::rgba(0.77, 0.59, 0.12, 1.0);
             rc.fill(2.0, h - 2.0, (w - 4.0).max(0.0), 1.0, underline);
         }
     }
@@ -580,25 +676,28 @@ impl Widget for MarkupToggle {
 
     fn draw(&mut self, ui: &mut UiRoot, me: ElementId, rc: &mut RenderContext<'_>) {
         let (w, h) = size(ui, me);
+        let live = enabled(ui, me);
+        let mut color = self.color;
+        if !live {
+            color.a = DISABLED_ALPHA;
+        }
+        let y = (h - line_height(self.font.as_ref())) * 0.5;
+        if let Some(p) = &self.palette {
+            let switch_y = ((h - style::SWITCH_HEIGHT) * 0.5).max(0.0);
+            style::switch(rc, p, 1.0, switch_y, self.checked, live);
+            if self.keyboard_focused {
+                style::focus_ring(rc, p, w, h, style::SMALL_RADIUS);
+            }
+            let x = super::content_size::THEMED_TOGGLE_CAPTION_X;
+            text(rc, self.font.as_ref(), &self.text, x, y, color, false);
+            return;
+        }
         if self.keyboard_focused {
             rc.rect_outline(0.0, 0.0, w, h, KEYBOARD_FOCUS_OUTLINE, 1.0);
         }
         let check_y = ((h - CHECK_SIZE) * 0.5).max(1.0);
-        draw_check(rc, 1.0, check_y, self.checked, self.palette.as_ref());
-        let mut color = self.color;
-        if !enabled(ui, me) {
-            color.a = DISABLED_ALPHA;
-        }
-        let y = (h - line_height(self.font.as_ref())) * 0.5;
-        text(
-            rc,
-            self.font.as_ref(),
-            &self.text,
-            17.0,
-            y,
-            color,
-            self.palette.is_none(),
-        );
+        draw_check(rc, 1.0, check_y, self.checked, None);
+        text(rc, self.font.as_ref(), &self.text, 17.0, y, color, true);
     }
 }
 
@@ -623,15 +722,17 @@ impl Widget for MarkupIcon {
     }
 }
 
-/// The panel's frame: the retail nine-piece chrome, or on a themed panel
-/// the theme's fill and border (OpenAC `UiNineSlicePanel`,
-/// `UiPluginMarkupPanel`).
+/// The panel's frame: the retail nine-piece chrome, or on a themed panel a
+/// rounded, shadowed window in the theme's colours, with a band behind its
+/// title (OpenAC `UiNineSlicePanel`, `UiPluginMarkupPanel`).
 #[derive(Debug, Clone, Default)]
 pub struct MarkupFrame {
     /// The retail chrome.
     pub chrome: NineSliceFrame,
     /// The theme in force on a themed panel.
     pub palette: Option<Palette>,
+    /// It has a title, which a theme draws a band behind.
+    pub has_title: bool,
 }
 
 impl Widget for MarkupFrame {
@@ -639,7 +740,12 @@ impl Widget for MarkupFrame {
         match self.palette {
             Some(p) => {
                 let (w, h) = size(ui, me);
-                rc.fill(0.0, 0.0, w, h, p.background);
+                style::window_shadow(rc, w, h);
+                let radii = CornerRadii::all(style::WINDOW_RADIUS);
+                rc.fill_rounded_rect(0.0, 0.0, w, h, radii, p.background);
+                if self.has_title {
+                    style::header(rc, &p, w, style::HEADER_HEIGHT);
+                }
             }
             None => self.chrome.draw(ui, me, rc),
         }
@@ -649,9 +755,10 @@ impl Widget for MarkupFrame {
         match self.palette {
             Some(p) => {
                 let (w, h) = size(ui, me);
-                rc.rect_outline(0.0, 0.0, w, h, p.border, 1.0);
+                let radii = CornerRadii::all(style::WINDOW_RADIUS - 0.5);
+                rc.stroke_rounded_rect(0.5, 0.5, w - 1.0, h - 1.0, radii, p.border, 1.0);
                 if ui.element(me).is_some_and(|e| e.resizable) {
-                    rc.fill(w - 7.0, h - 3.0, 5.0, 1.0, p.muted);
+                    style::resize_grip(rc, &p, w, h);
                 }
             }
             None => self.chrome.draw_after_children(ui, me, rc),
@@ -679,7 +786,8 @@ pub mod vertical_bar {
 const SCROLL_BUTTON: f32 = 16.0;
 
 /// Draws a vertical scrollbar at `x`, `width` wide, the element's height:
-/// retail art, or the theme's flat bar (OpenAC `UiMarkupList.DrawScrollbar`).
+/// retail art, or the theme's slim thumb with no track, `active` while it is
+/// held (OpenAC `UiMarkupList.DrawScrollbar`).
 fn draw_vbar(
     rc: &mut RenderContext<'_>,
     x: f32,
@@ -687,15 +795,12 @@ fn draw_vbar(
     height: f32,
     scroll: &Scrollable,
     palette: Option<&Palette>,
+    active: bool,
 ) {
     if let Some(p) = palette {
-        rc.fill(x, 0.0, width, height, p.field);
-        rc.rect_outline(x, 0.0, width, height, p.border, 1.0);
         let button = SCROLL_BUTTON.min(height / 2.0);
         let (top, extent) = thumb_rect(scroll, button, (height - 2.0 * button).max(0.0));
-        rc.fill(x + 3.0, top, width - 6.0, extent, p.muted);
-        rc.fill(x + 5.0, button / 2.0, width - 10.0, 1.0, p.muted);
-        rc.fill(x + 5.0, height - button / 2.0, width - 10.0, 1.0, p.muted);
+        style::scroll_thumb(rc, p, x, top, width, extent, active);
         return;
     }
     let dec = SCROLL_BUTTON.clamp(0.0, height);
@@ -811,6 +916,8 @@ pub struct MarkupList {
     pub selection_band: bool,
     /// The interface font.
     pub font: Option<Arc<UiFont>>,
+    /// The header's font under a theme (none: the interface font).
+    pub header_font: Option<Arc<UiFont>>,
     /// Fill.
     pub background: Color,
     /// Border.
@@ -911,6 +1018,7 @@ impl MarkupList {
             row_height,
             selection_band: false,
             font,
+            header_font: None,
             background: Color::rgba(0.0, 0.0, 0.0, 0.92),
             border: Color::rgba(0.46, 0.37, 0.16, 1.0),
             text_color: Color::rgba(0.91, 0.87, 0.76, 1.0),
@@ -1149,22 +1257,31 @@ impl MarkupList {
         };
         let (x, top, w, h) = self.button_rect(column, cell_x, cell_w, y);
         let p = self.palette;
-        let base = p.map_or(self.button_color, |p| p.background);
-        let mut border = p.map_or(self.button_border_color, |p| p.border);
-        let mut text_color = p.map_or(self.text_color, |p| p.text);
         let look = self.button_look(row, column, enabled);
-        let mut face = match look {
-            ButtonLook::Hovered => toward(base, border, 0.3),
-            ButtonLook::Pressed => toward(base, Color::rgba(0.0, 0.0, 0.0, 0.0), 0.25),
-            _ => base,
-        };
-        if look == ButtonLook::Disabled {
-            face = dimmed(face);
-            border = dimmed(border);
-            text_color = dimmed(text_color);
+        let mut text_color = p.map_or(self.text_color, |p| p.text);
+        if let Some(p) = &p {
+            // The list's own ground is the field colour, so its buttons take
+            // the window's.
+            style::button(rc, p, (x, top, w, h), p.background, p.border, look);
+            if look == ButtonLook::Disabled {
+                text_color = style::faded(text_color);
+            }
+        } else {
+            let base = self.button_color;
+            let mut border = self.button_border_color;
+            let mut face = match look {
+                ButtonLook::Hovered => toward(base, border, 0.3),
+                ButtonLook::Pressed => toward(base, Color::rgba(0.0, 0.0, 0.0, 0.0), 0.25),
+                _ => base,
+            };
+            if look == ButtonLook::Disabled {
+                face = dimmed(face);
+                border = dimmed(border);
+                text_color = dimmed(text_color);
+            }
+            rc.fill(x, top, w, h, face);
+            rc.rect_outline(x, top, w, h, border, 1.0);
         }
-        rc.fill(x, top, w, h, face);
-        rc.rect_outline(x, top, w, h, border, 1.0);
         rc.push_clip(x, top, w, h);
         let font = self.font.as_ref();
         text(
@@ -1240,7 +1357,7 @@ impl MarkupList {
                     && live
                     && ext.multi
                     && e.key == Key::A
-                    && e.modifiers.contains(crate::event::Modifiers::CTRL) =>
+                    && adds_to_selection(e.modifiers) =>
             {
                 ext.select_all_rows();
                 Some(true)
@@ -1290,7 +1407,7 @@ impl MarkupList {
                         let ext = self.ext.as_mut()?;
                         ext.pick(
                             plugin as i32,
-                            e.modifiers.contains(crate::event::Modifiers::CTRL),
+                            adds_to_selection(e.modifiers),
                             e.modifiers.contains(crate::event::Modifiers::SHIFT),
                         );
                         return Some(true);
@@ -1308,15 +1425,16 @@ impl MarkupList {
         let p = self.palette;
         let border = p.map_or(self.border, |p| p.border);
         let text_color = p.map_or(self.text_color, |p| p.text);
-        rc.fill(
-            0.0,
-            0.0,
-            w,
-            super::list_ext::HEADER_HEIGHT,
-            p.map_or(self.background, |p| p.field),
-        );
-        rc.fill(0.0, super::list_ext::HEADER_HEIGHT - 1.0, w, 1.0, border);
-        let font = self.font.clone();
+        let underline = super::list_ext::HEADER_HEIGHT - 1.0;
+        if p.is_some() {
+            // The header sits inside the list's rounded container.
+            let inset = style::ROW_INSET;
+            rc.fill(inset, underline, w - 2.0 * inset, 1.0, border);
+        } else {
+            rc.fill(0.0, 0.0, w, super::list_ext::HEADER_HEIGHT, self.background);
+            rc.fill(0.0, underline, w, 1.0, border);
+        }
+        let font = self.header_font.clone().or_else(|| self.font.clone());
         let Some(ext) = self.ext.as_mut() else {
             return;
         };
@@ -1561,6 +1679,11 @@ impl Widget for MarkupList {
             self.top = list::reveal(self.top, shown_selected, count, visible);
         }
         let header_top = self.rows_top();
+        if let Some(p) = &self.palette {
+            let (outer_w, outer_h) = size(ui, me);
+            let radius = style::CONTAINER_RADIUS;
+            style::surface(rc, 0.0, 0.0, outer_w, outer_h, radius, p.field, p.border);
+        }
         if header_top > 0.0 {
             let content = self.content_width(w, h);
             let layout = list::column_layout(&self.columns, content);
@@ -1575,8 +1698,10 @@ impl Widget for MarkupList {
         let is_enabled = enabled(ui, me);
         let content = self.content_width(w, h);
         let p = self.palette;
-        rc.fill(0.0, 0.0, w, h, p.map_or(self.background, |p| p.field));
-        rc.rect_outline(0.0, 0.0, w, h, p.map_or(self.border, |p| p.border), 1.0);
+        if p.is_none() {
+            rc.fill(0.0, 0.0, w, h, self.background);
+            rc.rect_outline(0.0, 0.0, w, h, self.border, 1.0);
+        }
         let band = self.selection_band || p.is_some();
         let font = self.font.clone();
         let text_y = (self.row_height - line_height(font.as_ref())).max(0.0) * 0.5;
@@ -1601,20 +1726,23 @@ impl Widget for MarkupList {
             }
             let banded = match &self.ext {
                 Some(ext) if ext.multi => ext.banded(plugin),
-                Some(_) => self.selection_band && plugin as i32 == self.selected,
+                Some(_) => band && plugin as i32 == self.selected,
                 None => {
                     band && i32::try_from(index).ok() == Some(self.selected)
-                        && self.columns.is_empty()
+                        && (self.columns.is_empty() || p.is_some())
                 }
             };
             if banded {
-                rc.fill(
-                    1.0,
-                    y + 1.0,
-                    content - 2.0,
-                    self.row_height - 1.0,
-                    p.map_or(self.selected_color, |p| p.selected),
-                );
+                match &p {
+                    Some(p) => style::row(rc, 0.0, y, content, self.row_height, p.selected),
+                    None => rc.fill(
+                        1.0,
+                        y + 1.0,
+                        content - 2.0,
+                        self.row_height - 1.0,
+                        self.selected_color,
+                    ),
+                }
             }
             if self.columns.is_empty() {
                 if let Some(Some(icon)) = self.row_icons.as_ref().and_then(|icons| icons.get(index))
@@ -1663,8 +1791,18 @@ impl Widget for MarkupList {
                         let mut tx = cx + PADDING;
                         if let Some((level, parent, expanded)) = tree {
                             let slot = cx + PADDING + level as f32 * super::list_ext::TREE_INDENT;
-                            if parent {
-                                let arrow = p.map_or(self.text_color, |p| p.text);
+                            if let (true, Some(p)) = (parent, &p) {
+                                // A smooth chevron: down when expanded, right
+                                // when collapsed.
+                                let cy = y + self.row_height * 0.5;
+                                if expanded {
+                                    style::chevron(rc, slot + 2.0, cy - 2.0, 7.0, 4.0, p.text);
+                                } else {
+                                    let x = slot + 3.5;
+                                    style::chevron_right(rc, x, cy - 3.5, 3.5, 7.0, p.text);
+                                }
+                            } else if parent {
+                                let arrow = self.text_color;
                                 let top = y + ((self.row_height - 7.0) * 0.5).floor();
                                 for i in 0..4u8 {
                                     let i = f32::from(i);
@@ -1713,6 +1851,7 @@ impl Widget for MarkupList {
                 h,
                 &self.scroll,
                 p.as_ref(),
+                self.dragging.is_some(),
             );
         }
         rc.pop_transform();
@@ -1948,10 +2087,13 @@ impl Widget for MarkupLog {
         let (w, h) = size(ui, me);
         self.refresh(w, h);
         let p = self.palette;
-        let background = Color::rgba(0.0, 0.0, 0.0, 0.92);
-        let border = Color::rgba(0.46, 0.37, 0.16, 1.0);
-        rc.fill(0.0, 0.0, w, h, p.map_or(background, |p| p.field));
-        rc.rect_outline(0.0, 0.0, w, h, p.map_or(border, |p| p.border), 1.0);
+        if let Some(p) = &p {
+            let radius = style::CONTAINER_RADIUS;
+            style::surface(rc, 0.0, 0.0, w, h, radius, p.field, p.border);
+        } else {
+            rc.fill(0.0, 0.0, w, h, Color::rgba(0.0, 0.0, 0.0, 0.92));
+            rc.rect_outline(0.0, 0.0, w, h, Color::rgba(0.46, 0.37, 0.16, 1.0), 1.0);
+        }
         let line = self.line_height();
         rc.push_clip(4.0, 4.0, (w - 25.0).max(0.0), (h - 8.0).max(0.0));
         let top = (self.scroll.scroll_y() / line).max(0) as usize;
@@ -1974,6 +2116,7 @@ impl Widget for MarkupLog {
                 (h - 2.0).max(0.0),
                 &self.scroll,
                 p.as_ref(),
+                self.dragging.is_some(),
             );
             rc.pop_transform();
         }

@@ -202,7 +202,7 @@ mod tests {
     /// commit; when an existing record changed shape (not only a new
     /// import, event or `since`-marked field), say in the commit message
     /// which plugins must be rebuilt.
-    const PUBLISHED: u64 = 0xa7e9_ffe2_33f6_5ae3;
+    const PUBLISHED: u64 = 0xcdfe_f06c_6f4d_60f8;
 
     #[test]
     fn the_fingerprint_is_the_published_one() {
@@ -232,7 +232,7 @@ mod tests {
     /// The import shapes an API 1.1 SDK wrote for the calls whose records
     /// API 1.2 gave a field (the house hook's item types on the inventory
     /// and world-object records); every other import is as it was.
-    const API_1_1_IMPORTS: [(Import, u64); 7] = [
+    const API_1_1_IMPORTS: [(Import, u64); 11] = [
         (Import::WorldObjects, 0x001b_e2ad_09b2_7238),
         (Import::WorldObject, 0x1579_5703_0d8b_7bcc),
         (Import::ItemsOwned, 0xed66_6352_01bd_02ed),
@@ -240,6 +240,13 @@ mod tests {
         (Import::LootClassify, 0x62f1_8b7c_4679_4184),
         (Import::LootNeedsIdentification, 0x99d6_7d8a_8f61_8fa8),
         (Import::LootNotifyLooted, 0x4014_883b_f67a_6245),
+        (Import::UiTheme, API_1_3_UI_THEME),
+        (Import::UiCanvasPaint, API_1_3_UI_CANVAS_PAINT),
+        (Import::UiPanelRegister, API_1_3_UI_PANEL_REGISTER),
+        (
+            Import::UiPanelRegisterTyped,
+            API_1_3_UI_PANEL_REGISTER_TYPED,
+        ),
     ];
 
     #[test]
@@ -252,9 +259,146 @@ mod tests {
             assert_ne!(import.shape(), shape, "{import:?}");
         }
         for import in Import::ALL {
-            if !API_1_1_IMPORTS.iter().any(|(i, _)| i == import) {
+            if import.since().is_at_most(v1_1)
+                && !API_1_1_IMPORTS.iter().any(|(i, _)| i == import)
+                && !API_1_4_CHANGED.iter().any(|(i, _)| i == import)
+            {
                 assert_eq!(import.shape_at(v1_1), import.shape(), "{import:?}");
             }
+        }
+        for (import, shape) in API_1_4_CHANGED {
+            assert_eq!(import.shape_at(v1_1), shape, "{import:?}");
+        }
+    }
+
+    /// The core shape every plugin built for API 1.2 or 1.3 carries (the
+    /// theme kinds as they were then).
+    const API_1_3_CORE: u64 = 0xd3a8_7cd5_8663_029c;
+
+    /// The shape an API 1.3 SDK wrote for the call that answers the theme,
+    /// whose kind API 1.4 gave more variants.
+    const API_1_3_UI_THEME: u64 = 0x93b3_e387_5bf3_f44c;
+
+    /// The shape an API 1.3 SDK wrote for painting a canvas, whose text API
+    /// 1.4 gave a font.
+    const API_1_3_UI_CANVAS_PAINT: u64 = 0xf6ff_2420_525c_7a85;
+
+    /// The shapes an API 1.3 SDK wrote for registering a window, to which API
+    /// 1.4 added the window's own dock icon.
+    const API_1_3_UI_PANEL_REGISTER: u64 = 0x0686_b6f5_994b_6ffa;
+    const API_1_3_UI_PANEL_REGISTER_TYPED: u64 = 0x1c74_d74c_9019_e501;
+
+    /// The calls API 1.4 changed, with the shape each had before.
+    const API_1_3_CHANGED: [(Import, u64); 4] = [
+        (Import::UiTheme, API_1_3_UI_THEME),
+        (Import::UiCanvasPaint, API_1_3_UI_CANVAS_PAINT),
+        (Import::UiPanelRegister, API_1_3_UI_PANEL_REGISTER),
+        (
+            Import::UiPanelRegisterTyped,
+            API_1_3_UI_PANEL_REGISTER_TYPED,
+        ),
+    ];
+
+    /// The imports API 1.4 added: not in an older plugin's section at all.
+    const API_1_4_FONTS: [Import; 5] = [
+        Import::UiFontBundled,
+        Import::UiFontLoad,
+        Import::UiFontMeasure,
+        Import::UiFontRelease,
+        Import::UiFontCount,
+    ];
+
+    /// The core shape every plugin built for API 1.4 carries (a path
+    /// preview's plan without the grid it reused or the worker's time).
+    const API_1_4_CORE: u64 = 0xc98c_762b_1ce4_4a3c;
+
+    /// The calls API 1.5 changed, with the shape each had before: the
+    /// indoor cells gained their doorways and the cells seen from them, and
+    /// the floorplan's cells their bounds and floor height.
+    const API_1_4_CHANGED: [(Import, u64); 2] = [
+        (Import::DungeonIndoorCells, 0xca99_6144_2871_7333),
+        (Import::DungeonFloorplan, 0xa845_70db_d1b5_681c),
+    ];
+
+    /// API 1.5 added fields at the end of a path preview's plan, which
+    /// changes the core shape, and to the records of the calls in
+    /// [`API_1_4_CHANGED`]: an API 1.4 plugin keeps its own shapes for all
+    /// of them, and every other import it has is as it was.
+    #[test]
+    fn api_1_4_plugins_keep_their_core_and_import_shapes() {
+        let v1_4 = ApiVersion::new(1, 4);
+        assert_eq!(core_shape(v1_4), API_1_4_CORE);
+        assert_ne!(CORE_SHAPE, API_1_4_CORE);
+        for (import, shape) in API_1_4_CHANGED {
+            assert_eq!(import.shape_at(v1_4), shape, "{import:?}");
+            assert_ne!(import.shape(), shape, "{import:?}");
+        }
+        let section = PluginLayout::parse(&section_at(v1_4)).unwrap();
+        for import in Import::ALL {
+            let expected = import
+                .since()
+                .is_at_most(v1_4)
+                .then(|| import.shape_at(v1_4));
+            assert_eq!(section.import_shape(import.name()), expected, "{import:?}");
+            if expected.is_some() && !API_1_4_CHANGED.iter().any(|(i, _)| i == import) {
+                assert_eq!(import.shape_at(v1_4), import.shape(), "{import:?}");
+            }
+        }
+    }
+
+    /// API 1.3 added only imports (the world triangles and markers): an API
+    /// 1.2 plugin's section leaves those out, and its other shapes are an API
+    /// 1.3 plugin's.
+    #[test]
+    fn api_1_2_plugins_keep_their_core_and_import_shapes() {
+        let v1_2 = ApiVersion::new(1, 2);
+        assert_eq!(core_shape(v1_2), API_1_3_CORE);
+        let new_imports = [
+            Import::UiTrianglesCreate,
+            Import::UiTrianglesSet,
+            Import::UiTrianglesRemove,
+            Import::UiMarkersCreate,
+            Import::UiMarkersSetIcons,
+            Import::UiMarkersSetShapes,
+            Import::UiMarkersRemove,
+        ];
+        let section = PluginLayout::parse(&section_at(v1_2)).unwrap();
+        for import in Import::ALL {
+            let absent = new_imports.contains(import)
+                || API_1_4_FONTS.contains(import)
+                || !import.since().is_at_most(v1_2);
+            let expected = (!absent).then(|| import.shape_at(v1_2));
+            assert_eq!(section.import_shape(import.name()), expected, "{import:?}");
+        }
+        for (import, shape) in API_1_3_CHANGED {
+            assert_eq!(import.shape_at(v1_2), shape, "{import:?}");
+        }
+    }
+
+    /// API 1.4 gave the theme's kind more variants, a canvas's text a font and
+    /// a window its own dock icon, which changes the core shape and the calls
+    /// that carry them: an API 1.3 plugin keeps those, and has no font imports.
+    #[test]
+    fn api_1_3_plugins_keep_their_core_and_import_shapes() {
+        let v1_3 = ApiVersion::new(1, 3);
+        assert_eq!(core_shape(v1_3), API_1_3_CORE);
+        assert_ne!(CORE_SHAPE, API_1_3_CORE);
+        for (import, shape) in API_1_3_CHANGED {
+            assert_eq!(import.shape_at(v1_3), shape, "{import:?}");
+            assert_ne!(import.shape(), shape, "{import:?}");
+        }
+        let section = PluginLayout::parse(&section_at(v1_3)).unwrap();
+        for import in Import::ALL {
+            if API_1_4_FONTS.contains(import) {
+                assert_eq!(section.import_shape(import.name()), None, "{import:?}");
+            } else if !API_1_3_CHANGED.iter().any(|(changed, _)| changed == import)
+                && !API_1_4_CHANGED.iter().any(|(changed, _)| changed == import)
+            {
+                assert_eq!(import.shape_at(v1_3), import.shape(), "{import:?}");
+            }
+        }
+        for (import, shape) in API_1_4_CHANGED {
+            assert_eq!(import.shape_at(v1_3), shape, "{import:?}");
         }
     }
 

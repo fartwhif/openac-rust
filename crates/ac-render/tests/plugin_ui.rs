@@ -1,6 +1,6 @@
 //! The plugins' UI in the game window on the retail dats: a window
 //! built from the session's snapshot mounts the plugin's window and its
-//! shelf button, a press reaches the session as a command, and a plugin's
+//! dock slot, a press reaches the session as a command, and a plugin's
 //! request to toggle a client window is carried out and reported back.
 //! Ignored by default; `scripts/check.*` runs them when the dats are
 //! present.
@@ -88,7 +88,7 @@ fn a_plugin_window_mounts_from_the_snapshot_and_reports_presses() {
     assert!(
         ui.host()
             .root
-            .is_window_visible(ac_ui::plugin::shelf::WINDOW)
+            .is_window_visible(ac_ui::plugin::dock::WINDOW)
     );
     // The window tells the session which client windows it has.
     let commands = ui.drain();
@@ -131,7 +131,7 @@ fn a_plugin_window_mounts_from_the_snapshot_and_reports_presses() {
     deliver(&mut state, ui.drain());
     assert!(state.is_client_window_visible(ClientWindow::Inventory));
 
-    // The plugin goes: its window and its shelf button go with it.
+    // The plugin goes: its window and its dock slot go with it.
     state.release("test.demo");
     scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
         state.take_changes(),
@@ -143,7 +143,7 @@ fn a_plugin_window_mounts_from_the_snapshot_and_reports_presses() {
     assert!(
         !ui.host()
             .root
-            .is_window_visible(ac_ui::plugin::shelf::WINDOW)
+            .is_window_visible(ac_ui::plugin::dock::WINDOW)
     );
 }
 
@@ -151,10 +151,10 @@ fn a_plugin_window_mounts_from_the_snapshot_and_reports_presses() {
 /// chords, the session binds around them and sends the bound table back,
 /// and a press of a bound chord reaches the plugin (a client chord never
 /// binds). Toggle Plugin Manager (Shift+Ctrl+F1) hides and shows the
-/// shelf (OpenAC `RetailUiRuntime.TogglePluginManager`).
+/// dock (OpenAC `RetailUiRuntime.TogglePluginManager`).
 #[test]
 #[ignore = "needs the retail dat files"]
-fn plugin_hotkeys_fire_from_the_window_and_the_shelf_toggles() {
+fn plugin_hotkeys_fire_from_the_window_and_the_dock_toggles() {
     use ac_plugin_ui::hotkeys::Chord;
     use ac_ui::event::{Key, Modifiers};
     use ac_ui::input::{InputAction, KeyBindings};
@@ -236,18 +236,403 @@ fn plugin_hotkeys_fire_from_the_window_and_the_shelf_toggles() {
         ]
     );
 
-    let shelf = ac_ui::plugin::shelf::WINDOW;
-    assert!(ui.host().root.is_window_visible(shelf));
+    let dock = ac_ui::plugin::dock::WINDOW;
+    assert!(ui.host().root.is_window_visible(dock));
     assert!(ui.handle_input_action(InputAction::TogglePluginManager));
     ui.frame(Instant::now(), size);
-    assert!(!ui.host().root.is_window_visible(shelf));
+    assert!(!ui.host().root.is_window_visible(dock));
     assert!(ui.handle_input_action(InputAction::TogglePluginManager));
     ui.frame(Instant::now(), size);
-    assert!(ui.host().root.is_window_visible(shelf));
+    assert!(ui.host().root.is_window_visible(dock));
+}
+
+/// The dock's gear opens the Appearance window on the first press and closes it
+/// on the next, and a right click does the same.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_docks_gear_opens_and_closes_the_appearance_window() {
+    use ac_ui::plugin::dock::{PluginDock, WINDOW};
+    const APPEARANCE: &str = "plugin:openac:appearance";
+    let size = (1280, 720);
+    let (state, _) = session();
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    ui.frame(Instant::now(), size);
+    let gear = ui
+        .host_mut()
+        .with_controller::<PluginDock, _>(WINDOW, |c, _| c.layout().gear)
+        .unwrap();
+    let frame = ui.host().root.window(WINDOW).unwrap().frame;
+    let e = ui.host().root.element(frame).unwrap();
+    let (x, y) = (
+        (e.left + gear.x + 4.0) as i32,
+        (e.top + gear.y + 4.0) as i32,
+    );
+    let mut press = |ui: &mut WindowUi, button| {
+        ui.script(&UiScript::Click {
+            x,
+            y,
+            button,
+            double: false,
+        });
+        ui.feed(&mut scene);
+        ui.frame(Instant::now(), size);
+        ui.feed(&mut scene);
+        ui.frame(Instant::now(), size);
+        ui.host().root.is_window_visible(APPEARANCE)
+    };
+    assert!(press(&mut ui, 0), "the first press opens it");
+    assert!(!press(&mut ui, 0), "the second closes it");
+    assert!(press(&mut ui, 1), "a right click opens it");
+    assert!(!press(&mut ui, 1), "and closes it");
+}
+
+/// The dock's place: a saved one applies, a drag is saved only as it ends, and
+/// the Appearance window offers all six.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_dock_takes_its_saved_place_and_a_drag_is_saved_when_it_ends() {
+    use ac_host::settings::PlayerSettings;
+    use ac_ui::event::MouseButton;
+    use ac_ui::plugin::dock::{DockMode, PluginDock, WINDOW};
+    let size = (1280, 720);
+    let (state, _) = session();
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    ui.frame(Instant::now(), size);
+    let mode = |ui: &mut WindowUi| {
+        ui.host_mut()
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.mode())
+            .unwrap()
+    };
+    assert_eq!(mode(&mut ui), DockMode::Floating);
+
+    let mut saved = PlayerSettings::default();
+    saved.plugin_ui.dock = "top".to_owned();
+    saved.plugin_ui.dock_size = "bigger".to_owned();
+    saved.plugin_ui.dock_opens = "hover".to_owned();
+    ui.settings_changed_elsewhere(&saved);
+    ui.frame(Instant::now(), size);
+    assert_eq!(mode(&mut ui), DockMode::Top);
+    assert_eq!(
+        ui.host_mut()
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.size()),
+        Some(ac_ui::plugin::dock::DockSize::Bigger)
+    );
+    assert_eq!(
+        ui.host_mut()
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.opens()),
+        Some(ac_ui::plugin::dock::DockOpens::Hover)
+    );
+    let frame = ui.host().root.window(WINDOW).unwrap().frame;
+    let at = |ui: &WindowUi| {
+        let e = ui.host().root.element(frame).unwrap();
+        (e.left, e.top)
+    };
+    assert_eq!(at(&ui).1, 0.0);
+
+    // Pull it down off the top, then to the left edge.
+    let (left, _) = at(&ui);
+    let (x, y) = (left as i32 + 5, 10);
+    let host = ui.host_mut();
+    host.mouse_move(x, y);
+    host.mouse_down(MouseButton::Left, x, y, 0);
+    host.mouse_move(x, y + 100);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    assert_eq!(mode(&mut ui), DockMode::FloatingHorizontal);
+    assert_eq!(
+        ui.settings().plugin_ui.dock,
+        "top",
+        "not until the drag ends"
+    );
+    ui.host_mut().mouse_up(MouseButton::Left, x, y + 100, 0);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    assert_eq!(ui.settings().plugin_ui.dock, "floating-horizontal");
+    assert!(
+        ui.take_settings_changes()
+            .iter()
+            .any(|(s, _)| *s == ac_ui::panels::options::Section::PluginUi)
+    );
+}
+
+/// The options window's Configuration page opened, its vsync row unchecked
+/// as a click does.
+fn uncheck_vsync_in_the_options_window(ui: &mut WindowUi) {
+    use ac_render::ui::options::OPTIONS_WINDOW;
+    use ac_ui::widgets::Button;
+    assert!(ui.open_options_page(ac_ui::panels::options::OptionsPage::Configuration));
+    // The page shows (and applies) before the click.
+    ui.drain();
+    ui.host_mut().pump();
+    ui.drain();
+    let content = ac_ui::content::DatContent::new(dats()).unwrap();
+    let caption = content.strings().resolve(
+        0x2300_0003,
+        ac_ui::strings::compute_hash("ID_Rendering_SyncToDisplayRefresh"),
+        0,
+    );
+    assert!(caption.is_some(), "the vsync caption resolves");
+    let root = &ui.host().root;
+    let mut stack = vec![root.window(OPTIONS_WINDOW).unwrap().frame];
+    let mut row = None;
+    while let Some(id) = stack.pop() {
+        if root
+            .widget::<Button>(id)
+            .is_some_and(|b| b.label.is_some() && b.label == caption)
+        {
+            row = Some(id);
+        }
+        stack.extend(root.children(id));
+    }
+    let row = row.expect("the vsync row");
+    let root = &mut ui.host_mut().root;
+    root.with::<Button, _>(row, |b, ui| b.set_selected(ui, row, false));
+    root.send_message(row, ac_ui::root::ElementMessage::Clicked { x: 1, y: 1 });
+    ui.host_mut().pump();
+    ui.drain();
+}
+
+/// The options window edits only what it changed: the dock's place, saved
+/// by a drag after the options window was built, survives the options
+/// window's next change (vsync), so the next save writes the new place.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_docks_dragged_place_survives_an_options_window_change() {
+    use ac_host::settings::PlayerSettings;
+    use ac_ui::event::MouseButton;
+    use ac_ui::panels::options::Section;
+    use ac_ui::plugin::dock::{DockMode, PluginDock, WINDOW};
+    let size = (1280, 720);
+    let (state, _) = session();
+    let mut saved = PlayerSettings::default();
+    saved.plugin_ui.dock = "top".to_owned();
+    let mut ui =
+        WindowUi::build_with(dats(), size, &saved, vec!["1280x720".into()]).expect("the UI builds");
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    ui.frame(Instant::now(), size);
+    let mode = |ui: &mut WindowUi| {
+        ui.host_mut()
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.mode())
+            .unwrap()
+    };
+    assert_eq!(mode(&mut ui), DockMode::Top);
+
+    // Drag the dock down off the top edge: its new place is saved.
+    let frame = ui.host().root.window(WINDOW).unwrap().frame;
+    let left = ui.host().root.element(frame).unwrap().left;
+    let (x, y) = (left as i32 + 5, 10);
+    let host = ui.host_mut();
+    host.mouse_move(x, y);
+    host.mouse_down(MouseButton::Left, x, y, 0);
+    host.mouse_move(x, y + 100);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    ui.host_mut().mouse_up(MouseButton::Left, x, y + 100, 0);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    assert_eq!(ui.settings().plugin_ui.dock, "floating-horizontal");
+    ui.take_settings_changes();
+
+    uncheck_vsync_in_the_options_window(&mut ui);
+    assert!(!ui.settings().display.vsync, "the options change applies");
+    assert_eq!(
+        ui.settings().plugin_ui.dock,
+        "floating-horizontal",
+        "the options window put the dock's old place back"
+    );
+    assert_eq!(mode(&mut ui), DockMode::FloatingHorizontal);
+    assert_eq!(ui.take_settings_changes(), [(Section::Display, true)]);
+}
+
+/// The same for the theme picked in the Appearance window: it survives the
+/// options window's next change.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_picked_plugin_theme_survives_an_options_window_change() {
+    use ac_plugin_ui::ThemeKind;
+    use ac_ui::plugin::dock::{PluginDock, WINDOW};
+    use ac_ui::widgets::Menu;
+    const APPEARANCE: &str = "plugin:openac:appearance";
+    let size = (1280, 720);
+    let (state, _) = session();
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    ui.frame(Instant::now(), size);
+
+    // The dock's gear opens the Appearance window.
+    let gear = ui
+        .host_mut()
+        .with_controller::<PluginDock, _>(WINDOW, |c, _| c.layout().gear)
+        .unwrap();
+    let frame = ui.host().root.window(WINDOW).unwrap().frame;
+    let e = ui.host().root.element(frame).unwrap();
+    ui.script(&UiScript::Click {
+        x: (e.left + gear.x + 4.0) as i32,
+        y: (e.top + gear.y + 4.0) as i32,
+        button: 0,
+        double: false,
+    });
+    for _ in 0..2 {
+        ui.feed(&mut scene);
+        ui.frame(Instant::now(), size);
+    }
+    assert!(ui.host().root.is_window_visible(APPEARANCE));
+
+    // Its theme menu picks Moss.
+    let moss = ThemeKind::Moss.display_name();
+    let root = &ui.host().root;
+    let mut stack = vec![root.window(APPEARANCE).unwrap().frame];
+    let mut pick = None;
+    while let Some(id) = stack.pop() {
+        if let Some(item) = root
+            .widget::<Menu>(id)
+            .and_then(|m| m.items.iter().find(|i| i.label == moss))
+        {
+            pick = Some((id, item.payload));
+        }
+        stack.extend(root.children(id));
+    }
+    let (menu, payload) = pick.expect("the theme menu offers Moss");
+    ui.host_mut()
+        .root
+        .send_message(menu, ac_ui::root::ElementMessage::MenuSelected(payload));
+    ui.host_mut().pump();
+    for _ in 0..2 {
+        ui.feed(&mut scene);
+        ui.frame(Instant::now(), size);
+    }
+    let theme = ThemeKind::Moss.saved_name();
+    assert_eq!(ui.settings().plugin_ui.theme, theme);
+    ui.take_settings_changes();
+
+    uncheck_vsync_in_the_options_window(&mut ui);
+    assert!(!ui.settings().display.vsync, "the options change applies");
+    assert_eq!(
+        ui.settings().plugin_ui.theme,
+        theme,
+        "the options window put the old theme back"
+    );
+}
+
+/// The limit on the dock's slots: a saved one applies, and a drag of its handle
+/// is saved only as it ends.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_dock_takes_its_saved_limit_and_a_drag_of_its_handle_is_saved_when_it_ends() {
+    use ac_host::settings::PlayerSettings;
+    use ac_ui::event::MouseButton;
+    use ac_ui::plugin::dock::{PluginDock, WINDOW};
+    let size = (1280, 720);
+    let (mut state, _) = session();
+    for i in 0..8 {
+        state
+            .register_panel(
+                &UiOwner::new(format!("test.{i}"), format!("Plugin {i}")),
+                PanelDescriptor::new("main", format!("Plugin {i}")),
+                "<panel/>",
+                BindingSchema::new("Binding"),
+            )
+            .unwrap();
+    }
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    ui.frame(Instant::now(), size);
+    let limit = |ui: &mut WindowUi| {
+        ui.host_mut()
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.slot_limit())
+            .unwrap()
+    };
+    assert_eq!(limit(&mut ui), None);
+
+    let mut saved = PlayerSettings::default();
+    saved.plugin_ui.dock_slots = 3;
+    ui.settings_changed_elsewhere(&saved);
+    ui.frame(Instant::now(), size);
+    assert_eq!(limit(&mut ui), Some(3));
+    saved.plugin_ui.dock_slots = -1;
+    ui.settings_changed_elsewhere(&saved);
+    ui.frame(Instant::now(), size);
+    assert_eq!(limit(&mut ui), None);
+    saved.plugin_ui.dock_slots = 5;
+    ui.settings_changed_elsewhere(&saved);
+    ui.frame(Instant::now(), size);
+    assert_eq!(limit(&mut ui), Some(5));
+
+    let on_handle = |ui: &mut WindowUi| {
+        let handle = ui
+            .host_mut()
+            .with_controller::<PluginDock, _>(WINDOW, |c, _| c.layout().length_handle)
+            .unwrap()
+            .unwrap();
+        let frame = ui.host().root.window(WINDOW).unwrap().frame;
+        let e = ui.host().root.element(frame).unwrap();
+        (
+            (e.left + handle.x + handle.w / 2.0) as i32,
+            (e.top + handle.y + handle.h / 2.0) as i32,
+        )
+    };
+
+    // Two slots back from its far end.
+    ui.host_mut().root.set_ui_locked(false);
+    ui.frame(Instant::now(), size);
+    let (x, y) = on_handle(&mut ui);
+    let host = ui.host_mut();
+    host.mouse_move(x, y);
+    host.mouse_down(MouseButton::Left, x, y, 0);
+    host.mouse_move(x, y - 90);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    assert_eq!(limit(&mut ui), Some(3));
+    assert_eq!(
+        ui.settings().plugin_ui.dock_slots,
+        5,
+        "not until the drag ends"
+    );
+    ui.host_mut().mouse_up(MouseButton::Left, x, y - 90, 0);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    assert_eq!(ui.settings().plugin_ui.dock_slots, 3);
+    assert!(
+        ui.take_settings_changes()
+            .iter()
+            .any(|(s, _)| *s == ac_ui::panels::options::Section::PluginUi)
+    );
+
+    // A press in place saves nothing.
+    let (x, y) = on_handle(&mut ui);
+    let host = ui.host_mut();
+    host.mouse_move(x, y);
+    host.mouse_down(MouseButton::Left, x, y, 0);
+    host.mouse_up(MouseButton::Left, x, y, 0);
+    ui.frame(Instant::now(), size);
+    ui.feed(&mut scene);
+    assert!(ui.take_settings_changes().is_empty());
 }
 
 /// A reader that hands out a 4 x 4 image for every path (OpenAC PR #271's
-/// file icons; the real reader is `ac-plugin`'s).
+/// file icons; the real reader is `ac-plugin-ui`'s).
 #[derive(Debug)]
 struct SquareFiles;
 
@@ -262,6 +647,163 @@ impl ac_plugin_ui::FileImageLoader for SquareFiles {
     }
 }
 
+/// A reader that hands out one 64 x 64 dock icon, filled by the file's name.
+#[derive(Debug)]
+struct DockIconFiles;
+
+impl ac_plugin_ui::FileImageLoader for DockIconFiles {
+    fn load(&self, _directory: &std::path::Path, _path: &str) -> ac_plugin_ui::FileImageRead {
+        ac_plugin_ui::FileImageRead::finished(Err("not used here".to_owned()))
+    }
+
+    fn read_dock_icon(
+        &self,
+        _directory: &std::path::Path,
+        path: &str,
+    ) -> Result<Option<ac_plugin_ui::PluginIcon>, String> {
+        let fill = match path {
+            "icons/a.png" => 40,
+            "icons/b.png" => 80,
+            _ => return Ok(None),
+        };
+        Ok(Some(ac_plugin_ui::PluginIcon {
+            width: 64,
+            height: 64,
+            rgba: Arc::new(vec![fill; 64 * 64 * 4]),
+        }))
+    }
+}
+
+/// Three windows name two files: the dock draws them from two textures, as a
+/// picture uploads once however many slots show it. When the plugin goes, the
+/// window gives both textures back.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_dock_uploads_each_windows_picture_once_and_gives_it_back() {
+    let size = (1280, 720);
+    let owner = UiOwner::new("test.files", "Files");
+    let mut state = PluginUi::new();
+    state.set_window_attached(true);
+    state.set_file_images(Some(Arc::new(DockIconFiles)));
+    state.set_plugin_folder("test.files", Some(PathBuf::from("plugin")));
+    for (window, file) in [
+        ("one", "icons/a.png"),
+        ("two", "icons/a.png"),
+        ("three", "icons/b.png"),
+    ] {
+        let descriptor = PanelDescriptor {
+            icon_file: Some(file.to_owned()),
+            start_visible: false,
+            ..PanelDescriptor::new(window, window)
+        };
+        state
+            .register_panel(&owner, descriptor, "<panel/>", BindingSchema::new("Files"))
+            .unwrap();
+    }
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    let list = ui.frame(Instant::now(), size);
+    let mut textures: Vec<u32> = list
+        .main
+        .iter()
+        .filter_map(|c| match c {
+            ac_ui::draw::DrawCmd::Sprite {
+                texture: ac_ui::draw::TextureRef::Runtime(id),
+                ..
+            } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(textures.len(), 4, "the tile and three slots");
+    textures.sort_unstable();
+    textures.dedup();
+    assert_eq!(textures.len(), 3, "the tile and two pictures");
+
+    state.release("test.files");
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.take_changes(),
+    )));
+    ui.feed(&mut scene);
+    let _ = ui.frame(Instant::now(), size);
+    let released = ac_render::ui::UiTextureSource::released(&mut ui.surfaces());
+    assert_eq!(
+        released
+            .iter()
+            .filter(|t| matches!(t, ac_ui::draw::TextureRef::Runtime(id) if textures.contains(id)))
+            .count(),
+        2,
+        "{released:?}"
+    );
+}
+
+/// The window bakes a sharper bundled font in each weight when it is on a
+/// high-density display, one a frame so no frame waits for them all, lets go
+/// of the bakes for a density it leaves, and draws from none on a standard
+/// display.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_window_follows_the_displays_density_with_sharper_fonts() {
+    let mut ui = WindowUi::build(dats(), (1280, 720)).expect("the UI builds");
+    ui.set_pixels_per_unit(1.0);
+    assert!(ui.host().root.sharp_fonts().is_none());
+
+    let textures = |ui: &WindowUi| {
+        let mut bakes: Vec<_> = ui
+            .host()
+            .root
+            .sharp_fonts()
+            .expect("sharper bakes")
+            .values()
+            .map(|s| s.font.foreground.texture)
+            .collect();
+        bakes.sort_by_key(|t| format!("{t:?}"));
+        bakes
+    };
+    let frames = |ui: &mut WindowUi, pixels: f32, count: usize| {
+        for _ in 0..count {
+            ui.set_pixels_per_unit(pixels);
+        }
+    };
+    ui.set_pixels_per_unit(2.0);
+    assert_eq!(textures(&ui).len(), 1, "one bake a frame");
+    frames(&mut ui, 2.0, 4);
+    let first = textures(&ui);
+    // The regular and SemiBold fonts, and the dock's count and two sizes of
+    // letters.
+    assert_eq!(first.len(), 5);
+    assert!(first.windows(2).all(|t| t[0] != t[1]));
+    frames(&mut ui, 2.0, 3);
+    assert_eq!(textures(&ui), first, "nothing more to bake");
+
+    // Leaving the density lets its bakes go; coming back bakes them again.
+    ui.set_pixels_per_unit(1.0);
+    assert!(ui.host().root.sharp_fonts().is_none());
+    frames(&mut ui, 2.0, 5);
+    let again = textures(&ui);
+    assert_eq!(again.len(), 5);
+    assert!(again.iter().all(|t| !first.contains(t)), "baked anew");
+
+    // No bake goes past what the largest allows, so a bigger font stops sooner
+    // and a smaller one has room for more. Bakes the new density still wants
+    // are kept.
+    frames(&mut ui, 3.0, 5);
+    let mut scales: Vec<f32> = ui
+        .host()
+        .root
+        .sharp_fonts()
+        .expect("sharper bakes")
+        .values()
+        .map(|s| s.scale)
+        .collect();
+    scales.sort_by(f32::total_cmp);
+    assert_eq!(scales, [1.5, 2.0, 2.0, 2.5, 3.0]);
+    let at_three = textures(&ui);
+    assert_eq!(again.iter().filter(|t| at_three.contains(t)).count(), 3);
+}
 fn runtime_sprites(list: &ac_ui::draw::DrawList) -> usize {
     list.main
         .iter()
@@ -275,6 +817,95 @@ fn runtime_sprites(list: &ac_ui::draw::DrawList) -> usize {
             )
         })
         .count()
+}
+
+/// The textures canvas text was drawn from with a plugin's font.
+fn runtime_glyph_textures(list: &ac_ui::draw::DrawList) -> Vec<ac_ui::draw::TextureRef> {
+    list.commands()
+        .filter_map(|c| match c {
+            ac_ui::draw::DrawCmd::Glyphs { texture, .. }
+                if matches!(texture, ac_ui::draw::TextureRef::Runtime(_)) =>
+            {
+                Some(*texture)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A plugin's font in the real window: canvas text in it draws from an atlas
+/// this window uploaded, from a sharper one once the window says its display is
+/// dense, and not at all once the plugin lets go.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn a_plugins_font_draws_on_its_canvas_and_sharper_on_a_dense_display() {
+    use ac_plugin_ui::fonts::FontWeight;
+    use ac_plugin_ui::{CanvasAnchor, CanvasDescriptor, Color8, PaintCmd};
+    let size = (1280, 720);
+    let owner = UiOwner::new("test.font", "Font");
+    let mut state = PluginUi::new();
+    state.set_window_attached(true);
+    let canvas = state
+        .register_canvas(
+            &owner,
+            CanvasDescriptor {
+                canvas_id: "c".into(),
+                width: 200,
+                height: 60,
+                anchor: CanvasAnchor::from_index(0).unwrap(),
+                offset: (100.0, 100.0),
+                start_visible: true,
+                accepts_pointer_input: false,
+            },
+        )
+        .unwrap();
+    let font = state.font_bundled("test.font", 16.0, FontWeight::SemiBold);
+    assert_ne!(font.handle, 0);
+    state
+        .paint_canvas(
+            "test.font",
+            canvas,
+            vec![PaintCmd::Text {
+                text: "Golem".into(),
+                at: (4.0, 4.0),
+                color: Color8::new(255, 255, 255, 255),
+                outline: false,
+                font: font.handle,
+            }],
+        )
+        .unwrap();
+    let mut ui = WindowUi::build(dats(), size).expect("the UI builds");
+    ui.set_pixels_per_unit(1.0);
+    let mut scene = Scene::default();
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.snapshot(),
+    )));
+    ui.feed(&mut scene);
+    let plain = runtime_glyph_textures(&ui.frame(Instant::now(), size));
+    assert_eq!(plain.len(), 1, "one run from one atlas");
+    deliver(&mut state, ui.drain());
+
+    ui.set_pixels_per_unit(2.0);
+    let commands = ui.drain();
+    assert!(commands.iter().any(|c| matches!(
+        c,
+        SessionCommand::PluginUi(UiInput::DisplayDensity(d)) if *d == 2.0
+    )));
+    deliver(&mut state, commands);
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.take_changes(),
+    )));
+    ui.feed(&mut scene);
+    let sharp = runtime_glyph_textures(&ui.frame(Instant::now(), size));
+    assert_eq!(sharp.len(), 1);
+    assert_ne!(sharp, plain, "the sharper atlas");
+
+    assert!(state.font_release("test.font", font.handle));
+    scene.apply(PresentationEvent::Interface(InterfaceEvent::PluginUi(
+        state.take_changes(),
+    )));
+    ui.feed(&mut scene);
+    assert!(runtime_glyph_textures(&ui.frame(Instant::now(), size)).is_empty());
 }
 
 /// A plugin window's file icon: the window tells the session the path it

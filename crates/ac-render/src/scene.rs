@@ -35,6 +35,9 @@ pub enum SceneEffect {
 #[derive(Debug, Default)]
 pub struct Scene {
     player_guid: Option<u32>,
+    /// Snapshots that brought a character into the world (a player where
+    /// there was none, or another one).
+    world_entries: u64,
     objects: HashMap<u32, ObjectView>,
     received_snapshot: bool,
     /// The server's tick count at the latest sync and when it arrived.
@@ -60,6 +63,9 @@ impl Scene {
     pub fn apply(&mut self, event: PresentationEvent) {
         match event {
             PresentationEvent::Snapshot(snapshot) => {
+                if snapshot.player_guid.is_some() && snapshot.player_guid != self.player_guid {
+                    self.world_entries += 1;
+                }
                 self.player_guid = snapshot.player_guid;
                 self.objects = snapshot
                     .objects
@@ -205,6 +211,14 @@ impl Scene {
     #[must_use]
     pub fn player_guid(&self) -> Option<u32> {
         self.player_guid
+    }
+
+    /// How many times a character has entered the world in the snapshots
+    /// seen: each log in (and an attach to a session in the world) counts
+    /// one.
+    #[must_use]
+    pub fn world_entries(&self) -> u64 {
+        self.world_entries
     }
 
     /// The local player's object.
@@ -363,6 +377,32 @@ mod tests {
             effects: ac_runtime::world::EffectFacts::default(),
             step_blend: None,
         }
+    }
+
+    /// Each snapshot that brings a character into the world counts one
+    /// entry: a log in after character selection (the same character or
+    /// another), or a switch straight to another character; a snapshot of
+    /// the same character again does not.
+    #[test]
+    fn snapshots_count_the_entries_into_the_world() {
+        let mut scene = Scene::default();
+        let world = |player_guid| {
+            PresentationEvent::Snapshot(WorldSnapshot {
+                player_guid,
+                objects: Vec::new(),
+            })
+        };
+        scene.apply(world(None));
+        assert_eq!(scene.world_entries(), 0, "character selection");
+        scene.apply(world(Some(0x5000_000A)));
+        assert_eq!(scene.world_entries(), 1);
+        scene.apply(world(Some(0x5000_000A)));
+        assert_eq!(scene.world_entries(), 1, "the same entry");
+        scene.apply(world(None));
+        scene.apply(world(Some(0x5000_000A)));
+        assert_eq!(scene.world_entries(), 2, "logged out and in again");
+        scene.apply(world(Some(0x5000_000B)));
+        assert_eq!(scene.world_entries(), 3, "another character");
     }
 
     #[test]

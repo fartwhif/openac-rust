@@ -25,9 +25,8 @@ use ac_core::properties::PropertyInt;
 use ac_runtime::inventory::shop::{StagedRow, VendorListsView};
 use ac_runtime::inventory::{ItemCommand, ObjectRef, VendorCommand, VendorView, VendorViewReason};
 use ac_runtime::session::SessionCommand;
-use ac_ui::ElementId;
 use ac_ui::element_info::ElementInfo;
-use ac_ui::event::{DragAcceptance, DragPayload, kind};
+use ac_ui::event::{DragAcceptance, DragPayload, ItemDragPayload, ItemDragSource, kind};
 use ac_ui::host::UiHost;
 use ac_ui::import::ImportedLayout;
 use ac_ui::panels::items::ItemsView;
@@ -36,6 +35,7 @@ use ac_ui::panels::{PanelOutput, panel_id};
 use ac_ui::root::UiRoot;
 use ac_ui::tree::Element;
 use ac_ui::widgets::{ItemList, ItemSlot, Menu, Panel, ScrollSource, Scrollbar, Text};
+use ac_ui::{ElementId, MouseButton, UiOutput};
 use common::items::*;
 use common::panels::*;
 use common::*;
@@ -618,6 +618,97 @@ fn a_category_filters_the_row_and_selects_its_first_listing() {
     assert_eq!(l.scroll.scroll_y(), 0);
 }
 
+/// A shop with more armor than the row shows at once.
+fn long_armor_row() -> Vec<VendorShopItem> {
+    (0..20)
+        .map(|i| listing(0x6000_0300 + i, "Buckler", ItemType::ARMOR, 900 + i, 40))
+        .collect()
+}
+
+fn item_row_scroll(v: &Vendor) -> i32 {
+    v.host
+        .root
+        .widget::<ItemList>(v.ids[&vendor::ITEM_LIST_ID])
+        .unwrap()
+        .scroll
+        .scroll_y()
+}
+
+fn scroll_item_row_to(v: &mut Vendor, x: i32) {
+    let l = v.ids[&vendor::ITEM_LIST_ID];
+    v.host
+        .root
+        .widget_mut::<ItemList>(l)
+        .unwrap()
+        .scroll
+        .set_scroll_y(x);
+}
+
+// The shop sent again after a purchase keeps the row scrolled where it was,
+// so listings far along it can be bought one after another.
+#[test]
+fn a_refresh_keeps_the_rows_sideways_scroll() {
+    let mut v = vendor_window();
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        profile(1.5),
+        long_armor_row(),
+    )));
+    scroll_item_row_to(&mut v, 160);
+    assert_eq!(item_row_scroll(&v), 160);
+    v.event(Some(&shop(
+        VendorViewReason::Refreshed,
+        profile(1.5),
+        long_armor_row(),
+    )));
+    assert_eq!(item_row_scroll(&v), 160);
+}
+
+// A refill with fewer listings keeps as much of the scroll as still fits.
+#[test]
+fn a_refresh_with_a_shorter_row_clamps_the_kept_scroll() {
+    let mut v = vendor_window();
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        profile(1.5),
+        long_armor_row(),
+    )));
+    scroll_item_row_to(&mut v, 320);
+    assert_eq!(item_row_scroll(&v), 320);
+    let mut shorter = long_armor_row();
+    shorter.truncate(14);
+    v.event(Some(&shop(
+        VendorViewReason::Refreshed,
+        profile(1.5),
+        shorter,
+    )));
+    let l = v
+        .host
+        .root
+        .widget::<ItemList>(v.ids[&vendor::ITEM_LIST_ID])
+        .unwrap();
+    assert!(l.scroll.max_scroll() > 0 && l.scroll.max_scroll() < 320);
+    assert_eq!(item_row_scroll(&v), l.scroll.max_scroll());
+}
+
+// Another shop opening starts its row at the beginning.
+#[test]
+fn a_newly_opened_shop_starts_the_row_at_the_beginning() {
+    let mut v = vendor_window();
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        profile(1.5),
+        long_armor_row(),
+    )));
+    scroll_item_row_to(&mut v, 160);
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        profile(1.5),
+        long_armor_row(),
+    )));
+    assert_eq!(item_row_scroll(&v), 0);
+}
+
 // ── The selection's name and cost ───────────────────────────────────────
 
 fn stacked_arrows() -> VendorShopItem {
@@ -849,6 +940,36 @@ fn the_tabs_switch_pages() {
     v.click(vendor::ITEMS_TAB_ID);
     assert!(v.visible(vendor::ITEMS_PAGE_ID));
     assert_eq!(v.occupied(vendor::ITEM_LIST_ID), [ARMOR]);
+    assert_eq!(v.with(|c, _| c.tab()), VendorTab::Items);
+}
+
+// The shop sent again after a sale leaves the window on the page the player
+// was on; only a newly opened shop picks its page.
+#[test]
+fn a_refresh_keeps_the_open_tab() {
+    let mut v = vendor_window();
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        profile(1.5),
+        armor_and_food(),
+    )));
+    v.click(vendor::SELLING_TAB_ID);
+    assert_eq!(v.with(|c, _| c.tab()), VendorTab::Selling);
+    v.event(Some(&shop(
+        VendorViewReason::Refreshed,
+        profile(1.5),
+        armor_and_food(),
+    )));
+    assert_eq!(v.with(|c, _| c.tab()), VendorTab::Selling);
+    assert!(v.visible(vendor::SELLING_PAGE_ID));
+    assert!(!v.visible(vendor::ITEMS_PAGE_ID));
+    // The listing row is still refilled behind the open page.
+    assert_eq!(v.occupied(vendor::ITEM_LIST_ID), [ARMOR]);
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        profile(1.5),
+        armor_and_food(),
+    )));
     assert_eq!(v.with(|c, _| c.tab()), VendorTab::Items);
 }
 
@@ -1292,6 +1413,43 @@ fn a_refused_drop_says_why_and_stages_nothing() {
     }
 }
 
+// The main pack (the character itself) is the player's own: a drop of it
+// with an item in an item slot is taken; one holding only pack-slot objects
+// (a spell focus, container type 2) is judged as the character, which a
+// vendor does not buy.
+#[test]
+fn the_main_pack_is_taken_when_an_item_slot_holds_something() {
+    let mut v = vendor_window();
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        sell_profile(ItemType::ARMOR | ItemType::MISC),
+        Vec::new(),
+    )));
+    // "Foci of Enchantment" (wcid 15268): item type Misc, value 500.
+    v.owned(0x6000_0301, ItemType::MISC, 500, 1, 15268);
+    v.objects.t.replace_contents(
+        PLAYER,
+        &[ac_core::items::ContainerContentEntry {
+            guid: 0x6000_0301,
+            container_type: 2,
+        }],
+        &mut v.objects.ev,
+    );
+    let out = drag_onto_sell_list(&mut v, PLAYER, kind::DROP_RELEASED);
+    assert_eq!(notices(&out), ["You cannot sell that here"]);
+    assert!(items_commands(&out).is_empty());
+
+    v.owned(OWNED_ARMOR, ItemType::ARMOR, 100, 1, 1);
+    let out = drag_onto_sell_list(&mut v, PLAYER, kind::DROP_RELEASED);
+    assert!(notices(&out).is_empty());
+    assert_dbg_eq!(
+        items_commands(&out),
+        [ItemCommand::Vendor(VendorCommand::AddToSellList(
+            ObjectRef::Guid(PLAYER)
+        ))]
+    );
+}
+
 // HandleDropRelease_PartialStack_SplitsThenStagesTheNewExactStack
 #[test]
 fn part_of_a_stack_is_split_off_and_the_new_stack_staged() {
@@ -1468,6 +1626,78 @@ fn lifting_a_staged_sale_takes_it_off_and_refuses_a_partial_selection() {
             .any(|o| matches!(o, PanelOutput::ResetSplitQuantity { stack: 10 })),
         "{out:?}"
     );
+}
+
+/// A vendor window with `OWNED_ARMOR` staged on the sell list, on the
+/// selling tab.
+fn staged_sale() -> Vendor {
+    let mut v = vendor_window();
+    v.event(Some(&shop(
+        VendorViewReason::Opened,
+        sell_profile(ItemType::ARMOR),
+        Vec::new(),
+    )));
+    v.owned(OWNED_ARMOR, ItemType::ARMOR, 100, 1, 1);
+    let mut view = shop(
+        VendorViewReason::Lists,
+        sell_profile(ItemType::ARMOR),
+        Vec::new(),
+    );
+    view.lists.selling = vec![row(OWNED_ARMOR, "Chainmail Shirt", 1)];
+    v.event(Some(&view));
+    v.click(vendor::SELLING_TAB_ID);
+    v
+}
+
+/// A staged sale let go over the world says it came from the vendor
+/// window, so the world only takes it off the sell list and never drops
+/// it on the ground (issue #44).
+#[test]
+fn a_staged_sale_dragged_out_over_the_world_comes_from_the_vendor_window() {
+    let mut v = staged_sale();
+    assert_eq!(
+        v.slot(vendor::SELLING_LIST_ID, 0).source_kind,
+        ItemDragSource::Vendor
+    );
+    let c = v.cell(vendor::SELLING_LIST_ID, 0);
+    let (x, y) = v.host.root.screen_position(c);
+    let e = v.host.root.element(c).unwrap();
+    let (x, y) = ((x + e.width / 2.0) as i32, (y + e.height / 2.0) as i32);
+    v.host.take_outputs();
+    v.host.mouse_move(x, y);
+    v.host.mouse_down(MouseButton::Left, x, y, 0);
+    v.host.mouse_move(x + 200, y + 300);
+    v.host.mouse_up(MouseButton::Left, x + 200, y + 300, 0);
+    let released: Vec<ItemDragSource> = v
+        .host
+        .take_outputs()
+        .into_iter()
+        .filter_map(|o| match o {
+            UiOutput::DragReleasedOutsideUi { payload, .. } => {
+                payload.get::<ItemDragPayload>().map(|p| p.source_kind)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(released, [ItemDragSource::Vendor]);
+}
+
+/// A drag out of the sell list is refused everywhere, the sell list
+/// included: a staged sale lifted and let go over the list again is not
+/// staged a second time.
+#[test]
+fn a_staged_sale_dropped_back_on_the_sell_list_is_refused() {
+    let mut v = staged_sale();
+    let c = v.cell(vendor::SELLING_LIST_ID, 0);
+    let lifted = ItemDragPayload::new(OWNED_ARMOR, ItemDragSource::Vendor, 0);
+    v.fire(c, kind::DRAG_ENTER, Some(DragPayload::new(lifted.clone())));
+    assert_eq!(
+        v.slot(vendor::SELLING_LIST_ID, 0).drag_acceptance(),
+        DragAcceptance::Reject
+    );
+    let out = v.fire(c, kind::DROP_RELEASED, Some(DragPayload::new(lifted)));
+    assert!(items_commands(&out).is_empty(), "{out:?}");
+    assert!(notices(&out).is_empty(), "{out:?}");
 }
 
 // ── Real dats ───────────────────────────────────────────────────────────

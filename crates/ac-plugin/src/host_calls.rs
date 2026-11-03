@@ -270,6 +270,12 @@ pub(crate) fn handle_import(
         | Import::UiCanvasAvailable
         | Import::UiCanvasRemove
         | Import::UiMeasureText
+        | Import::UiFontBundled
+        | Import::UiFontLoad
+        | Import::UiFontMeasure
+        | Import::UiFontRelease
+        | Import::UiFontCount
+        | Import::UiTheme
         | Import::UiImageClientArt
         | Import::UiImageSpellIcon
         | Import::UiImageObjectIcon
@@ -281,6 +287,13 @@ pub(crate) fn handle_import(
         | Import::UiLinesCreate
         | Import::UiLinesSet
         | Import::UiLinesRemove
+        | Import::UiTrianglesCreate
+        | Import::UiTrianglesSet
+        | Import::UiTrianglesRemove
+        | Import::UiMarkersCreate
+        | Import::UiMarkersSetIcons
+        | Import::UiMarkersSetShapes
+        | Import::UiMarkersRemove
         | Import::UiProjectileDebug
         | Import::UiHotkeyRegister
         | Import::UiHotkeyUnregister
@@ -301,7 +314,7 @@ pub(crate) fn handle_import(
                     import.name()
                 ));
             };
-            return handle(import, request, &owner, state, answer);
+            return handle(import, request, &owner, state, answer, version);
         }
         // Net: the permission is checked above; the host here.
         Import::NetHttpRequest => {

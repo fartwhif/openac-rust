@@ -269,6 +269,22 @@ pub enum ItemDragSource {
     Equipment,
     /// The ground or an outside container.
     Ground,
+    /// A salvage window cell: a pack item staged there. Dragging it out
+    /// only unstages it.
+    Salvage,
+    /// A vendor window or house purchase window cell: a pack item staged
+    /// there to sell or to pay with. Dragging it out only unstages it.
+    Vendor,
+}
+
+impl ItemDragSource {
+    /// Whether the drag stands for an item rather than carrying it: the
+    /// world and the item windows refuse it, so letting it go anywhere
+    /// moves nothing.
+    #[must_use]
+    pub fn is_alias(self) -> bool {
+        matches!(self, Self::ShortcutBar | Self::Salvage | Self::Vendor)
+    }
 }
 
 /// An item being dragged.

@@ -154,6 +154,16 @@ pub enum MovementCommand {
     StopMouseDrift,
     /// Instant mouse look ended (the movement goes to the server at once).
     EndMouseLook,
+    /// Modern mouse turning began (the right button pressed over the
+    /// world): the view, not the mouse's motion, owns the turn, and the
+    /// turn keys keep turning (the movement goes to the server at once).
+    /// [`MovementCommand::EndMouseLook`] ends it.
+    BeginModernMouseLook,
+    /// Modern mouse turning: the yaw (radians from +x, counter-clockwise)
+    /// the view points along. With the turn keys up, the character turns
+    /// toward it with the ordinary turn motion at the full turn rate and
+    /// stops on it.
+    MouseLookFacing(f32),
     /// Play an action or emote motion as the player's own (an emote key);
     /// nothing when it cannot play now.
     Motion(u32),
@@ -308,6 +318,9 @@ pub struct Movement {
     /// The movement keys a plugin holds (it replaces the keyboard while
     /// held).
     intent: Option<MovementInput>,
+    /// The window went away during a modern mouse look: it ends at the
+    /// next frame.
+    end_modern_mouse_look: bool,
 }
 
 impl Default for Movement {
@@ -490,6 +503,7 @@ impl Movement {
             applied_pk: None,
             approaches: approach::Approaches::default(),
             intent: None,
+            end_modern_mouse_look: false,
         }
     }
 
@@ -721,6 +735,7 @@ impl Movement {
         self.keys = MovementKeys::default();
         self.auto_run = false;
         self.input.lose();
+        self.end_modern_mouse_look = false;
         self.last_frame = None;
         self.in_portal_space = false;
         self.arrival_held = false;
@@ -729,9 +744,11 @@ impl Movement {
         self.applied_pk = None;
     }
 
-    /// The window that held movement keys went away.
+    /// The window that held movement keys went away (a modern mouse look
+    /// it held ends at the next frame).
     pub fn release_keys(&mut self) {
         self.keys = MovementKeys::default();
+        self.end_modern_mouse_look = true;
     }
 
     /// Whether held movement runs by default (the ToggleRun character
@@ -873,9 +890,23 @@ impl Movement {
             }
             MovementCommand::BeginMouseLook => {
                 let input = self.key_input();
-                let begun = self.with_controller(world, |c, env| c.begin_mouse_look(env, input));
+                let begun =
+                    self.with_controller(world, |c, env| c.begin_mouse_look(env, input, false));
                 if begun == Some(true) {
                     self.send_movement_now(world, outbox);
+                }
+            }
+            MovementCommand::BeginModernMouseLook => {
+                let input = self.key_input();
+                let begun =
+                    self.with_controller(world, |c, env| c.begin_mouse_look(env, input, true));
+                if begun == Some(true) {
+                    self.send_movement_now(world, outbox);
+                }
+            }
+            MovementCommand::MouseLookFacing(yaw) => {
+                if let Some(player) = self.player.as_mut() {
+                    player.controller.set_mouse_look_facing_target(yaw);
                 }
             }
             MovementCommand::MouseTurn(adjustment) => {
@@ -1042,7 +1073,8 @@ impl Movement {
         }
     }
 
-    fn refuse(&mut self, text: &str) {
+    /// Report something the owner could not do (printed as a movement line).
+    pub(crate) fn refuse(&mut self, text: &str) {
         self.events.push(MovementEvent::Refused(text.to_owned()));
     }
 
@@ -2671,6 +2703,18 @@ impl Movement {
         self.apply_stats(world);
         if self.player.is_some() {
             self.follow_sought_object(world);
+            if std::mem::take(&mut self.end_modern_mouse_look)
+                && self
+                    .player
+                    .as_ref()
+                    .is_some_and(|p| p.controller.modern_mouse_look_active())
+            {
+                let input = self.key_input();
+                let ended = self.with_controller(world, |c, env| c.end_mouse_look(env, input));
+                if ended == Some(true) {
+                    self.send_movement_now(world, outbox);
+                }
+            }
             let input = self.capture_input();
             let view = self.bodies_view();
             let guid = self.player.as_ref().map_or(0, |p| p.guid);

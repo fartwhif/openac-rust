@@ -13,8 +13,8 @@ use bytemuck::{Pod, Zeroable};
 
 use super::particles::{ParticleGpu, ParticlePipelines};
 use super::pipelines::{
-    DEPTH_FORMAT, mesh_pipeline_with, portal_pipeline, shader, sky_pipeline, uniform_entry,
-    world_line_pipeline,
+    DEPTH_FORMAT, icon_probe_pipeline, mesh_pipeline_with, portal_pipeline, shader, sky_pipeline,
+    uniform_entry, world_line_pipeline, world_triangle_pipeline,
 };
 use crate::assets::{MeshGpuVertex, TerrainGpuVertex};
 use crate::atmosphere::auto_quality::{
@@ -88,6 +88,10 @@ pub(crate) struct HdrWorldPipelines {
     pub particle_meshes: HashMap<(crate::draws::ParticleBlend, Cull), wgpu::RenderPipeline>,
     /// The plugins' world lines.
     pub world_line: wgpu::RenderPipeline,
+    /// The plugins' world triangles.
+    pub world_triangle: wgpu::RenderPipeline,
+    /// The invisible probes of the icons hidden behind the world.
+    pub icon_probe: wgpu::RenderPipeline,
 }
 
 /// The layouts the plain world's pipelines are built against.
@@ -195,6 +199,8 @@ impl HdrWorldPipelines {
         let (billboard, particle_meshes): ParticlePipelines =
             ParticleGpu::pipelines(device, format, samples, layouts.globals, layouts.material);
         let world_line = world_line_pipeline(device, format, samples, layouts.globals);
+        let world_triangle = world_triangle_pipeline(device, format, samples, layouts.globals);
+        let icon_probe = icon_probe_pipeline(device, format, samples, layouts.globals);
         Self {
             terrain,
             portal,
@@ -204,6 +210,8 @@ impl HdrWorldPipelines {
             billboard,
             particle_meshes,
             world_line,
+            world_triangle,
+            icon_probe,
         }
     }
 }
@@ -230,7 +238,7 @@ fn terrain_receiver_pipeline(
         immediate_size: 0,
     });
     let vertex_attributes = terrain_vertex_attributes();
-    let offset_attributes = wgpu::vertex_attr_array![6 => Float32x3];
+    let offset_attributes = wgpu::vertex_attr_array![6 => Float32x3, 7 => Uint32];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("terrain atmospheric"),
         layout: Some(&layout),

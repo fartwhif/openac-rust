@@ -6,11 +6,11 @@
 //! counters (spellbook, enchantments, desired components) and the methods
 //! return what was added or removed, so the owner can notify observers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::enchantment::{
-    ActiveEnchantmentRecord, BUCKET_ADDITIVE, BUCKET_COOLDOWN, BUCKET_MULTIPLICATIVE,
+    ActiveEnchantmentRecord, BUCKET_ADDITIVE, BUCKET_COOLDOWN, BUCKET_MULTIPLICATIVE, BUCKET_VITAE,
     EnchantmentTypeFlags, VitalMod, get_enchantments_in_effect, get_mod, get_skill_mod,
     make_identity,
 };
@@ -173,10 +173,9 @@ impl Spellbook {
     #[must_use]
     pub fn get_vital_mod(&self, stat_key: u32) -> VitalMod {
         get_mod(
-            &self.active,
-            &self.table,
+            self.stat_enchantments_in_list_order(),
             stat_key,
-            Some(EnchantmentTypeFlags::SECOND_ATT),
+            EnchantmentTypeFlags::SECOND_ATT,
             true,
         )
     }
@@ -185,10 +184,9 @@ impl Spellbook {
     #[must_use]
     pub fn get_attribute_mod(&self, attribute_id: u32) -> VitalMod {
         get_mod(
-            &self.active,
-            &self.table,
+            self.stat_enchantments_in_list_order(),
             attribute_id,
-            Some(EnchantmentTypeFlags::ATTRIBUTE),
+            EnchantmentTypeFlags::ATTRIBUTE,
             false,
         )
     }
@@ -196,7 +194,29 @@ impl Spellbook {
     /// The skill modifier (vitae included).
     #[must_use]
     pub fn get_skill_mod(&self, skill_id: u32) -> VitalMod {
-        get_skill_mod(&self.active, &self.table, skill_id)
+        get_skill_mod(self.stat_enchantments_in_list_order(), skill_id)
+    }
+
+    /// The multiplicative, additive and vitae records, each list from its
+    /// head: the order the stat math takes them in, which decides exact
+    /// stacking ties.
+    fn stat_enchantments_in_list_order(&self) -> Vec<&ActiveEnchantmentRecord> {
+        let by_identity: HashMap<u32, &ActiveEnchantmentRecord> = self
+            .active
+            .iter()
+            .map(|record| (record.identity(), record))
+            .collect();
+        [BUCKET_MULTIPLICATIVE, BUCKET_ADDITIVE, BUCKET_VITAE]
+            .into_iter()
+            .flat_map(|bucket| {
+                self.order_by_bucket
+                    .get(&bucket)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|identity| by_identity.get(identity).copied())
+                    .filter(move |record| record.bucket == bucket)
+            })
+            .collect()
     }
 
     /// Learned spell ids, ascending.
@@ -713,26 +733,33 @@ mod tests {
             Arc::new(SpellTable::create([SpellMetadata::new(42, "Test", 100)]).expect("unique"));
         let mut book = Spellbook::new(Some(t));
         let record = |value: f32| ActiveEnchantmentRecord {
-            stat_mod_type: Some(EnchantmentTypeFlags::SECOND_ATT.bits()),
+            stat_mod_type: Some(
+                (EnchantmentTypeFlags::SECOND_ATT | EnchantmentTypeFlags::MULTIPLICATIVE).bits(),
+            ),
             stat_mod_key: Some(STAT_KEY_MAX_HEALTH),
             stat_mod_value: Some(value),
             bucket: 1,
             ..ActiveEnchantmentRecord::new(42, 7, 300.0, 0)
         };
         book.on_enchantment_added(record(1.5));
-        assert!(book.get_vital_mod(STAT_KEY_MAX_HEALTH).multiplier == 1.5);
+        assert!(book.get_vital_mod(STAT_KEY_MAX_HEALTH).multiplier() == 1.5);
         book.on_enchantment_added(record(1.25));
-        assert!(book.get_vital_mod(STAT_KEY_MAX_HEALTH).multiplier == 1.25);
+        assert!(book.get_vital_mod(STAT_KEY_MAX_HEALTH).multiplier() == 1.25);
     }
+
+    // The records below tie exactly (same category, power and start), so
+    // the list order decides: the list is walked from its head and the
+    // later challenger takes an exact tie.
 
     #[test]
     fn live_new_identity_inserts_at_list_head() {
         let mut book = Spellbook::default();
         book.on_enchantment_added(effect(1, 1, 12));
         book.on_enchantment_added(effect(2, 2, 12));
+        // List [2, 1]: the record that arrived first is the challenger.
         let in_effect = book.enchantments_in_effect_snapshot();
         assert_eq!(in_effect.len(), 1);
-        assert_eq!(in_effect[0].spell_id, 2);
+        assert_eq!(in_effect[0].spell_id, 1);
     }
 
     #[test]
@@ -741,18 +768,54 @@ mod tests {
         book.on_enchantment_added(effect(1, 1, 12));
         book.on_enchantment_added(effect(2, 2, 12));
         book.on_enchantment_added(effect(1, 1, 12));
+        // Still [2, 1]; moving the refresh to the head would make it [1, 2].
         let in_effect = book.enchantments_in_effect_snapshot();
         assert_eq!(in_effect.len(), 1);
-        assert_eq!(in_effect[0].spell_id, 2);
+        assert_eq!(in_effect[0].spell_id, 1);
     }
 
     #[test]
     fn manifest_preserves_received_order() {
         let mut book = Spellbook::default();
         book.replace_manifest([], [effect(1, 1, 12), effect(2, 2, 12)], &[], &[], 0x3FFF);
+        // [1, 2] as received.
         let in_effect = book.enchantments_in_effect_snapshot();
         assert_eq!(in_effect.len(), 1);
-        assert_eq!(in_effect[0].spell_id, 1);
+        assert_eq!(in_effect[0].spell_id, 2);
+    }
+
+    #[test]
+    fn stat_queries_walk_the_lists_in_their_order() {
+        let record = |spell_id: u32, value: f32| ActiveEnchantmentRecord {
+            stat_mod_type: Some(
+                (EnchantmentTypeFlags::SECOND_ATT | EnchantmentTypeFlags::ADDITIVE).bits(),
+            ),
+            stat_mod_key: Some(STAT_KEY_MAX_HEALTH),
+            stat_mod_value: Some(value),
+            ..effect(spell_id, spell_id, 12)
+        };
+        let mut live = Spellbook::default();
+        live.on_enchantment_added(ActiveEnchantmentRecord {
+            bucket: 2,
+            ..record(1, 10.0)
+        });
+        live.on_enchantment_added(ActiveEnchantmentRecord {
+            bucket: 2,
+            ..record(2, 20.0)
+        });
+        assert!(live.get_vital_mod(STAT_KEY_MAX_HEALTH).additive() == 10.0);
+        let mut manifest = Spellbook::default();
+        manifest.replace_manifest(
+            [],
+            [1, 2].map(|id| ActiveEnchantmentRecord {
+                bucket: 2,
+                ..record(id, 10.0 * id as f32)
+            }),
+            &[],
+            &[],
+            0x3FFF,
+        );
+        assert!(manifest.get_vital_mod(STAT_KEY_MAX_HEALTH).additive() == 20.0);
     }
 
     #[test]

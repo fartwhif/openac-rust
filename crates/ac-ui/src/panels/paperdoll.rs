@@ -701,7 +701,7 @@ impl PaperdollController {
         let mask = SLOT_DEFINITIONS[index].mask;
         match message {
             ElementMessage::ItemDragEntered(p) => {
-                let a = if p.source_kind == ItemDragSource::ShortcutBar {
+                let a = if p.source_kind.is_alias() {
                     DragAcceptance::None
                 } else {
                     match view.get(p.obj_id) {
@@ -718,7 +718,7 @@ impl PaperdollController {
                 }
             }
             ElementMessage::ItemDropped(p) => {
-                if p.source_kind == ItemDragSource::ShortcutBar {
+                if p.source_kind.is_alias() {
                     return;
                 }
                 let Some(item) = view.get(p.obj_id) else {
@@ -776,7 +776,7 @@ impl PaperdollController {
             }
             DollEvent::DragOver(p) => {
                 self.doll_drag_acceptance = match p {
-                    Some(p) if p.source_kind != ItemDragSource::ShortcutBar => {
+                    Some(p) if !p.source_kind.is_alias() => {
                         if view.get(p.obj_id).is_some_and(is_auto_wear_item) {
                             DragAcceptance::Accept
                         } else {
@@ -789,7 +789,7 @@ impl PaperdollController {
             DollEvent::DragLeft => self.doll_drag_acceptance = DragAcceptance::None,
             DollEvent::Dropped(p) => {
                 self.doll_drag_acceptance = DragAcceptance::None;
-                let Some(p) = p.filter(|p| p.source_kind != ItemDragSource::ShortcutBar) else {
+                let Some(p) = p.filter(|p| !p.source_kind.is_alias()) else {
                     return;
                 };
                 if let Some(item) = view.get(p.obj_id).filter(|i| is_auto_wear_item(i)) {

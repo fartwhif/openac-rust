@@ -4252,3 +4252,91 @@ fn a_placement_forced_into_its_cell_keeps_the_contact_the_body_had() {
     assert!(body.on_walkable(), "keeps its walkable ground");
     assert!(body.contact_plane_valid, "keeps its contact plane");
 }
+
+/// Modern mouse turning on the real character (its own animation turns
+/// it): the view 90 degrees to the right turns the body right through the
+/// turn motion, one way only, frame by frame, lands exactly on the view,
+/// and the server hears the start and the stop of one turn.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn modern_mouse_turning_turns_the_character_once_onto_the_view() {
+    use ac_motion::motion_command::TURN_RIGHT;
+    let mut rig = Rig::entered();
+    rig.frames(10);
+    rig.command(MovementCommand::BeginModernMouseLook);
+    let begun = rig.movement.take_outbound_records();
+    assert!(
+        begun.iter().any(|r| r.kind == OutboundKind::MoveToState),
+        "beginning sends the movement: {begun:?}"
+    );
+    let start_yaw = rig.movement.controller().unwrap().yaw();
+    let (_, start, _) = rig.body();
+    // Compass headings grow clockwise: a lower yaw is to the right.
+    let target = start_yaw - std::f32::consts::FRAC_PI_2;
+    let mut headings = vec![start];
+    let mut turned_by_the_turn_motion = false;
+    for _ in 0..180 {
+        rig.command(MovementCommand::MouseLookFacing(target));
+        rig.frames(1);
+        headings.push(rig.body().1);
+        let view = rig.world.object(PLAYER).unwrap().motion_view().unwrap();
+        turned_by_the_turn_motion |= view.state.turn_command == TURN_RIGHT;
+    }
+    assert!(turned_by_the_turn_motion, "the turn motion turns the body");
+    for pair in headings.windows(2) {
+        let step = (pair[1] - pair[0] + 540.0).rem_euclid(360.0) - 180.0;
+        assert!(step >= -1e-3, "the heading only grows: {pair:?}");
+    }
+    let landed = (start + 90.0).rem_euclid(360.0);
+    let off = ((headings.last().unwrap() - landed + 540.0).rem_euclid(360.0) - 180.0).abs();
+    assert!(off < 0.01, "lands on the view: {off} degrees off");
+    let c = rig.movement.controller().unwrap();
+    assert!(c.mouse_look_facing_settled());
+    let turn: Vec<_> = rig
+        .movement
+        .take_outbound_records()
+        .into_iter()
+        .filter(|r| r.kind == OutboundKind::MoveToState)
+        .collect();
+    assert_eq!(turn.len(), 2, "one turn: its start and its stop: {turn:?}");
+    rig.command(MovementCommand::EndMouseLook);
+    assert!(
+        rig.movement
+            .take_outbound_records()
+            .iter()
+            .any(|r| r.kind == OutboundKind::MoveToState)
+    );
+    rig.frames(30);
+    assert!((rig.body().1 - headings.last().unwrap()).abs() < 0.01);
+}
+
+/// The window going away during a modern mouse look ends it (the server
+/// hears it), so the character is not left turning toward an old view.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn a_detached_window_ends_its_modern_mouse_look() {
+    let mut rig = Rig::entered();
+    rig.frames(10);
+    rig.command(MovementCommand::BeginModernMouseLook);
+    assert!(
+        rig.movement
+            .controller()
+            .unwrap()
+            .modern_mouse_look_active()
+    );
+    let _ = rig.movement.take_outbound_records();
+    rig.movement.release_keys();
+    rig.frames(1);
+    assert!(
+        !rig.movement
+            .controller()
+            .unwrap()
+            .modern_mouse_look_active()
+    );
+    assert!(
+        rig.movement
+            .take_outbound_records()
+            .iter()
+            .any(|r| r.kind == OutboundKind::MoveToState)
+    );
+}

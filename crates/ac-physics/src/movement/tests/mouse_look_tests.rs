@@ -22,7 +22,12 @@ fn create() -> Rig {
 
 fn begin(r: &mut Rig, i: MovementInput) -> bool {
     let mut env = MovementEnv::new(&mut r.engine, &NoTargets);
-    r.c.begin_mouse_look(&mut env, i)
+    r.c.begin_mouse_look(&mut env, i, false)
+}
+
+fn begin_modern(r: &mut Rig, i: MovementInput) -> bool {
+    let mut env = MovementEnv::new(&mut r.engine, &NoTargets);
+    r.c.begin_mouse_look(&mut env, i, true)
 }
 
 fn end(r: &mut Rig, i: MovementInput) -> bool {
@@ -524,4 +529,164 @@ fn a_physically_held_key_keeps_retail_edges_after_a_server_posture() {
     let held = r.update(1.0 / 60.0, physical);
     assert!(!held.should_send_movement_event);
     assert_eq!(r.c.object().interp.interpreted_state.turn_command, 0);
+}
+
+// -- modern mouse turning ---------------------------------------------------
+// OpenAC `PlayerMouseLookMovementTests` (modern facing turn).
+
+fn facing(r: &mut Rig, yaw: f32) {
+    r.c.set_mouse_look_facing_target(yaw);
+}
+
+fn wrap(angle: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let w = (angle + PI).rem_euclid(TAU) - PI;
+    if w <= -PI { w + TAU } else { w }
+}
+
+#[test]
+fn modern_mouse_look_keyboard_turn_wins_without_sidestep_remapping() {
+    let mut r = create();
+    let keyboard = MovementInput {
+        turn_left: true,
+        run: true,
+        ..input()
+    };
+    assert!(begin_modern(&mut r, keyboard));
+    let entry = capture(&r);
+    assert_eq!(entry.turn_command, Some(TURN_LEFT));
+    assert_eq!(entry.sidestep_command, None);
+
+    let yaw = r.c.yaw();
+    facing(&mut r, yaw - 0.5);
+    let combined = r.update(0.01, keyboard);
+    assert_eq!(combined.turn_command, Some(TURN_LEFT));
+    assert_eq!(combined.sidestep_command, None);
+    assert!(!combined.turn_uses_run_hold);
+
+    let released = MovementInput {
+        run: true,
+        ..input()
+    };
+    let yaw = r.c.yaw();
+    facing(&mut r, yaw - 0.5);
+    let mouse_only = r.update(0.01, released);
+    assert_eq!(mouse_only.turn_command, Some(TURN_RIGHT));
+    assert!(mouse_only.turn_uses_run_hold);
+
+    assert!(end(&mut r, keyboard));
+    let mouse_released = capture(&r);
+    assert_eq!(mouse_released.turn_command, Some(TURN_LEFT));
+    assert_eq!(mouse_released.sidestep_command, None);
+}
+
+/// Modern mouse turning turns the character like a held turn key: one
+/// full-rate turn that the server hears start and stop, never re-issued at
+/// a new speed, and it ends exactly on the view without turning past it.
+#[test]
+fn a_modern_facing_turn_is_one_steady_turn_that_stops_exactly_on_the_view() {
+    let mut r = create();
+    let run = MovementInput {
+        run: true,
+        ..input()
+    };
+    assert!(begin_modern(&mut r, run));
+    note_sent(&mut r, false);
+    let target = r.c.yaw() - 0.6; // About 34 degrees to the right.
+    let mut sent = Vec::new();
+    let mut turns = Vec::new();
+    for _ in 0..144 {
+        facing(&mut r, target);
+        let result = r.update(1.0 / 144.0, run);
+        turns.push((result.turn_command, result.turn_speed));
+        if result.should_send_movement_event {
+            sent.push(result);
+            note_sent(&mut r, false);
+        }
+    }
+    assert!(
+        turns
+            .iter()
+            .filter(|t| t.0.is_some())
+            .all(|t| *t == (Some(TURN_RIGHT), Some(1.0))),
+        "{turns:?}"
+    );
+    assert_eq!(sent.len(), 2, "the start and the stop");
+    assert_eq!(sent[0].turn_command, Some(TURN_RIGHT));
+    assert!(sent[0].turn_uses_run_hold);
+    assert_eq!(sent[1].turn_command, None);
+    assert_eq!(turns.last().unwrap().0, None);
+    assert!(wrap(target - r.c.yaw()).abs() < 1e-4);
+    assert!(r.c.mouse_look_facing_settled());
+}
+
+#[test]
+fn a_view_swung_back_past_the_facing_turns_the_other_way() {
+    let mut r = create();
+    let run = MovementInput {
+        run: true,
+        ..input()
+    };
+    assert!(begin_modern(&mut r, run));
+    let start = r.c.yaw();
+    facing(&mut r, start + 1.0);
+    assert_eq!(r.update(1.0 / 30.0, run).turn_command, Some(TURN_LEFT));
+    facing(&mut r, start - 1.0);
+    assert_eq!(r.update(1.0 / 144.0, run).turn_command, Some(TURN_RIGHT));
+    assert!(!r.c.mouse_look_facing_settled());
+}
+
+#[test]
+fn the_facing_target_is_ignored_outside_a_modern_mouse_look() {
+    let mut r = create();
+    let run = MovementInput {
+        run: true,
+        ..input()
+    };
+    let yaw = r.c.yaw();
+    facing(&mut r, yaw + 1.0);
+    assert_eq!(r.update(1.0 / 30.0, run).turn_command, None);
+    assert!(begin(&mut r, run));
+    let yaw = r.c.yaw();
+    facing(&mut r, yaw + 1.0);
+    assert_eq!(r.update(1.0 / 30.0, run).turn_command, None);
+}
+
+/// The cause of the stutter the turn must not have: a view resting between
+/// two physics turn steps. The body turns once, lands on the view, and
+/// never turns back (no hunting), frame by frame.
+#[test]
+fn a_view_resting_between_turn_steps_causes_no_reversal() {
+    let mut r = create();
+    let run = MovementInput {
+        run: true,
+        ..input()
+    };
+    assert!(begin_modern(&mut r, run));
+    note_sent(&mut r, false);
+    // Prime the turn rate: one step's turn at the full rate.
+    let start = r.c.yaw();
+    facing(&mut r, start - 1.0);
+    r.update(PhysicsBody::MIN_QUANTUM + 0.001, run);
+    let step = (start - r.c.yaw()).abs();
+    assert!(step > 0.01, "the body turned one step: {step}");
+    // Rest the view a third of a step past the body, then keep it there.
+    let target = r.c.yaw() - step / 3.0;
+    let mut turns = Vec::new();
+    let mut sent = 0;
+    for _ in 0..240 {
+        facing(&mut r, target);
+        let result = r.update(1.0 / 144.0, run);
+        turns.push(result.turn_command);
+        if result.should_send_movement_event {
+            sent += 1;
+            note_sent(&mut r, false);
+        }
+    }
+    assert!(turns.iter().all(|t| *t != Some(TURN_LEFT)), "{turns:?}");
+    let edges = turns.windows(2).filter(|w| w[0] != w[1]).count();
+    assert!(edges <= 1, "one stop at most, no restart: {turns:?}");
+    assert!(sent <= 1, "at most the stop is sent: {sent}");
+    assert!(wrap(target - r.c.yaw()).abs() < 1e-4);
+    assert!(r.c.mouse_look_facing_settled());
 }

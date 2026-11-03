@@ -474,16 +474,38 @@ impl SessionState {
             teleport_sequence,
             destination_cell,
         } = held;
-        let arrived = self.transit.acknowledge_destination_readiness(readiness)
-            && self.transit.acknowledge_portal_materialized(
-                generation,
-                teleport_sequence,
-                destination_cell,
-            )
-            && self.transit.acknowledge_world_viewport_visible(generation)
-            && self.transit.complete(generation);
+        let refused = if !self.transit.acknowledge_destination_readiness(readiness) {
+            Some("its readiness")
+        } else if !self.transit.acknowledge_portal_materialized(
+            generation,
+            teleport_sequence,
+            destination_cell,
+        ) {
+            Some("its materialization")
+        } else if !self.transit.acknowledge_world_viewport_visible(generation) {
+            Some("its world view")
+        } else if !self.transit.complete(generation) {
+            Some("its completion")
+        } else {
+            None
+        };
         self.movement.arrive();
-        if arrived {
+        if let Some(step) = refused {
+            // No newer teleport replaced this one (that cancels the held
+            // arrival before it gets here), so the server never hears that
+            // this teleport ended and keeps the character in portal space.
+            let snapshot = self.transit.snapshot();
+            self.movement.refuse(&format!(
+                "portal arrival {generation} (teleport {teleport_sequence}) to \
+                 0x{destination_cell:08X} refused at {step}: the server is not told \
+                 the teleport ended (reveal {} to 0x{:08X}, {} stale, {} invariant failures)",
+                snapshot.generation,
+                snapshot.destination_cell(),
+                self.transit.rejection_count(),
+                snapshot.invariant_failure_count,
+            ));
+            self.transit.cancel(generation);
+        } else {
             if std::mem::take(&mut self.login_release_on_arrival) {
                 // The login complete a window held at login goes out now.
                 self.login_release = true;
@@ -496,8 +518,6 @@ impl SessionState {
                 teleport_sequence,
                 destination_cell,
             });
-        } else {
-            self.transit.cancel(generation);
         }
         self.transit.end_teleport();
     }
@@ -1111,10 +1131,13 @@ impl SessionState {
         self.options.echo_shortcuts(self.inventory.shortcuts());
     }
 
-    /// The character left the world: the journal is saved and every piece
-    /// of server-owned state is forgotten.
+    /// The character left the world: the journal is saved, every piece of
+    /// server-owned state is forgotten and the plugins' labels and markers
+    /// over objects come down (what they draw at fixed positions stays).
     pub fn left_world(&mut self, wall_unix_ms: i64) {
         self.wall_unix_ms = wall_unix_ms;
+        self.plugin_ui.clear_labels();
+        self.plugin_ui.clear_object_markers();
         self.communication.left_world(wall_unix_ms);
         self.options.reset_session();
         self.inventory.reset_session(&mut self.world);
@@ -1499,7 +1522,20 @@ impl SessionState {
         let sent = self.inventory.execute(item, &mut ctx);
         self.inventory.observe(&mut ctx);
         self.begin_games(outbox, active, clocks);
+        self.select_merged_stacks(outbox, active, clocks);
         sent
+    }
+
+    /// Each merge sent selects the stack it joins (a pickup that joins a
+    /// carried stack shows that stack and its count, not the one picked
+    /// up), here so a session with no window follows it as one with a
+    /// window does.
+    fn select_merged_stacks(&mut self, outbox: &mut Outbox, active: bool, clocks: Clocks) {
+        use crate::inventory::ObjectRef;
+        for target in self.inventory.take_merged_into() {
+            let select = GameplayCommand::Select(ObjectRef::Guid(target));
+            self.command(SessionCommand::Gameplay(select), outbox, active, clocks);
+        }
     }
 
     /// The game boards the item owner was asked to use begin their games
@@ -2219,6 +2255,9 @@ fn list_objects(world: &World) -> Vec<ObjectSummary> {
                 origin: position.map(|p| [p.origin.x, p.origin.y, p.origin.z]),
                 distance: position.zip(player).map(|(p, me)| distance(p, &me)),
                 parent: o.parent().map(|p| p.guid),
+                monarch: world
+                    .item(o.guid())
+                    .and_then(ac_core::items::ClientObject::monarch_id),
             }
         })
         .collect();
@@ -3031,6 +3070,51 @@ mod tests {
         assert!(outbox.is_empty());
     }
 
+    /// An arrival the reveal's checks refuse leaves the server in portal
+    /// space (no login complete); the log says so, naming the step, so a
+    /// character left stuck that way can be told apart from one the server
+    /// never moved.
+    #[test]
+    fn a_refused_arrival_is_reported_and_tells_the_server_nothing() {
+        let (mut state, mut outbox) = in_portal_space(true, 1);
+        arrive_at(&mut state, &mut outbox, 1, DESTINATION);
+        state.drain_host_events();
+        let generation = state.transit.snapshot().generation;
+        // An outdoor destination with no render radius fails the readiness
+        // check.
+        let readiness = DestinationReadiness {
+            required_render_radius: 0,
+            ..DestinationReadiness::immediate(generation, DESTINATION)
+        };
+        state.command(
+            SessionCommand::DestinationShown(DestinationShown {
+                teleport_sequence: 1,
+                readiness,
+            }),
+            &mut outbox,
+            true,
+            CLOCKS,
+        );
+        assert!(outbox.is_empty(), "no login complete");
+        assert!(state.transit.snapshot().cancelled);
+        assert!(!state.transit.is_teleport_active());
+        let refusals: Vec<String> = state
+            .drain_host_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                HostEvent::Movement(crate::movement::MovementEvent::Refused(text)) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert!(
+            refusals[0].contains("refused at its readiness")
+                && refusals[0].contains("the server is not told the teleport ended"),
+            "{}",
+            refusals[0]
+        );
+    }
+
     /// A window that goes away mid-hold releases the
     /// arrival at once, as a session without a window arrives.
     #[test]
@@ -3106,6 +3190,65 @@ mod tests {
         assert_eq!(state.transit.snapshot(), PortalSnapshot::IDLE);
         state.set_window_attached(false, &mut outbox);
         assert!(outbox.is_empty());
+    }
+
+    /// The plugins outlive the stay, but their world labels end with it, so
+    /// a label on a lasting id (the character, a carried item) does not
+    /// come back on the next stay.
+    #[test]
+    fn leaving_the_world_takes_the_plugins_labels_down() {
+        let (mut state, _outbox) = state();
+        let label = ac_plugin_ui::WorldLabel {
+            object_id: 0x5000_0001,
+            text: "me".into(),
+            color: [1.0; 4],
+            height_offset: 0.0,
+            line: 0,
+            max_range: 60.0,
+            outline: true,
+        };
+        assert!(state.plugin_ui.show_labels("edwards.tank", vec![label]));
+        state.end_generation(0);
+        assert!(state.plugin_ui.merged_labels().is_empty());
+    }
+
+    /// Markers over objects end with the stay too, those at fixed positions
+    /// stay, and the plugin's layer stays usable for the next one.
+    #[test]
+    fn leaving_the_world_takes_the_plugins_markers_over_objects_down() {
+        let (mut state, _outbox) = state();
+        let icon = ac_plugin_ui::WorldIcon {
+            anchor: ac_plugin_ui::MarkerAnchor::Object(0x5000_0001),
+            image: 1,
+            size: 24.0,
+            tint_rgba: 0xFFFF_FFFF,
+            border_rgba: None,
+            max_range: 60.0,
+            hidden_by_world: false,
+        };
+        let here = ac_plugin_ui::MarkerAnchor::Position {
+            point: ac_plugin_ui::MapPoint {
+                east_west: 40.0,
+                north_south: 12.5,
+                elevation: 0.3,
+            },
+            is_outdoor: true,
+        };
+        let waypoint = ac_plugin_ui::WorldIcon {
+            anchor: here,
+            ..icon
+        };
+        let layer = state.plugin_ui.create_marker_layer("edwards.tank");
+        assert!(
+            state
+                .plugin_ui
+                .set_icons("edwards.tank", layer, vec![icon, waypoint])
+        );
+        state.end_generation(0);
+        let left = state.plugin_ui.merged_icons();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].icon.anchor, here);
+        assert!(state.plugin_ui.set_icons("edwards.tank", layer, vec![icon]));
     }
 
     #[test]
@@ -4540,6 +4683,56 @@ mod list_tests {
         );
         assert_eq!(state.gameplay.selection().selected(), Some(0x7000_0001));
         assert!(status_lines(&mut state).is_empty());
+    }
+
+    #[test]
+    fn a_pickup_that_joins_a_carried_stack_selects_that_stack() {
+        // OpenAC `InventoryController.OnMergeAttempted` (every merge the
+        // runtime sends selects the stack it joins), from the game's merge
+        // attempt, which selects the target after sending the merge. The
+        // loose gem picked up leaves the world; the joined stack stays the
+        // selection and its new size is what the selection shows.
+        const LOOSE: u32 = 0x6000_0002;
+        let (mut state, mut outbox) = monster_and_gem();
+        let Inbound::CreateObject(mut loose) =
+            create(LOOSE, stamps(1, 1), Some(position(0xA9B4_0001, 11.0)))
+        else {
+            unreachable!()
+        };
+        loose.weenie = Some(ac_proto::PublicWeenieDesc {
+            name: "Gem".into(),
+            item_type: ac_core::items::ItemType::GEM.bits(),
+            stack_size: Some(1),
+            max_stack_size: Some(100),
+            ..ac_proto::PublicWeenieDesc::default()
+        });
+        state.world.apply(&Inbound::CreateObject(loose));
+        select(&mut state, &mut outbox, LOOSE);
+        key(&mut state, &mut outbox, ItemCommand::PickUpSelected);
+        assert_eq!(
+            outbox.drain().map(|o| o.body).collect::<Vec<_>>(),
+            [ac_proto::inventory::build_stackable_merge(1, LOOSE, GEM, 1)]
+        );
+        assert_eq!(state.gameplay.selection().selected(), Some(GEM));
+        // The server's answer: the loose stack goes, the carried one grows.
+        let clocks = Clocks::default();
+        for message in [
+            Inbound::InventoryRemoveObject(ac_proto::InventoryRemoveObject { guid: LOOSE }),
+            Inbound::DeleteObject(ac_proto::DeleteObject {
+                guid: LOOSE,
+                instance_sequence: 1,
+            }),
+            Inbound::SetStackSize(ac_proto::SetStackSize {
+                sequence: 1,
+                guid: GEM,
+                stack_size: 6,
+                value: 60,
+            }),
+        ] {
+            state.apply(&message, &mut outbox, true, clocks);
+        }
+        assert_eq!(state.gameplay.selection().selected(), Some(GEM));
+        assert_eq!(state.world.item(GEM).map(|g| g.stack_size), Some(6));
     }
 
     #[test]

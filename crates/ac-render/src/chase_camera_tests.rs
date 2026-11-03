@@ -698,6 +698,6 @@ fn the_views_toggle_back_to_the_view_before_them() {
         "an adjustment leaves the look-down view"
     );
     cam.set_default_view();
-    assert!(near(cam.distance, 2.5f32.hypot(0.75), 6));
+    assert!(near(cam.distance, 2.75f32.hypot(0.825), 5));
     assert_eq!(cam.yaw_offset, 0.0);
 }

@@ -2,6 +2,7 @@
 //! atlas textures the draw list names.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ac_dat::objects::{Font, FontCharDesc};
 
@@ -41,6 +42,21 @@ pub struct UiFont {
     /// font's `?`); dat fonts have none and skip such characters.
     fallback_character: Option<char>,
 }
+
+/// A font baked again at a multiple of its size. Its glyphs are drawn in the
+/// font's place on a high-density display; every measurement, and so all
+/// layout, still comes from the font itself.
+#[derive(Debug, Clone)]
+pub struct SharpFont {
+    /// The sharper bake.
+    pub font: Arc<UiFont>,
+    /// How many times the font's size it was baked at.
+    pub scale: f32,
+}
+
+/// The sharper bakes for the display in use, by the id of the font each one
+/// draws for.
+pub type SharpFonts = HashMap<u32, SharpFont>;
 
 /// The default UI font id.
 pub const DEFAULT_FONT_ID: u32 = ac_dat::objects::DEFAULT_FONT_ID;

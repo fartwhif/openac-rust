@@ -108,6 +108,7 @@ fn scene() -> Scene {
         public_weenie_bitfield: 0,
         radar_behavior: Some(4),
         radar_blip_color: 0,
+        monarch_id: 0,
     };
     scene.apply(PresentationEvent::Snapshot(WorldSnapshot {
         player_guid: Some(PLAYER),
@@ -2415,4 +2416,205 @@ fn the_radar_marks_the_fellowship_the_session_reports() {
         .blips;
     let drudge = blips.iter().find(|b| b.object_id == DRUDGE).unwrap();
     assert_eq!(drudge.shape, BlipShape::Triangle);
+}
+
+/// A War spell (scarab 1, lowest taper 63) the player knows, examined from
+/// the spellbook: its component names as the examination window lists them
+/// and its formula cells.
+struct ExaminedSpell {
+    ui: WindowUi,
+    scene: Scene,
+    names: std::collections::HashMap<u32, String>,
+    focus_class: u32,
+    class_of: std::collections::HashMap<u32, u32>,
+}
+
+const EXAMINED_SPELL: u32 = 0x7FFF;
+const FOCUS: u32 = 0x8000_0030;
+const SCARAB: u32 = 0x8000_0031;
+const PRISMATIC_TAPER: u32 = 0x8000_0032;
+
+impl ExaminedSpell {
+    fn new() -> Self {
+        use ac_core::spells::{MagicSchool, SpellMetadata, SpellTable, Spellbook};
+        use ac_ui::panels::PanelOutput;
+        use ac_ui::root::UiOutput;
+        let dats = dats();
+        // Names, focus and component classes as the dats hold them.
+        let names = dats
+            .get::<ac_dat::objects::SpellComponentTable>(ac_dat::objects::SPELL_COMPONENT_TABLE_ID)
+            .unwrap()
+            .unwrap()
+            .components
+            .into_iter()
+            .map(|(id, c)| (id, c.name))
+            .collect();
+        let focus_class = ac_runtime::gameplay::tables::magic_packs(&dats).unwrap()[&1];
+        let map = dats
+            .get::<ac_dat::objects::EnumIdMap>(0x2700_0002)
+            .unwrap()
+            .unwrap();
+        let class_of = [1, 0xBC]
+            .into_iter()
+            .map(|scid| (scid, map.client_id(scid).unwrap()))
+            .collect();
+        let size = (1280, 720);
+        let mut ui = WindowUi::build(dats, size).expect("the UI builds");
+        let mut scene = scene();
+        interface(
+            &mut scene,
+            InterfaceState {
+                account: "testaccount".to_owned(),
+                ..InterfaceState::default()
+            },
+        );
+        let spell = SpellMetadata {
+            school: "War Magic".to_owned(),
+            school_id: MagicSchool::WAR_MAGIC,
+            formula_components: vec![1, 63],
+            ..SpellMetadata::new(EXAMINED_SPELL, "Test Bolt", 0)
+        };
+        let mut book = Spellbook::new(Some(Arc::new(SpellTable::create([spell]).unwrap())));
+        book.on_spell_learned(EXAMINED_SPELL, 0.0);
+        scene.apply(PresentationEvent::Interface(InterfaceEvent::Player(
+            Box::new(PlayerFacts {
+                revision: 2,
+                numbers: ac_core::player::LocalPlayerState::new(Some(book)),
+                session_seconds: 0.0,
+            }),
+        )));
+        ui.feed(&mut scene);
+        ui.handle(vec![UiOutput::Panel(PanelOutput::ExamineSpell(
+            EXAMINED_SPELL,
+        ))]);
+        ui.feed(&mut scene);
+        Self {
+            ui,
+            scene,
+            names,
+            focus_class,
+            class_of,
+        }
+    }
+
+    /// `items` put directly in the player's pack (beside the sword).
+    fn carry(&mut self, items: &[(u32, u32)]) {
+        use ac_core::items::ClientObject;
+        let objects: Vec<ClientObject> = items
+            .iter()
+            .map(|&(guid, class)| {
+                let mut o = ClientObject::new(guid);
+                o.weenie_class_id = class;
+                o.container_id = PLAYER;
+                o
+            })
+            .collect();
+        let mut contents = vec![SWORD];
+        contents.extend(items.iter().map(|&(guid, _)| guid));
+        self.scene
+            .apply(PresentationEvent::Interface(InterfaceEvent::Items(
+                ItemsUpdate {
+                    reset: false,
+                    objects,
+                    removed: Vec::new(),
+                    contents: vec![(PLAYER, Some(contents))],
+                },
+            )));
+        self.ui.feed(&mut self.scene);
+    }
+
+    fn display(&mut self) -> String {
+        use ac_ui::panels::appraisal;
+        use ac_ui::widgets::Text;
+        let root = &self.ui.host().root;
+        let frame = root.window(EXAMINATION_WINDOW).unwrap().frame;
+        let text = root
+            .find_descendant(frame, appraisal::SPELL_DISPLAY_TEXT_ID)
+            .unwrap();
+        root.widget::<Text>(text)
+            .unwrap()
+            .content_lines()
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn cells(&mut self) -> Vec<ac_ui::ElementId> {
+        use ac_ui::panels::appraisal::AppraisalController;
+        self.ui
+            .host_mut()
+            .with_controller::<AppraisalController, _>(EXAMINATION_WINDOW, |c, _| {
+                c.formula_cells().to_vec()
+            })
+            .unwrap()
+    }
+
+    /// Whether each formula cell's missing overlay shows.
+    fn missing(&mut self) -> Vec<bool> {
+        use ac_ui::panels::appraisal::SPELL_COMPONENT_MISSING_ID;
+        let cells = self.cells();
+        let root = &self.ui.host().root;
+        cells
+            .into_iter()
+            .map(|c| {
+                let m = root
+                    .find_descendant(c, SPELL_COMPONENT_MISSING_ID)
+                    .expect("the authored cell's missing overlay");
+                root.element(m).unwrap().visible
+            })
+            .collect()
+    }
+}
+
+// OpenAC `AppraisalUiController.RefreshSpellComponents`, run on the item
+// table's changes: picking up the school's focus while the spell shows
+// lists its scarab and prismatic taper at once.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn picking_up_a_focus_while_a_spell_is_examined_shows_its_prismatic_taper() {
+    let mut s = ExaminedSpell::new();
+    assert!(s.ui.host().root.is_window_visible(EXAMINATION_WINDOW));
+    let taper = s.names[&63].clone();
+    let prismatic = s.names[&0xBC].clone();
+    let display = s.display();
+    assert!(display.contains(&taper), "{display}");
+    assert!(!display.contains(&prismatic), "{display}");
+    assert_eq!(s.cells().len(), 2);
+
+    let focus = s.focus_class;
+    s.carry(&[(FOCUS, focus)]);
+    let display = s.display();
+    assert!(display.contains(&prismatic), "{display}");
+    assert!(!display.contains(&taper), "{display}");
+    assert_eq!(s.cells().len(), 2);
+}
+
+// OpenAC `SpellExamineComponentTemplateFactory.Create`: each formula cell
+// is the examination layout's authored cell, its missing overlay shown
+// over a component the player does not carry.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn components_the_player_does_not_carry_show_the_missing_overlay() {
+    use ac_ui::widgets::DatElement;
+    let mut s = ExaminedSpell::new();
+    assert_eq!(s.missing(), [true, true]);
+    let (focus, scarab, prismatic) = (s.focus_class, s.class_of[&1], s.class_of[&0xBC]);
+    s.carry(&[(FOCUS, focus), (SCARAB, scarab)]);
+    assert_eq!(s.missing(), [false, true]);
+    s.carry(&[
+        (FOCUS, focus),
+        (SCARAB, scarab),
+        (PRISMATIC_TAPER, prismatic),
+    ]);
+    assert_eq!(s.missing(), [false, false]);
+    let cells = s.cells();
+    let root = &s.ui.host().root;
+    for c in cells {
+        let cell = root.widget::<DatElement>(c).expect("the authored cell");
+        assert!(
+            matches!(cell.runtime_image, Some(Some(_))),
+            "the icon shows"
+        );
+    }
 }

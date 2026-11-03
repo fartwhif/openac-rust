@@ -70,6 +70,8 @@ pub struct RadarPlayer {
     pub item_type: u32,
     /// His public description bit field.
     pub pwd_bitfield: u32,
+    /// His allegiance's monarch (0: none).
+    pub monarch_id: u32,
 }
 
 /// One object near the player.
@@ -89,7 +91,11 @@ pub struct RadarObject {
     pub pwd_bitfield: u32,
     /// Its own blip colour (0: none).
     pub color_override: u8,
-    /// Its relation to the player (fellowship, allegiance).
+    /// Its allegiance's monarch (0: none).
+    pub monarch_id: u32,
+    /// Its place in the player's fellowship. Allegiance membership and the
+    /// player-killer relation are filled in from the monarchs and the
+    /// player's description.
     pub relationship: RelationshipTraits,
 }
 
@@ -143,6 +149,7 @@ pub fn build_snapshot(scene: &RadarScene) -> RadarSnapshot {
             o.color_override,
         );
         let relationship = RelationshipTraits {
+            is_allegiance_member: radar::is_allegiance_member(o.monarch_id, player.monarch_id),
             player_is_player_killer: player_traits.is_player_killer,
             player_is_pk_lite: player_traits.is_pk_lite,
             ..o.relationship

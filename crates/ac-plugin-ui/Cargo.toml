@@ -14,6 +14,14 @@ license = "MIT"
 # The panel markup is XML; the same reader the launcher uses for its feed
 # (pure Rust, refuses DTDs).
 roxmltree.workspace = true
+# A plugin's canvas fonts are baked here, so the client and the SDK's fake host
+# answer alike.
+fontdue.workspace = true
+ttf-parser.workspace = true
+# Inflates a plugin's icon.png, and the client's own icon (the launcher checks
+# and shows the same file).
+miniz_oxide.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

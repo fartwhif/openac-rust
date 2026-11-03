@@ -251,6 +251,7 @@ impl InterfaceFacts {
             split,
             vendor_split_exempt: self.vendor_split_exempt(selected),
             strength: self.strength(),
+            open_vendor: self.shop.as_ref().map_or(0, |s| s.vendor_guid),
             owner_name: self.objects.get(player).map(|o| o.name.as_str()),
             names: Some(names),
             ..ItemsView::new(&self.objects, player)

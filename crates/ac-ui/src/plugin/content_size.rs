@@ -11,6 +11,7 @@ use ac_plugin_ui::markup::Element as Markup;
 
 use super::controls::{MarkupCheckbox, MarkupHotkey, MarkupNumber, MarkupRadio, SPIN_WIDTH};
 use super::fold::{CAPTION_X as EXPANDER_CAPTION_X, ExpanderHeader, MarkupExpander};
+use super::style;
 use super::widgets::{MarkupButton, MarkupLabel, MarkupToggle};
 use crate::font::UiFont;
 use crate::root::UiRoot;
@@ -29,8 +30,10 @@ pub const CONTROL_TEXT_PADDING: f32 = 8.0;
 pub const BUTTON_PADDING_X: f32 = 12.0;
 /// The smallest height of a toggle.
 pub const TOGGLE_HEIGHT: f32 = 20.0;
-/// Where a toggle's caption starts, in either look: lamp (or check) and gap.
+/// Where a toggle's caption starts in Classic: lamp and gap.
 pub const CLASSIC_TOGGLE_CAPTION_X: f32 = 17.0;
+/// Where a themed toggle's caption starts: switch and gap.
+pub const THEMED_TOGGLE_CAPTION_X: f32 = 1.0 + style::SWITCH_WIDTH + style::SWITCH_CAPTION_GAP;
 /// Where a checkbox's or radio button's caption starts: box and gap.
 pub const CHECK_CAPTION_X: f32 = 17.0;
 /// Room after each round radio option's caption.
@@ -225,8 +228,13 @@ pub fn measure(
         }
         Markup::Toggle { .. } => {
             let w = ui.widget::<MarkupToggle>(id)?;
+            let caption_x = if w.palette.is_some() {
+                THEMED_TOGGLE_CAPTION_X
+            } else {
+                CLASSIC_TOGGLE_CAPTION_X
+            };
             fixed(
-                CLASSIC_TOGGLE_CAPTION_X + text_width(w.font.as_ref(), &w.text).ceil(),
+                caption_x + text_width(w.font.as_ref(), &w.text).ceil(),
                 toggle_height_for(w.font.as_ref()),
             )
         }

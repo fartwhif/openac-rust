@@ -28,6 +28,11 @@ ui_canvas_state -
 ui_canvas_available - window
 ui_canvas_remove -
 ui_measure_text -
+ui_font_bundled -
+ui_font_load -
+ui_font_measure -
+ui_font_release -
+ui_font_count -
 ui_theme -
 ui_image_client_art -
 ui_image_spell_icon -
@@ -40,6 +45,13 @@ ui_labels_show -
 ui_lines_create -
 ui_lines_set -
 ui_lines_remove -
+ui_triangles_create -
+ui_triangles_set -
+ui_triangles_remove -
+ui_markers_create -
+ui_markers_set_icons -
+ui_markers_set_shapes -
+ui_markers_remove -
 ui_projectile_debug -
 ui_hotkey_register - window
 ui_hotkey_unregister -
@@ -147,6 +159,7 @@ loot_open -
 loot_close -
 loot_identify -
 loot_pickup -
+loot_put -
 loot_classifier_register -
 loot_classifier_unregister -
 loot_classifiers -
@@ -189,6 +202,7 @@ navigation_follow -
 navigation_stop_go_to -
 navigation_go_to_report -
 navigation_preview_path -
+navigation_reachable_cells -
 navigation_pause -
 navigation_pause_set -
 navigation_pause_release -

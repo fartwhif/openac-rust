@@ -10,6 +10,7 @@
 
 pub mod animation;
 pub mod appearance;
+mod appearance_residency;
 pub mod assets;
 pub mod atmosphere;
 pub mod attach;
@@ -70,8 +71,10 @@ pub mod surface_image;
 #[cfg(test)]
 mod test_gpu;
 pub mod texture_detail;
+pub mod title;
 pub mod translucency;
 pub mod ui;
+mod ui_scale;
 pub mod unowned_cache;
 pub mod viewport;
 pub mod walk;
@@ -79,6 +82,8 @@ pub mod work_budget;
 pub mod world_click;
 pub mod world_frame;
 pub mod world_lines;
+pub mod world_shapes;
+pub mod world_triangles;
 
 pub use attach::DetachReason;
 pub use host::{

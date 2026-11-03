@@ -30,6 +30,11 @@ mod raw {
         pub(super) fn ui_canvas_available(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_canvas_remove(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_measure_text(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_font_bundled(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_font_load(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_font_measure(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_font_release(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_font_count(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_theme(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_image_client_art(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_image_spell_icon(ptr: *const u8, len: usize) -> i32;
@@ -42,6 +47,13 @@ mod raw {
         pub(super) fn ui_lines_create(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_lines_set(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_lines_remove(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_triangles_create(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_triangles_set(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_triangles_remove(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_markers_create(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_markers_set_icons(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_markers_set_shapes(ptr: *const u8, len: usize) -> i32;
+        pub(super) fn ui_markers_remove(ptr: *const u8, len: usize) -> i32;
         pub(super) fn ui_projectile_debug(ptr: *const u8, len: usize) -> i32;
     }
 }
@@ -82,6 +94,11 @@ wrappers!(
     ui_canvas_available,
     ui_canvas_remove,
     ui_measure_text,
+    ui_font_bundled,
+    ui_font_load,
+    ui_font_measure,
+    ui_font_release,
+    ui_font_count,
     ui_theme,
     ui_image_client_art,
     ui_image_spell_icon,
@@ -94,5 +111,12 @@ wrappers!(
     ui_lines_create,
     ui_lines_set,
     ui_lines_remove,
+    ui_triangles_create,
+    ui_triangles_set,
+    ui_triangles_remove,
+    ui_markers_create,
+    ui_markers_set_icons,
+    ui_markers_set_shapes,
+    ui_markers_remove,
     ui_projectile_debug,
 );

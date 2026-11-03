@@ -300,9 +300,11 @@ impl VendorLists {
 
     /// Stage one of the player's items on the sell list, checked as the
     /// vendor window checks a drop: a refusal comes back as its text. A
-    /// pack holding items sells its contents instead: each direct child the
-    /// vendor takes is staged (a child that is itself a full pack is not
-    /// opened), the rest are skipped without a word.
+    /// pack holding items (the main pack included) sells its contents
+    /// instead: each object in its item slots that the vendor takes is
+    /// staged (one that is itself a pack holding something is not opened),
+    /// the rest are skipped without a word. What fills its pack slots (side
+    /// packs and spell foci) is never walked.
     pub fn add_to_sell(
         &mut self,
         item_guid: u32,
@@ -314,11 +316,12 @@ impl VendorLists {
             notices.push(rejection.message().to_owned());
             return false;
         }
-        let contents = world.items().get_contents(item_guid).to_vec();
-        if contents.is_empty() {
+        if world.items().get_contents(item_guid).is_empty() {
             let quantity = world.item(item_guid).map_or(1, |i| i.stack_size.max(1));
             self.sell.stage(item_guid, quantity);
-        } else {
+        }
+        let contents = world.items().get_contained_items(item_guid);
+        if !contents.is_empty() {
             let name = world
                 .item(item_guid)
                 .map(|i| i.name.clone())
@@ -664,10 +667,8 @@ fn evaluate(
     let player = world.player_guid().unwrap_or(0);
     evaluate_sell(
         &VendorSellCandidate {
-            owned_by_player: player != 0
-                && item_guid != player
-                && world.items().is_owned_by_object(item_guid, player),
-            contained_item_count: i32::try_from(world.items().get_contents(item_guid).len())
+            owned_by_player: world.items().is_owned_by_object(item_guid, player),
+            contained_item_count: i32::try_from(world.items().get_contained_items(item_guid).len())
                 .unwrap_or(i32::MAX),
             item_type: item.item_type.bits(),
             per_unit_value: per_unit_value(item.value, Some(item.stack_size)),
@@ -1131,6 +1132,79 @@ mod tests {
         ShopItems::default().follow(&vendor, &mut world);
         assert!(!lists.add_to_sell(ITEM_A, &vendor, &mut world, &mut notices));
         assert_eq!(notices, ["You can only sell items you are carrying"]);
+    }
+
+    /// The main pack as the server lists it: the gem in an item slot, the
+    /// pack and a spell focus in pack slots (container types 0, 1 and 2,
+    /// as the inventory listing sends them), and a second gem inside the
+    /// side pack. The focus is the "Foci of Enchantment" weenie (wcid
+    /// 15268): item type Misc, value 500. The vendor buys gems and Misc.
+    fn main_pack_with_a_focus() -> (World, VendorState) {
+        const FOCUS: u32 = 0x6000_0003;
+        const PACKED_GEM: u32 = 0x6000_0004;
+        let (mut world, mut vendor) = shop();
+        world.apply(&create(FOCUS, "Foci of Enchantment", |d| {
+            d.item_type = ItemType::MISC.bits();
+            d.value = Some(500);
+            d.container_id = Some(PLAYER);
+        }));
+        world.apply(&create(PACKED_GEM, "Packed Gem", |d| {
+            d.item_type = ItemType::GEM.bits();
+            d.value = Some(100);
+            d.container_id = Some(PACK);
+        }));
+        world.mutate_items_for_test(|table, events| {
+            let entry = |guid, container_type| ac_core::items::ContainerContentEntry {
+                guid,
+                container_type,
+            };
+            table.replace_contents(
+                PLAYER,
+                &[entry(GEM, 0), entry(PACK, 1), entry(FOCUS, 2)],
+                events,
+            );
+            table.replace_contents(PACK, &[entry(PACKED_GEM, 0)], events);
+        });
+        let profile = VendorShopProfile {
+            merchandise_item_types: (ItemType::GEM | ItemType::MISC).bits(),
+            ..vendor.profile().clone()
+        };
+        let items = vendor.items().to_vec();
+        vendor.apply(0x7000_0003, profile, items);
+        (world, vendor)
+    }
+
+    #[test]
+    fn the_main_pack_sells_its_item_slots_only() {
+        let (mut world, vendor) = main_pack_with_a_focus();
+        let mut lists = VendorLists::default();
+        let mut notices = Vec::new();
+        assert!(lists.add_to_sell(PLAYER, &vendor, &mut world, &mut notices));
+        assert_eq!(notices, ["Selling contents of Horan"]);
+        // The focus and the side pack take pack slots and are not walked;
+        // nothing inside the side pack is either.
+        let staged: Vec<u32> = lists.sell().entries().iter().map(|e| e.item_guid).collect();
+        assert_eq!(staged, [GEM]);
+    }
+
+    #[test]
+    fn a_main_pack_with_only_pack_slots_filled_is_judged_as_the_character() {
+        let (mut world, vendor) = main_pack_with_a_focus();
+        world.mutate_items_for_test(|table, events| {
+            table.replace_contents(
+                PLAYER,
+                &[ac_core::items::ContainerContentEntry {
+                    guid: PACK,
+                    container_type: 1,
+                }],
+                events,
+            );
+        });
+        let mut lists = VendorLists::default();
+        let mut notices = Vec::new();
+        assert!(!lists.add_to_sell(PLAYER, &vendor, &mut world, &mut notices));
+        assert_eq!(notices, ["You cannot sell that here"]);
+        assert!(lists.sell().is_empty());
     }
 
     #[test]

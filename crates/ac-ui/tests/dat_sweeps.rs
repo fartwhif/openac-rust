@@ -550,3 +550,62 @@ fn the_examination_and_inventory_backgrounds_are_authored_translucent() {
     assert_eq!((t.width, t.height), (48, 48));
     assert!(t.rgba.chunks(4).all(|p| p[3] == 175));
 }
+
+// ── Authored text ─────────────────────────────────────────────────────────
+
+#[test]
+#[ignore = "needs the retail dat files"]
+fn authored_text_too_tall_for_its_box_shows_its_first_line() {
+    // A text element lays its own string out from the first line: one that
+    // wraps past its box (the squelch page's 100-pixel "Character Name:"
+    // label) shows its start, not its end.
+    use ac_ui::draw::{DrawList, RenderContext};
+    use ac_ui::widgets::TextContent;
+    let c = content();
+    let layouts: Vec<u32> = c
+        .dats()
+        .local
+        .entries()
+        .filter_map(Result::ok)
+        .map(|e| e.id)
+        .filter(|id| id >> 24 == 0x21)
+        .collect();
+    let mut overflowing = Vec::new();
+    for layout in layouts {
+        let mut ui = root(1600.0, 1200.0);
+        let Some(l) = import(&mut ui, &c, layout, c.font(DEFAULT_FONT_ID)) else {
+            continue;
+        };
+        let mut stack = vec![l.root];
+        while let Some(e) = stack.pop() {
+            stack.extend(ui.children(e));
+            let Some(t) = ui.widget::<Text>(e) else {
+                continue;
+            };
+            if t.one_line
+                || !matches!(
+                    t.content(),
+                    TextContent::Single(_) | TextContent::Wrapped(_)
+                )
+            {
+                continue;
+            }
+            ui.set_visible(e, true);
+            let mut list = DrawList::default();
+            let mut rc = RenderContext::new(&mut list, (1600.0, 1200.0), &c);
+            ui.draw_tree(e, &mut rc);
+            let dat = ui.element(e).unwrap().dat_element_id;
+            let t = ui.widget::<Text>(e).unwrap();
+            if t.scroll.has_overflow() {
+                overflowing.push((layout, dat));
+                assert_eq!(
+                    t.scroll.scroll_y(),
+                    0,
+                    "{layout:#X} {dat:#X} shows {:?} from its end",
+                    t.shown_lines().iter().map(|l| &l.text).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    assert!(overflowing.contains(&(0x2100_0060, 0x1000_053F)));
+}

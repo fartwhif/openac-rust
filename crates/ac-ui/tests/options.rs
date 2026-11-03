@@ -268,12 +268,15 @@ fn binding_builds_every_page_and_shows_gameplay() {
     assert!(b.c.page(OptionsPage::Gameplay).is_empty());
     assert_eq!(b.c.page(OptionsPage::Character).len(), 50);
     assert_eq!(b.c.page(OptionsPage::Chat).len(), 7);
-    // The game's 39 and the Graphics Enhancements section's 21.
-    assert_eq!(b.c.page(OptionsPage::Configuration).len(), 60);
-    // 6 headers, 50 toggles, 6 separators; 6 + 36 + 6 and 1 + 21 + 1;
-    // 1 + 2 + 1 + 5 x 3.
+    // The game's 39, the UI Scale row, the landscape detail textures row,
+    // the Graphics Enhancements section's 21 and the two modern mouse
+    // turning rows in the input section.
+    assert_eq!(b.c.page(OptionsPage::Configuration).len(), 64);
+    // 6 headers, 50 toggles, 6 separators; 6 + 40 + 6 (the game's 36, the
+    // UI Scale row, the landscape detail textures row and the two modern
+    // mouse turning rows) and 1 + 21 + 1; 1 + 2 + 1 + 5 x 3.
     assert_eq!(list_rows(&b, options::CHARACTER_LIST_ID).len(), 62);
-    assert_eq!(list_rows(&b, options::CONFIG_LIST_ID).len(), 71);
+    assert_eq!(list_rows(&b, options::CONFIG_LIST_ID).len(), 75);
     assert_eq!(list_rows(&b, options::CHAT_LIST_ID).len(), 19);
     let notices = b.c.take_notices();
     assert!(notices.is_empty(), "{notices:?}");
@@ -754,4 +757,125 @@ fn the_opacity_sliders_drag_each_other_and_save_when_the_drag_ends() {
             persist: true
         })]
     );
+}
+
+#[test]
+#[ignore = "needs the retail dat files"]
+fn the_ui_scale_row_follows_potato_mode_and_shows_its_percent() {
+    let c = content();
+    let mut b = bind_with(&c, live());
+    b.c.show_page(&mut b.ui, OptionsPage::Configuration);
+    pump(&mut b);
+    // The row's caption carries the value; it is the slider after Potato
+    // Mode's checkbox.
+    let rows = list_rows(&b, options::CONFIG_LIST_ID);
+    let labelled = |row: ElementId, label: &str| {
+        let mut stack = vec![row];
+        while let Some(id) = stack.pop() {
+            if b.ui
+                .widget::<Button>(id)
+                .is_some_and(|w| w.label.as_deref() == Some(label))
+            {
+                return true;
+            }
+            stack.extend(b.ui.children(id));
+        }
+        false
+    };
+    let potato = rows
+        .iter()
+        .position(|r| labelled(*r, "Potato Mode"))
+        .expect("the potato mode row");
+    let row = rows[potato + 1];
+    let caption = b.ui.find_descendant(row, 0x1000_021B).expect("its caption");
+    assert_eq!(text_of(&b.ui, caption), "UI Scale (100%)");
+    let slider = b.ui.find_descendant(row, 0x1000_021C).expect("its slider");
+    // 50..300 in tens: 0.41 of the way is 152.5, which snaps to 150.
+    let out = send(&mut b, slider, ElementMessage::ScalarChanged(0.41));
+    assert_eq!(
+        out,
+        vec![Out::Opt(OptionsOutput::Changed {
+            section: Section::Display,
+            persist: true
+        })]
+    );
+    assert_eq!(b.c.live().settings.display.ui_scale_percent, 150);
+    assert_eq!(text_of(&b.ui, caption), "UI Scale (150%)");
+    // The end of a drag settles the scale: it applies and saves.
+    let out = send(&mut b, slider, ElementMessage::DragCompleted);
+    assert_eq!(
+        out,
+        vec![Out::Opt(OptionsOutput::Changed {
+            section: Section::Display,
+            persist: true
+        })]
+    );
+}
+
+/// Modern mouse turning's two rows: off by default; Both Mouse Buttons
+/// Run Forward is grey and refuses a click until Modern Mouse Turning is
+/// on; while it is on, Use Mouse Turning refuses a click.
+#[test]
+#[ignore = "needs the retail dat files"]
+fn modern_mouse_turning_gates_its_run_row_and_the_legacy_mouse_turning_row() {
+    let c = content();
+    let mut b = bind_with(&c, live());
+    b.c.show_page(&mut b.ui, OptionsPage::Configuration);
+    pump(&mut b);
+    let strings = c.strings();
+    let caption = |key: &str| strings.resolve(0x2300_0003, compute_hash(key), 0);
+    let boxes = checkboxes(&b, options::CONFIG_LIST_ID);
+    let label = |b: &Bound, id: ElementId| b.ui.widget::<Button>(id).unwrap().label.clone();
+    let find = |b: &Bound, text: Option<String>| {
+        *boxes
+            .iter()
+            .find(|id| label(b, **id) == text)
+            .unwrap_or_else(|| panic!("the row {text:?}"))
+    };
+    let modern = find(&b, Some("Modern Mouse Turning".to_owned()));
+    let both = find(&b, Some("Both Mouse Buttons Run Forward".to_owned()));
+    let legacy = find(&b, caption("ID_Input_UseMouseTurning"));
+    let selected = |b: &Bound, id: ElementId| b.ui.widget::<Button>(id).unwrap().selected();
+    let color = |b: &Bound, id: ElementId| b.ui.widget::<Button>(id).unwrap().label_color;
+    assert!(
+        !selected(&b, modern) && !selected(&b, both),
+        "off by default"
+    );
+    assert_eq!(color(&b, both), options::STORE_ONLY_CAPTION_COLOR);
+
+    // Both buttons cannot be turned on without modern turning.
+    b.ui.with::<Button, _>(both, |w, ui| w.set_selected(ui, both, true));
+    assert!(click(&mut b, both).is_empty());
+    assert!(!b.c.live().settings.camera.both_mouse_buttons_run_forward);
+    assert!(!selected(&b, both), "the checkbox shows the refusal");
+
+    // Modern turning on: both buttons become available.
+    b.ui.with::<Button, _>(modern, |w, ui| w.set_selected(ui, modern, true));
+    let out = click(&mut b, modern);
+    assert_eq!(
+        out,
+        vec![Out::Opt(OptionsOutput::Changed {
+            section: Section::Camera,
+            persist: true
+        })]
+    );
+    assert!(b.c.live().settings.camera.modern_mouse_turning);
+    assert_eq!(color(&b, both), ac_ui::draw::Color::WHITE);
+    b.ui.with::<Button, _>(both, |w, ui| w.set_selected(ui, both, true));
+    click(&mut b, both);
+    assert!(b.c.live().settings.camera.both_mouse_buttons_run_forward);
+
+    // The legacy mouse turning row refuses while modern turning is on.
+    b.ui.with::<Button, _>(legacy, |w, ui| w.set_selected(ui, legacy, true));
+    assert!(click(&mut b, legacy).is_empty());
+    assert!(!b.c.live().settings.camera.use_mouse_turning);
+    assert!(!selected(&b, legacy));
+
+    // Modern turning off again: the legacy row takes clicks again.
+    b.ui.with::<Button, _>(modern, |w, ui| w.set_selected(ui, modern, false));
+    click(&mut b, modern);
+    assert_eq!(color(&b, both), options::STORE_ONLY_CAPTION_COLOR);
+    b.ui.with::<Button, _>(legacy, |w, ui| w.set_selected(ui, legacy, true));
+    click(&mut b, legacy);
+    assert!(b.c.live().settings.camera.use_mouse_turning);
 }

@@ -518,6 +518,25 @@ fn a_stack_size_change_renames_the_selection() {
 }
 
 #[test]
+fn a_pickup_joining_a_stack_shows_the_stacks_count_then_its_new_count() {
+    // A loose single selected, then (the merge sent) the stack it joins,
+    // then that stack grown by the server's new size.
+    let mut s = strip();
+    let mut c = s.bind();
+    let mut objects = Objects::new();
+    stack(&mut objects, 0xBB05, "Gold Pea", "Gold Peas", 1);
+    stack(&mut objects, 0xBB06, "Gold Pea", "Gold Peas", 5);
+    s.select(&mut c, &objects, Some(0xBB05), &SelectionFacts::default());
+    assert_eq!(s.name_lines(&c), ["Gold Pea"]);
+    s.select(&mut c, &objects, Some(0xBB06), &SelectionFacts::default());
+    assert_eq!(s.name_lines(&c), ["5 Gold Peas"]);
+    objects.get_mut(0xBB06).stack_size = 6;
+    s.select(&mut c, &objects, Some(0xBB06), &SelectionFacts::default());
+    assert_eq!(s.name_lines(&c), ["6 Gold Peas"]);
+    assert_eq!(s.overlay_state(), states::STACKED_ITEM_SELECTED);
+}
+
+#[test]
 fn a_long_name_wraps_at_the_last_space_that_fits() {
     let font = ac_ui::font::UiFont::new(
         0x4000_0001,

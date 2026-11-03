@@ -10,6 +10,8 @@ use crate::font::UiFont;
 use crate::geometry::PixelRect;
 use crate::layout_policy::LayoutPolicy;
 use crate::media::LoopingAnimation;
+use crate::plugin::Palette;
+use crate::plugin::style;
 use crate::root::UiRoot;
 use crate::states;
 use crate::tree::{Element, ElementId, Widget};
@@ -67,6 +69,8 @@ pub struct Meter {
     pub label: Option<String>,
     /// Plain fill colour (no images).
     pub bar_color: Color,
+    /// The plugin theme the plain look draws in (none: flat).
+    pub theme_palette: Option<Palette>,
     /// Plain background colour (no images).
     pub bg_color: Color,
     /// Caption colour.
@@ -113,6 +117,7 @@ impl Default for Meter {
             fill: Some(0.0),
             label: None,
             bar_color: Color::rgba(1.0, 0.0, 0.0, 1.0),
+            theme_palette: None,
             bg_color: Color::rgba(0.0, 0.0, 0.0, 0.5),
             label_color: Color::WHITE,
             outline: false,
@@ -493,6 +498,13 @@ impl Widget for Meter {
                     }
                 }
             }
+        } else if let Some(palette) = &self.theme_palette {
+            let fill = if has_fill {
+                compute_fill_rect(p, w, h)
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            };
+            style::meter(rc, palette, w, h, fill, self.bar_color);
         } else {
             rc.fill(0.0, 0.0, w, h, self.bg_color);
             if has_fill {

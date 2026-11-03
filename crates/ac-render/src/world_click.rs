@@ -19,6 +19,7 @@
 use ac_runtime::gameplay::GameplayCommand;
 use ac_runtime::inventory::{ItemCommand, ObjectRef};
 use ac_runtime::session::SessionCommand;
+use ac_ui::event::ItemDragSource;
 
 /// How long after a click offered to a target mode a second click on the
 /// same object is still the mode's, milliseconds (the double-click time).
@@ -114,12 +115,13 @@ impl WorldClicks {
 
     /// An item dragged out of a window let go over the world, over
     /// `picked` (the ground when none): it is placed there, `amount` of a
-    /// stack (0 for all). A shortcut dragged off the toolbar places
+    /// stack (0 for all). A shortcut dragged off the toolbar, or an item
+    /// dragged out of the salvage, vendor or house purchase window, places
     /// nothing. The selection is left alone.
     #[must_use]
     pub fn drop_item(
         item_id: u32,
-        from_shortcut_bar: bool,
+        source: ItemDragSource,
         picked: Option<u32>,
         amount: u32,
     ) -> ClickOutcome {
@@ -127,7 +129,7 @@ impl WorldClicks {
             pulse: picked,
             commands: Vec::new(),
         };
-        if from_shortcut_bar || item_id == 0 {
+        if source.is_alias() || item_id == 0 {
             return out;
         }
         out.commands.push(item(ItemCommand::Place {
@@ -257,7 +259,7 @@ mod tests {
 
     #[test]
     fn a_drop_over_an_object_places_it_there_and_selects_nothing() {
-        let out = WorldClicks::drop_item(0x7000_0002, false, Some(TARGET), 0);
+        let out = WorldClicks::drop_item(0x7000_0002, ItemDragSource::Inventory, Some(TARGET), 0);
         assert_eq!(out.pulse, Some(TARGET));
         assert_eq!(
             dbg(&out.commands),
@@ -271,7 +273,7 @@ mod tests {
 
     #[test]
     fn a_drop_over_nothing_goes_to_the_ground_and_a_shortcut_drop_places_nothing() {
-        let ground = WorldClicks::drop_item(0x7000_0002, false, None, 3);
+        let ground = WorldClicks::drop_item(0x7000_0002, ItemDragSource::Inventory, None, 3);
         assert_eq!(ground.pulse, None);
         assert_eq!(
             dbg(&ground.commands),
@@ -282,9 +284,30 @@ mod tests {
             })])
         );
         assert!(
-            WorldClicks::drop_item(0x7000_0002, true, None, 0)
+            WorldClicks::drop_item(0x7000_0002, ItemDragSource::ShortcutBar, None, 0)
                 .commands
                 .is_empty()
         );
+    }
+
+    /// Issue #32: a staged item dragged out of the salvage window only
+    /// unstages; it is not dropped on the ground or onto an object.
+    #[test]
+    fn a_salvage_window_drop_places_nothing() {
+        for picked in [None, Some(TARGET)] {
+            let out = WorldClicks::drop_item(0x7000_0002, ItemDragSource::Salvage, picked, 0);
+            assert!(out.commands.is_empty(), "{picked:?}");
+        }
+    }
+
+    /// Issue #44: an item dragged out of the vendor's sell list (or the
+    /// house purchase window) only comes off that list; it is not dropped
+    /// on the ground or onto an object.
+    #[test]
+    fn a_vendor_window_drop_places_nothing() {
+        for picked in [None, Some(TARGET)] {
+            let out = WorldClicks::drop_item(0x7000_0002, ItemDragSource::Vendor, picked, 0);
+            assert!(out.commands.is_empty(), "{picked:?}");
+        }
     }
 }

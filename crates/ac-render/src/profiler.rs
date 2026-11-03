@@ -458,19 +458,6 @@ pub struct FrameRateTitle {
 /// How often the title's frame rate is refreshed, seconds.
 pub const TITLE_INTERVAL_SECONDS: f64 = 0.5;
 
-/// What the title shows besides the frame rate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TitleFacts {
-    /// Landblocks drawn last frame.
-    pub visible_landblocks: usize,
-    /// Landblocks loaded.
-    pub total_landblocks: usize,
-    /// Objects the window knows.
-    pub objects: usize,
-    /// Object instances drawn.
-    pub drawn_objects: usize,
-}
-
 impl FrameRateTitle {
     /// A frame of `delta_seconds` was presented; every half second returns
     /// the frame rate and the mean frame time in milliseconds.
@@ -486,16 +473,6 @@ impl FrameRateTitle {
         self.frames = 0;
         Some((fps, mean_ms))
     }
-}
-
-/// The window title: the window's name, frame rate, frame time, landblocks
-/// drawn of loaded, and objects.
-#[must_use]
-pub fn format_title(name: &str, fps: f64, mean_ms: f64, facts: TitleFacts) -> String {
-    format!(
-        "{name} | {fps:.0} fps | {mean_ms:.1} ms | lb {}/{} | ent {}/{} drawn",
-        facts.visible_landblocks, facts.total_landblocks, facts.objects, facts.drawn_objects
-    )
 }
 
 #[cfg(test)]
@@ -635,20 +612,8 @@ mod tests {
         let (fps, ms) = t.frame(0.125).unwrap();
         assert_eq!(fps, 8.0);
         assert_eq!(ms, 125.0);
-        let title = format_title(
-            "openAC",
-            60.0,
-            1000.0 / 60.0,
-            TitleFacts {
-                visible_landblocks: 13,
-                total_landblocks: 25,
-                objects: 40,
-                drawn_objects: 410,
-            },
-        );
-        assert_eq!(
-            title,
-            "openAC | 60 fps | 16.7 ms | lb 13/25 | ent 40/410 drawn"
-        );
+        // The count starts again after a refresh.
+        assert_eq!(t.frame(0.25), None);
+        assert_eq!(t.frame(0.25), Some((4.0, 250.0)));
     }
 }

@@ -29,7 +29,7 @@ use crate::widgets::button::{Button, LabelAlign};
 use crate::widgets::dat_element::DatElement;
 use crate::widgets::meter::{DetailOverlay, Meter, MeterLabelAlign};
 use crate::widgets::resize_grip::{Border, ResizeGrip};
-use crate::widgets::text::{Text, TextContent};
+use crate::widgets::text::Text;
 use crate::widgets::{
     Bitfield64, ChildImport, DialogRoot, Field, ItemList, ListBox, Menu, OptionToggleSlider, Radar,
     Scrollbar, TabPanel, Viewport, VitalsRoot,
@@ -654,13 +654,7 @@ fn build_text(info: Arc<ElementInfo>, font: Option<Arc<UiFont>>, ctx: &BuildCont
     }
     t.configure_dat_state(info.clone());
     if let Some(authored) = authored_string(&info, ctx).filter(|s| !s.is_empty()) {
-        if authored.contains('\n') {
-            t.set_content(TextContent::Wrapped(authored));
-        } else {
-            // In the default colour as it is when drawn, so a state's font
-            // colour reaches the authored line.
-            t.set_content(TextContent::Single(authored));
-        }
+        t.set_authored(authored);
     }
     let mut state_strings = Vec::new();
     for (id, state) in &info.states {

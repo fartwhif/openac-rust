@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::model::{
-    CanvasView, ClientWindow, ClientWindowAction, ImageView, PanelView, ProjectileSample, UiChange,
-    WorldLabel, WorldLine,
+    CanvasView, ClientWindow, ClientWindowAction, GroundShape, ImageView, PanelView,
+    ProjectileSample, UiChange, WorldIconEntry, WorldLabel, WorldLine, WorldTriangle,
 };
 
 /// What changed in the copy since the window last looked.
@@ -33,10 +33,18 @@ pub struct PluginUiView {
     pub file_icons: BTreeMap<(u32, String), u32>,
     /// Every image, by plugin and handle.
     pub images: BTreeMap<(String, u32), ImageView>,
+    /// Every font a plugin holds, by plugin and handle.
+    pub fonts: BTreeMap<(String, u32), crate::fonts::FontView>,
     /// The world labels.
     pub labels: Arc<Vec<WorldLabel>>,
     /// The world lines.
     pub lines: Arc<Vec<WorldLine>>,
+    /// The world triangles.
+    pub triangles: Arc<Vec<WorldTriangle>>,
+    /// The world icons.
+    pub icons: Arc<Vec<WorldIconEntry>>,
+    /// The ground shapes.
+    pub shapes: Arc<Vec<GroundShape>>,
     /// The projectile markers last sent, with how many sets have come
     /// (the window shows each set for a moment).
     pub projectile: (u64, Arc<Vec<ProjectileSample>>),
@@ -116,9 +124,13 @@ impl PluginUiView {
                 self.panels.clear();
                 self.canvases.clear();
                 self.images.clear();
+                self.fonts.clear();
                 self.file_icons.clear();
                 self.labels = Arc::default();
                 self.lines = Arc::default();
+                self.triangles = Arc::default();
+                self.icons = Arc::default();
+                self.shapes = Arc::default();
                 self.hotkeys = Arc::default();
                 self.client_requests.clear();
                 self.dialogs.clear();
@@ -219,8 +231,17 @@ impl PluginUiView {
                 self.images.remove(&(owner, handle));
                 self.dirty.images = true;
             }
+            UiChange::FontAdded(font) => {
+                self.fonts.insert((font.owner.clone(), font.handle), *font);
+            }
+            UiChange::FontRemoved { owner, handle } => {
+                self.fonts.remove(&(owner, handle));
+            }
             UiChange::Labels(labels) => self.labels = labels,
             UiChange::Lines(lines) => self.lines = lines,
+            UiChange::Triangles(triangles) => self.triangles = triangles,
+            UiChange::Icons(icons) => self.icons = icons,
+            UiChange::Shapes(shapes) => self.shapes = shapes,
             UiChange::ProjectileDebug(samples) => {
                 self.projectile = (self.projectile.0 + 1, samples);
             }

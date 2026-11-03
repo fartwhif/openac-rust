@@ -258,6 +258,10 @@ impl Inventory {
             }
             C::AddShortcut(entry) => self.add_shortcut(*entry, ctx),
             C::RemoveShortcut(slot) => self.remove_shortcut(*slot, ctx),
+            C::PickUpToShortcut { item, slot } => {
+                let item = resolve!(item);
+                self.pick_up_to_shortcut(item, *slot, ctx)
+            }
             C::EnterUseMode => {
                 self.mode = InteractionMode::Use;
                 true
@@ -708,6 +712,34 @@ impl Inventory {
     fn snapshot(item: &ClientObject, ctx: &ItemContext<'_>) -> ItemPolicyObject {
         policy_object(ctx.world.items(), item, ctx.player())
     }
+
+    /// View `container` on the ground if it is described as openable. A
+    /// locked one stays unviewed (its use has already gone to the server,
+    /// which answers it with no text), and when `announce` the client says
+    /// why itself. Returns whether the view was asked for.
+    pub(super) fn attempt_set_ground_object(
+        &mut self,
+        container: u32,
+        announce: bool,
+        ctx: &mut ItemContext<'_>,
+    ) -> bool {
+        let object = ctx
+            .world
+            .item(container)
+            .map(|item| Self::snapshot(item, ctx));
+        match interaction::decide_set_ground_object(object.as_ref()) {
+            interaction::GroundObjectDecision::Open => {
+                self.request_external_open(container, ctx);
+                true
+            }
+            interaction::GroundObjectDecision::Refuse(message) => {
+                if announce && let Some(message) = message {
+                    self.notices.push(Notice::Interface(message));
+                }
+                false
+            }
+        }
+    }
 }
 
 /// Whether the item `source` may be used on `target` (the target cursor's
@@ -991,7 +1023,7 @@ impl Inventory {
             })
         });
         if sent {
-            self.replace_fully_merged_shortcut(join.source_object_id, join.target_object_id, ctx);
+            self.merge_sent(join.source_object_id, join.target_object_id, ctx);
         }
         Some(sent)
     }
@@ -1033,7 +1065,7 @@ impl Inventory {
             })
         });
         if sent {
-            self.replace_fully_merged_shortcut(plan.source_object_id, plan.target_object_id, ctx);
+            self.merge_sent(plan.source_object_id, plan.target_object_id, ctx);
         }
         sent
     }
@@ -1158,6 +1190,40 @@ impl Inventory {
         true
     }
 
+    /// A loose item dropped on the toolbar's `slot`: it is picked up into
+    /// the preferred pack as the use key picks it up, and once that request
+    /// has gone out it gets the shortcut in `slot` (any other shortcut to it
+    /// is taken off first). When the pickup does not go out (no room, a
+    /// request already in flight) the bar is left as it is.
+    pub(super) fn pick_up_to_shortcut(
+        &mut self,
+        item_id: u32,
+        slot: i32,
+        ctx: &mut ItemContext<'_>,
+    ) -> bool {
+        let on_bar = usize::try_from(slot).is_ok_and(|i| i < SHORTCUT_SLOTS);
+        if item_id == 0 || !on_bar || ctx.world.item(item_id).is_none() {
+            return false;
+        }
+        let acted = self.place_world_item_in_backpack(item_id, ctx);
+        if self.backpack_placement != Some(BackpackPlacement::Sent) {
+            return acted;
+        }
+        if let Some(existing) =
+            (0..SHORTCUT_SLOTS as i32).find(|&s| self.shortcuts.get(s) == item_id)
+        {
+            self.remove_shortcut(existing, ctx);
+        }
+        self.add_shortcut(
+            ShortcutEntry {
+                index: slot,
+                object_id: item_id,
+                spell_id: 0,
+            },
+            ctx,
+        )
+    }
+
     /// Take the shortcut in `slot` off the bar.
     pub(super) fn remove_shortcut(&mut self, slot: i32, ctx: &mut ItemContext<'_>) -> bool {
         let Some(index) = u32::try_from(slot)
@@ -1172,9 +1238,16 @@ impl Inventory {
     }
 
     /// A stack merge has just been sent, by any caller (a drag, a plugin,
-    /// an automatic join): the shortcut of the stack being poured moves to
-    /// the stack it is poured into, keeping its slot, and the server is told
-    /// of both changes. The poured stack's later removal then finds nothing
+    /// an automatic join): the poured stack's shortcut follows it, and the
+    /// stack it joins becomes the selection ([`Inventory::take_merged_into`]).
+    fn merge_sent(&mut self, source_id: u32, target_id: u32, ctx: &mut ItemContext<'_>) {
+        self.replace_fully_merged_shortcut(source_id, target_id, ctx);
+        self.merged_into.push(target_id);
+    }
+
+    /// After a stack merge was sent: the shortcut of the stack being poured
+    /// moves to the stack it is poured into, keeping its slot, and the
+    /// server is told of both changes. The poured stack's later removal then finds nothing
     /// of it on the bar.
     pub(super) fn replace_fully_merged_shortcut(
         &mut self,
@@ -1243,13 +1316,18 @@ impl Inventory {
         if source.useability.is_none() {
             return false;
         }
-        let compatible = interaction::is_target_compatible(
+        // The pick says what it does, or why it cannot, before anything
+        // else (a mana stone's question comes after the line).
+        match interaction::use_on_target_line(
             &Self::snapshot(&source, ctx),
             &Self::snapshot(&target, ctx),
             ctx.player(),
-        );
-        if !compatible {
-            return false;
+        ) {
+            Ok(line) => self.notices.push(Notice::Interface(line)),
+            Err(failure) => {
+                self.notices.push(Notice::Interface(failure));
+                return false;
+            }
         }
         // An empty mana stone destroys the item it drains: ask first, and
         // never for a retained item.
@@ -1295,7 +1373,13 @@ impl Inventory {
         if object == 0 || !self.ensure_ready(ctx) {
             return false;
         }
-        self.request_use(object, ctx)
+        let sent = self.request_use(object, ctx);
+        // An altar or a rare said yes to is always "Using the <name>".
+        if let Some(name) = ctx.world.item(object).map(|i| i.appropriate_name()) {
+            self.notices
+                .push(Notice::Interface(format!("Using the {name}")));
+        }
+        sent
     }
 
     /// The player said yes to charging a mana stone from an item: the stone
@@ -1373,7 +1457,7 @@ impl Inventory {
                         self.dispatch_targeted_use(action.object_id, action.target_id, false, ctx);
                 }
                 K::SetGroundObject => {
-                    self.request_external_open(action.object_id, ctx);
+                    self.attempt_set_ground_object(action.object_id, true, ctx);
                     acted = true;
                 }
                 K::EnterTargetMode => {
@@ -1397,7 +1481,7 @@ impl Inventory {
                         self.transactions.increment_busy_count(&mut tx);
                     }
                 }
-                K::Reject => {
+                K::Reject | K::Announce => {
                     if let Some(message) = action.message.as_ref().filter(|m| !m.trim().is_empty())
                     {
                         self.notices.push(Notice::Interface(message.clone()));
@@ -1532,11 +1616,7 @@ impl Inventory {
                 BackpackPlacement::NotDispatched
             });
             if sent {
-                self.replace_fully_merged_shortcut(
-                    merge.source_object_id,
-                    merge.target_object_id,
-                    ctx,
-                );
+                self.merge_sent(merge.source_object_id, merge.target_object_id, ctx);
             }
             return sent;
         }
@@ -1644,11 +1724,7 @@ impl Inventory {
                 })
             });
             if sent {
-                self.replace_fully_merged_shortcut(
-                    join.source_object_id,
-                    join.target_object_id,
-                    ctx,
-                );
+                self.merge_sent(join.source_object_id, join.target_object_id, ctx);
             }
             return sent;
         }

@@ -14,6 +14,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use ac_plugin_ui::icon::{ICON_EXTENT, ICON_MAXIMUM_BYTES, PluginIcon, decode_png, validate_icon};
 use ac_plugin_ui::{DecodedImage, FileImage, FileImageLoader, FileImageRead, FileImageResult};
 
 /// The largest image file, bytes (1 MiB).
@@ -30,6 +31,9 @@ const JPEG_SIGNATURE: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
 /// Why a path is refused when it leaves the folder.
 const OUTSIDE: &str = "points outside the plugin folder";
+
+/// Why a path that stays in the folder is refused when nothing is there.
+const MISSING: &str = "does not exist";
 
 /// The reader's refusal of a folder (and, on Windows, of anything that is
 /// not a file on disk).
@@ -108,7 +112,7 @@ pub fn resolve(
     };
     match std::fs::metadata(&candidate) {
         Ok(m) if !m.is_dir() => {}
-        _ => return Err("does not exist".to_owned()),
+        _ => return Err(MISSING.to_owned()),
     }
     // Then the real places: every link along both followed.
     let real_root = std::fs::canonicalize(&root).map_err(resolution)?;
@@ -154,6 +158,29 @@ pub fn resolve_image_path(directory: &Path, relative_path: &str) -> Result<PathB
         &IMAGE_EXTENSIONS,
         "a .png or .jpg file",
     )
+}
+
+/// Reads the dock icon a plugin window names, under the rules of a plugin's
+/// `icon.png`: relative and inside the folder after links are followed, a
+/// `.png` by name and by signature, exactly 64 x 64 pixels, at most 64 KiB and
+/// not animated. None when there is no such file.
+///
+/// # Errors
+/// Why a file that is there, or a path that leaves the folder, cannot be used.
+pub fn load_dock_icon(directory: &Path, relative_path: &str) -> Result<Option<PluginIcon>, String> {
+    let path = normalize(relative_path);
+    let full_path = match resolve(directory, &path, &[".png"], "a .png file") {
+        Ok(full_path) => full_path,
+        Err(reason) if reason == MISSING => return Ok(None),
+        Err(reason) => return Err(reason),
+    };
+    let bytes = read_regular_file(&full_path, ICON_MAXIMUM_BYTES + 1)?;
+    // The log adds the full stop the rules' own messages end in.
+    validate_icon(&bytes).map_err(|error| error.to_string().trim_end_matches('.').to_owned())?;
+    decode_png(&bytes)
+        .filter(|icon| icon.width == ICON_EXTENT && icon.height == ICON_EXTENT)
+        .map(Some)
+        .ok_or_else(|| "has pixels that do not decode".to_owned())
 }
 
 /// Opens `path` for reading without ever waiting on it: on Linux and macOS
@@ -555,6 +582,14 @@ impl FileImageLoader for PluginFileImageLoader {
             reading.insert(key, read.clone());
         }
         read
+    }
+
+    fn has_file(&self, directory: &Path, path: &str) -> bool {
+        resolve_image_path(directory, &normalize(path)).is_ok()
+    }
+
+    fn read_dock_icon(&self, directory: &Path, path: &str) -> Result<Option<PluginIcon>, String> {
+        load_dock_icon(directory, path)
     }
 
     fn is_current(&self, image: &FileImage) -> bool {

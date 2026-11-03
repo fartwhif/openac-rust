@@ -50,6 +50,10 @@ impl FileImageLoader for Reader {
         }
     }
 
+    fn has_file(&self, _directory: &Path, path: &str) -> bool {
+        self.0.files.lock().unwrap().contains_key(path)
+    }
+
     fn is_current(&self, image: &FileImage) -> bool {
         self.0
             .files
@@ -543,4 +547,146 @@ fn a_reason_is_reported_once_per_file_and_reason() {
         "{reports:?}"
     );
     assert!(reports[0].contains("does not exist"), "{reports:?}");
+}
+
+// PluginMarkupIconResolverTests: a file's light and dark versions, and the
+// PluginUiThemeTests rule that only a themed window follows the theme.
+impl Fixture {
+    fn themed_window(&mut self, id: &str) -> u32 {
+        self.ui
+            .register_panel(
+                &owner(),
+                PanelDescriptor::new(id, id),
+                r#"<panel theme="plugin"/>"#,
+                BindingSchema::new("Binding"),
+            )
+            .unwrap()
+    }
+
+    fn theme(&mut self, theme: crate::theme::ThemeKind) {
+        self.ui.input(UiInput::Theme(theme));
+    }
+}
+
+#[test]
+fn a_light_theme_draws_the_light_file_when_there_is_one() {
+    use crate::theme::ThemeKind;
+    let mut f = Fixture::new();
+    f.disk.write("icons/sword.light.png", 12, 12);
+    let panel = f.themed_window("hello");
+    f.draw(panel, &["icons/sword.png"]);
+    let size = |f: &Fixture| f.ui.file_icon(panel, "icons/sword.png").map(|i| (i.1, i.2));
+    assert_eq!(size(&f), Some((20, 10)));
+    f.theme(ThemeKind::Parchment);
+    f.draw(panel, &["icons/sword.png"]);
+    assert_eq!(size(&f), Some((12, 12)));
+    f.theme(ThemeKind::Moss);
+    f.draw(panel, &["icons/sword.png"]);
+    assert_eq!(size(&f), Some((20, 10)));
+    assert!(f.ui.take_reports().is_empty());
+}
+
+#[test]
+fn a_dark_theme_and_classic_draw_the_dark_file_when_there_is_one() {
+    use crate::theme::ThemeKind;
+    let mut f = Fixture::new();
+    f.disk.write("icons/sword.dark.png", 14, 14);
+    let panel = f.themed_window("hello");
+    let size = |f: &Fixture| f.ui.file_icon(panel, "icons/sword.png").map(|i| (i.1, i.2));
+    f.draw(panel, &["icons/sword.png"]);
+    assert_eq!(size(&f), Some((14, 14)), "Classic");
+    f.theme(ThemeKind::Parchment);
+    f.draw(panel, &["icons/sword.png"]);
+    assert_eq!(size(&f), Some((20, 10)), "no light file");
+    f.theme(ThemeKind::Glacier);
+    f.draw(panel, &["icons/sword.png"]);
+    assert_eq!(size(&f), Some((14, 14)));
+}
+
+#[test]
+fn a_window_that_did_not_opt_in_always_draws_the_dark_file() {
+    use crate::theme::ThemeKind;
+    let mut f = Fixture::new();
+    f.disk.write("icons/sword.light.png", 12, 12);
+    f.disk.write("icons/sword.dark.png", 14, 14);
+    let panel = f.window("hello");
+    f.theme(ThemeKind::Parchment);
+    f.draw(panel, &["icons/sword.png"]);
+    let icon = f.ui.file_icon(panel, "icons/sword.png").unwrap();
+    assert_eq!((icon.1, icon.2), (14, 14));
+}
+
+#[test]
+fn without_a_version_the_file_itself_is_drawn_and_nothing_is_reported() {
+    use crate::theme::ThemeKind;
+    let mut f = Fixture::new();
+    let panel = f.themed_window("hello");
+    f.theme(ThemeKind::Parchment);
+    f.draw(panel, &["icons/sword.png"]);
+    f.draw(panel, &["icons/sword.png"]);
+    let icon = f.ui.file_icon(panel, "icons/sword.png").unwrap();
+    assert_eq!((icon.1, icon.2), (20, 10));
+    assert_eq!(f.disk.reads(), 1);
+    assert!(f.ui.take_reports().is_empty());
+}
+
+#[test]
+fn a_change_of_theme_keeps_the_old_picture_until_the_new_one_is_ready() {
+    use crate::theme::ThemeKind;
+    let mut f = Fixture::new();
+    f.disk.write("icons/sword.light.png", 12, 12);
+    let panel = f.themed_window("hello");
+    f.draw(panel, &["icons/sword.png"]);
+    let dark = f.ui.file_icon(panel, "icons/sword.png").unwrap();
+    f.disk.hold.store(true, Ordering::Relaxed);
+    f.theme(ThemeKind::Parchment);
+    f.draw(panel, &["icons/sword.png"]);
+    assert_eq!(f.ui.file_icon(panel, "icons/sword.png"), Some(dark));
+    f.disk.finish_reads();
+    f.draw(panel, &["icons/sword.png"]);
+    let light = f.ui.file_icon(panel, "icons/sword.png").unwrap();
+    assert_eq!((light.1, light.2), (12, 12));
+    // The old picture goes once it has not been drawn for a while, and the
+    // window keeps the new one.
+    for _ in 0..7 {
+        f.now += RELEASE_CHECK_INTERVAL_MS;
+        f.draw(panel, &["icons/sword.png"]);
+    }
+    assert_eq!(f.ui.file_icon(panel, "icons/sword.png"), Some(light));
+    assert_eq!(f.ui.image_count("acme.hello"), 1);
+}
+
+/// A reader for which the light version is there and cannot be used.
+#[derive(Debug)]
+struct BadLightFile(Reader);
+
+impl FileImageLoader for BadLightFile {
+    fn load(&self, directory: &Path, path: &str) -> FileImageRead {
+        if path.ends_with(".light.png") {
+            return FileImageRead::finished(Err("is not an image".to_owned()));
+        }
+        self.0.load(directory, path)
+    }
+    fn has_file(&self, _directory: &Path, path: &str) -> bool {
+        path.ends_with(".light.png") || self.0.0.files.lock().unwrap().contains_key(path)
+    }
+    fn is_current(&self, image: &FileImage) -> bool {
+        self.0.is_current(image)
+    }
+}
+
+#[test]
+fn a_version_that_cannot_be_used_falls_back_to_the_file_and_is_reported_once() {
+    use crate::theme::ThemeKind;
+    let mut f = Fixture::new();
+    f.ui.set_file_images(Some(Arc::new(BadLightFile(Reader(Arc::clone(&f.disk))))));
+    let panel = f.themed_window("hello");
+    f.theme(ThemeKind::Parchment);
+    f.draw(panel, &["icons/sword.png"]);
+    f.draw(panel, &["icons/sword.png"]);
+    let icon = f.ui.file_icon(panel, "icons/sword.png").unwrap();
+    assert_eq!((icon.1, icon.2), (20, 10));
+    let reports = f.ui.take_reports();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(reports[0].1.contains("sword.light.png"), "{reports:?}");
 }

@@ -280,7 +280,7 @@ impl LocalPlayerState {
         let base = self.get_attribute(kind)?.current();
         Some(match &self.spellbook {
             None => base.cast_signed(),
-            Some(book) => enchant_attribute(book.get_attribute_mod(kind.id()), base),
+            Some(book) => enchant_attribute(&book.get_attribute_mod(kind.id()), base),
         })
     }
 
@@ -402,10 +402,10 @@ impl LocalPlayerState {
     }
 
     /// The vital's maximum: ranks + start + the attribute term (from
-    /// enchanted attributes) + gear bonus, then the vital spells; floored
-    /// at 5 (1 when the unbuffed maximum is below 5) and rounded half up,
-    /// so a fractional maximum agrees with the rounded vital values,
-    /// including those reduced by vitae.
+    /// enchanted attributes) + the health bonus (gear, Enlightenment), then
+    /// the vital spells; floored at 5 (1 when the unbuffed maximum is below
+    /// 5) and rounded half up, so a fractional maximum agrees with the
+    /// rounded vital values, including those reduced by vitae.
     #[must_use]
     pub fn get_max_approx(&self, kind: VitalKind) -> Option<u32> {
         let unbuffed = self.max_before_secondary_enchantments(kind)?;
@@ -415,7 +415,7 @@ impl LocalPlayerState {
         let modifier = self.spellbook.as_ref().map_or(VitalMod::IDENTITY, |book| {
             book.get_vital_mod(stat_key_for(kind))
         });
-        let mut buffed = unbuffed as f32 * modifier.multiplier + modifier.additive;
+        let mut buffed = modifier.apply(unbuffed as f32);
         let floor = if unbuffed >= 5 { 5.0 } else { 1.0 };
         if buffed < floor {
             buffed = floor;
@@ -424,7 +424,7 @@ impl LocalPlayerState {
     }
 
     /// The vital's maximum without any spell: ranks + start + the attribute
-    /// term from unenchanted attributes + gear bonus.
+    /// term from unenchanted attributes + the health bonus.
     #[must_use]
     pub fn get_base_max_approx(&self, kind: VitalKind) -> Option<u32> {
         self.vital_max(kind, false)
@@ -441,7 +441,7 @@ impl LocalPlayerState {
                 .ranks
                 .wrapping_add(vital.start)
                 .wrapping_add(self.attribute_contribution(kind, effective))
-                .wrapping_add(self.gear_health_bonus(kind)),
+                .wrapping_add(self.health_bonus(kind)),
         )
     }
 
@@ -666,13 +666,16 @@ impl LocalPlayerState {
             .cast_unsigned()
     }
 
-    fn gear_health_bonus(&self, kind: VitalKind) -> u32 {
+    // Health also counts the gear Max Health rating and 2 per Enlightenment
+    // level, both before the vital spells and vitae, as the server does.
+    fn health_bonus(&self, kind: VitalKind) -> u32 {
         if kind != VitalKind::Health {
             return 0;
         }
-        self.int_property(PropertyInt::GEAR_MAX_HEALTH)
-            .max(0)
-            .cast_unsigned()
+        let gear = self.int_property(PropertyInt::GEAR_MAX_HEALTH).max(0);
+        let enlightenment = self.int_property(PropertyInt::ENLIGHTENMENT).max(0);
+        gear.cast_unsigned()
+            .wrapping_add(enlightenment.cast_unsigned().wrapping_mul(2))
     }
 }
 

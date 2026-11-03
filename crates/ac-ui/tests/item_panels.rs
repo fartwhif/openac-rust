@@ -1657,12 +1657,19 @@ fn over_a_full_pack_icon_the_drag_is_refused_but_the_grid_accepts() {
         drag_over(&mut inv, g, 3, payload(0xA), &view),
         DragAcceptance::Accept
     );
-    // A shortcut alias gets no answer.
-    let alias = ItemDragPayload::new(0xA, ItemDragSource::ShortcutBar, 0);
-    assert_eq!(
-        drag_over(&mut inv, g, 3, alias, &view),
-        DragAcceptance::None
-    );
+    // An alias (a shortcut, or a salvage, vendor or house window cell) gets no answer.
+    for source in [
+        ItemDragSource::ShortcutBar,
+        ItemDragSource::Salvage,
+        ItemDragSource::Vendor,
+    ] {
+        let alias = ItemDragPayload::new(0xA, source, 0);
+        assert_eq!(
+            drag_over(&mut inv, g, 3, alias, &view),
+            DragAcceptance::None,
+            "{source:?}"
+        );
+    }
 }
 
 #[test]
@@ -2214,6 +2221,108 @@ fn lifting_a_drag_selects_the_item() {
     assert_dbg_eq!(inv.outputs(), vec![PanelOutput::SelectObject(0xA)]);
 }
 
+/// Press on the world at an empty spot, drag, lift what the world lift
+/// gives `hit` (as the window does with its pick there), and let go over
+/// cell `i` of `list`; the session commands that drop sent.
+fn drag_off_the_world_onto(
+    inv: &mut Inv,
+    objects: &ac_core::items::ClientObjectTable,
+    hit: u32,
+    list: ElementId,
+    i: usize,
+) -> Vec<SessionCommand> {
+    let view = ItemsView::new(objects, PLAYER);
+    inv.update(&view);
+    inv.outputs();
+    let root = &mut inv.host.root;
+    root.on_mouse_down(MouseButton::Left, 600, 500, 0);
+    root.on_mouse_move(620, 520);
+    let starts: Vec<(i32, i32)> = root
+        .drain_output()
+        .iter()
+        .filter_map(|o| match o {
+            UiOutput::WorldDragStart { x, y } => Some((*x, *y)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        starts,
+        [(600, 500)],
+        "the press on the world asks for a lift"
+    );
+    let (payload, ghost) = ac_ui::world_drag::lift(
+        hit,
+        PLAYER,
+        ac_core::combat::CombatMode::NON_COMBAT,
+        objects,
+        None,
+        &mut inv.icons,
+    )
+    .expect("the item on the ground lifts");
+    assert!(inv.host.root.begin_world_drag(payload, ghost));
+    let cell = inv.cell(list, i);
+    let (x, y) = inv.host.root.screen_position(cell);
+    let (x, y) = (x as i32 + 4, y as i32 + 4);
+    inv.host.root.on_mouse_move(x, y);
+    inv.host.root.on_mouse_up(MouseButton::Left, x, y, 0);
+    inv.host.pump();
+    inv.update(&view);
+    sessions(&inv.outputs())
+}
+
+#[test]
+fn an_item_dragged_off_the_ground_into_the_pack_is_picked_up() {
+    // GitHub #45: an item lying on the ground could not be dragged into
+    // the inventory; the drag never started. It lifts as a ground drag,
+    // and each pack target picks it up.
+    const LOOT: u32 = 0x7000_0001;
+    let world = || {
+        let mut o = Objects::new();
+        o.player(102, 7);
+        o.contained(0xA, PLAYER, 0, ItemType::MISC);
+        o.bag(0xC, 1, 24);
+        let mut loot = ClientObject::new(LOOT);
+        loot.item_type = ItemType::MISC;
+        loot.icon_id = 0x0600_0777;
+        o.add(loot);
+        o
+    };
+    let pickup = |container: ObjectRef, slot: i32| {
+        vec![SessionCommand::Item(ItemCommand::DropInto {
+            item: ObjectRef::Guid(LOOT),
+            container,
+            slot,
+            amount: 0,
+            pickup: true,
+            join_stack: false,
+        })]
+    };
+    // The open pack's grid: after the item already there.
+    let o = world();
+    let mut inv = inventory_window(None, InventorySprites::default());
+    let g = inv.grid;
+    assert_dbg_eq!(
+        drag_off_the_world_onto(&mut inv, &o.t, LOOT, g, 3),
+        pickup(ObjectRef::Player, 1)
+    );
+    // The main pack's icon.
+    let o = world();
+    let mut inv = inventory_window(None, InventorySprites::default());
+    let top = inv.top;
+    assert_dbg_eq!(
+        drag_off_the_world_onto(&mut inv, &o.t, LOOT, top, 0),
+        pickup(ObjectRef::Player, 0)
+    );
+    // A side pack's icon.
+    let o = world();
+    let mut inv = inventory_window(None, InventorySprites::default());
+    let packs = inv.containers;
+    assert_dbg_eq!(
+        drag_off_the_world_onto(&mut inv, &o.t, LOOT, packs, 0),
+        pickup(ObjectRef::Guid(0xC), 0)
+    );
+}
+
 #[test]
 fn cells_of_items_in_flight_wait() {
     let mut o = Objects::new();
@@ -2485,14 +2594,24 @@ fn a_drag_over_a_slot_is_taken_only_for_a_valid_location_and_never_for_an_alias(
         d.slot(SHIELD_SLOT).drag_acceptance(),
         DragAcceptance::Reject
     );
-    let alias = ItemDragPayload::new(0xC01, ItemDragSource::ShortcutBar, 2);
-    d.fire(HEAD_SLOT, kind::DRAG_ENTER, Some(alias.clone()));
-    d.update(&view);
-    assert_eq!(d.slot(HEAD_SLOT).drag_acceptance(), DragAcceptance::None);
-    d.outputs();
-    d.fire(HEAD_SLOT, kind::DROP_RELEASED, Some(alias));
-    d.update(&view);
-    assert!(wields(&d.outputs()).is_empty());
+    for source in [
+        ItemDragSource::ShortcutBar,
+        ItemDragSource::Salvage,
+        ItemDragSource::Vendor,
+    ] {
+        let alias = ItemDragPayload::new(0xC01, source, 2);
+        d.fire(HEAD_SLOT, kind::DRAG_ENTER, Some(alias.clone()));
+        d.update(&view);
+        assert_eq!(
+            d.slot(HEAD_SLOT).drag_acceptance(),
+            DragAcceptance::None,
+            "{source:?}"
+        );
+        d.outputs();
+        d.fire(HEAD_SLOT, kind::DROP_RELEASED, Some(alias));
+        d.update(&view);
+        assert!(wields(&d.outputs()).is_empty(), "{source:?}");
+    }
 }
 
 /// A drag that enters a slot and leaves it in one frame (a fast mouse, or
@@ -2876,14 +2995,20 @@ fn a_drop_on_the_figure_wears_a_wearable_item_and_refuses_anything_else() {
     d.mask_event(kind::DRAG_OVER, HEAD_X, Some(helm));
     d.update(&view);
     assert_eq!(d.acceptance(), DragAcceptance::None);
-    // A shortcut alias never wields.
-    let alias = ItemDragPayload::new(0xC12, ItemDragSource::ShortcutBar, 2);
-    d.mask_event(kind::DRAG_ENTER, HEAD_X, Some(alias.clone()));
-    d.update(&view);
-    assert_eq!(d.acceptance(), DragAcceptance::None);
-    d.mask_event(kind::DROP_RELEASED, HEAD_X, Some(alias));
-    d.update(&view);
-    assert!(wields(&d.outputs()).is_empty());
+    // An alias (a shortcut, or a salvage, vendor or house window cell) never wields.
+    for source in [
+        ItemDragSource::ShortcutBar,
+        ItemDragSource::Salvage,
+        ItemDragSource::Vendor,
+    ] {
+        let alias = ItemDragPayload::new(0xC12, source, 2);
+        d.mask_event(kind::DRAG_ENTER, HEAD_X, Some(alias.clone()));
+        d.update(&view);
+        assert_eq!(d.acceptance(), DragAcceptance::None, "{source:?}");
+        d.mask_event(kind::DROP_RELEASED, HEAD_X, Some(alias));
+        d.update(&view);
+        assert!(wields(&d.outputs()).is_empty(), "{source:?}");
+    }
 }
 
 #[test]
@@ -2945,6 +3070,9 @@ fn the_figure_flashes_the_parts_the_selected_item_covers() {
 
 mod real_dats {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use ac_ui::content::DatContent;
     use ac_ui::font::DEFAULT_FONT_ID;
     use ac_ui::icons::{IconComposer, IconUploader, Rgba};
@@ -2972,6 +3100,40 @@ mod real_dats {
             self.0.push(image.clone());
             TextureRef::Runtime(self.0.len() as u32)
         }
+    }
+
+    /// [`Uploads`] the test can still read once the composer holds it.
+    struct SharedUploads(Rc<RefCell<Uploads>>);
+
+    impl IconUploader for SharedUploads {
+        fn upload(&mut self, image: &Rgba) -> TextureRef {
+            self.0.borrow_mut().upload(image)
+        }
+    }
+
+    /// The image MossTank and MosswartMassacre name as their dock icon has an
+    /// opaque white outline, which keying replaces.
+    #[test]
+    #[ignore = "needs the retail dat files"]
+    fn a_keyed_plugin_icon_has_no_opaque_white_left() {
+        const OPAQUE_WHITE: [u8; 4] = [255, 255, 255, 255];
+        const ICON: u32 = 0x0600_2C41;
+        let c = content();
+        let uploads = Rc::new(RefCell::new(Uploads::default()));
+        let mut composer = IconComposer::new(
+            c.dats().clone(),
+            Box::new(SharedUploads(Rc::clone(&uploads))),
+        );
+        let raw = composer.surface(ICON).expect("the icon decodes");
+        let white = |pixels: &[u8]| pixels.chunks(4).filter(|p| *p == OPAQUE_WHITE).count();
+        assert!(white(&raw.pixels) > 0, "the art has its white outline");
+
+        let texture = composer.keyed_icon(ICON).expect("the icon is keyed");
+        let uploads = uploads.borrow();
+        let keyed = &uploads.0[0];
+        assert_eq!(texture, TextureRef::Runtime(1));
+        assert_eq!((keyed.width, keyed.height), (raw.width, raw.height));
+        assert_eq!(white(&keyed.pixels), 0);
     }
 
     // ItemListCellTemplateTests.

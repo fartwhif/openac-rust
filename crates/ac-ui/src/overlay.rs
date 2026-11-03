@@ -1,17 +1,20 @@
 //! What the interface paints over the world without taking input: the
 //! shared overlay band (full-screen, click-through layers behind every
-//! window), the world labels hung over objects, and the vivid target
-//! indicator around the selected object.
+//! window), the world labels and icons hung over objects, and the vivid
+//! target indicator around the selected object.
 //!
 //! World positions reach the screen through the camera's view and
 //! projection matrices (right-handed, the camera looking down -Z, as the
 //! renderer's), with clip = projection × view × position.
+
+use std::collections::{HashMap, HashSet};
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 
 use crate::draw::{Color, DEFAULT_OUTLINE_COLOR, RenderContext, TextureRef};
 use crate::font::UiFont;
 use crate::geometry::AnchorEdges;
+use crate::plugin::widgets::Icon;
 use crate::radar::{ObjectTraits, RelationshipTraits, blip_color};
 use crate::root::UiRoot;
 use crate::tree::{Element, ElementId, Widget};
@@ -421,6 +424,321 @@ impl WorldLabelOverlay {
             std::mem::swap(&mut w.placements, &mut self.scratch);
             w.labels.clear();
             w.labels.extend_from_slice(labels);
+        }
+        ui.set_visible(self.layer, shown);
+    }
+}
+
+// ── World icons ───────────────────────────────────────────────────────────
+
+/// The most icons in one row over an object.
+pub const ICONS_PER_ROW: usize = 8;
+/// The gap between icons, between rows and above the labels, pixels.
+pub const ICON_GAP: f32 = 2.0;
+
+/// Where an icon is.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WorldIconAnchor {
+    /// Over an object: in rows above its head and its labels.
+    Object(u32),
+    /// Centred on a position, in the camera's world frame.
+    Point(Vec3),
+}
+
+/// An image hung in the world at a constant size on the screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorldIcon {
+    /// Where it is.
+    pub anchor: WorldIconAnchor,
+    /// The image and its size in texels. Without one (a released image,
+    /// art the client cannot find) the icon keeps its place but draws
+    /// nothing.
+    pub image: Option<Icon>,
+    /// The side of the square the image is fitted into, UI units.
+    pub size: f32,
+    /// Multiplied into the image.
+    pub tint: Color,
+    /// A thin frame around the image.
+    pub border: Option<Color>,
+    /// Past this many metres it is not shown; the last fifth fades.
+    pub max_range: f32,
+}
+
+/// One icon on the screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IconPlacement {
+    /// Which icon.
+    pub icon: usize,
+    /// The left of its square, pixels.
+    pub x: f32,
+    /// The top of its square, pixels.
+    pub y: f32,
+    /// Distance from the camera to its anchor, metres.
+    pub depth: f32,
+    /// How solid.
+    pub alpha: f32,
+}
+
+/// How many label lines hang over each object (its highest line plus one)
+/// and the largest upward offset among them, metres.
+fn label_stacks(labels: &[WorldLabel]) -> HashMap<u32, (u32, f32)> {
+    let mut stacks: HashMap<u32, (u32, f32)> = HashMap::new();
+    for label in labels {
+        let stack = stacks.entry(label.object_id).or_default();
+        stack.0 = stack.0.max(label.line.saturating_add(1));
+        if label.height_offset.is_finite() {
+            stack.1 = stack.1.max(label.height_offset);
+        }
+    }
+    stacks
+}
+
+/// Fill `out` with this frame's placements, farthest first and then by
+/// icon, so where icons overlap the nearer anchor's are drawn last. An
+/// object's icons sit in rows of [`ICONS_PER_ROW`] above its labels, hung
+/// from the same raised point so they stay above them, in the order given
+/// even when other icons come between.
+pub fn place_icons(
+    icons: &[WorldIcon],
+    anchor: &dyn Fn(u32) -> Option<WorldLabelAnchor>,
+    labels: &[WorldLabel],
+    line_height: f32,
+    camera: &OverlayCamera,
+    out: &mut Vec<IconPlacement>,
+) {
+    out.clear();
+    let stacks = label_stacks(labels);
+    let mut placed = HashSet::new();
+    for (index, icon) in icons.iter().enumerate() {
+        match icon.anchor {
+            WorldIconAnchor::Point(point) => place_at_point(index, icon, point, camera, out),
+            WorldIconAnchor::Object(id) if placed.insert(id) => {
+                let (lines, offset) = stacks.get(&id).copied().unwrap_or_default();
+                if let Some(at) = anchor(id) {
+                    let head = at.base + Vec3::new(0.0, 0.0, at.height + offset);
+                    let raised = lines as f32 * line_height;
+                    place_over_object(icons, index, id, head, raised, camera, out);
+                }
+            }
+            WorldIconAnchor::Object(_) => {}
+        }
+    }
+    out.sort_by(|a, b| {
+        b.depth
+            .total_cmp(&a.depth)
+            .then_with(|| a.icon.cmp(&b.icon))
+    });
+}
+
+fn place_at_point(
+    index: usize,
+    icon: &WorldIcon,
+    point: Vec3,
+    camera: &OverlayCamera,
+    out: &mut Vec<IconPlacement>,
+) {
+    let Some(rect) = project_sphere(point, 0.0, camera, 0.0) else {
+        return;
+    };
+    if rect.depth > icon.max_range {
+        return;
+    }
+    let centre = (rect.min + rect.max) * 0.5;
+    let (x, y) = (centre.x - icon.size * 0.5, centre.y - icon.size * 0.5);
+    if on_screen(x, y, icon.size, camera) {
+        out.push(IconPlacement {
+            icon: index,
+            x,
+            y,
+            depth: rect.depth,
+            alpha: fade(rect.depth, icon.max_range),
+        });
+    }
+}
+
+/// The icons over object `id`, from `first` on: those in range, so a row
+/// closes up rather than keeping a hole. The first row's bottom sits a gap
+/// above the labels, `raised` pixels above the head; each further row a gap
+/// above the tallest icon of the row below.
+fn place_over_object(
+    icons: &[WorldIcon],
+    first: usize,
+    id: u32,
+    head: Vec3,
+    raised: f32,
+    camera: &OverlayCamera,
+    out: &mut Vec<IconPlacement>,
+) {
+    let Some(rect) = project_sphere(head, 0.0, camera, 0.0) else {
+        return;
+    };
+    let centre = (rect.min + rect.max) * 0.5;
+    let shown: Vec<usize> = (first..icons.len())
+        .filter(|&i| {
+            icons[i].anchor == WorldIconAnchor::Object(id) && rect.depth <= icons[i].max_range
+        })
+        .collect();
+    let mut bottom = centre.y - raised - ICON_GAP;
+    for row in shown.chunks(ICONS_PER_ROW) {
+        let sizes = row.iter().map(|&i| icons[i].size);
+        let width = sizes.clone().sum::<f32>() + ICON_GAP * (row.len() - 1) as f32;
+        let height = sizes.fold(0.0, f32::max);
+        let mut x = centre.x - width * 0.5;
+        for &i in row {
+            let icon = &icons[i];
+            let y = bottom - icon.size;
+            if on_screen(x, y, icon.size, camera) {
+                out.push(IconPlacement {
+                    icon: i,
+                    x,
+                    y,
+                    depth: rect.depth,
+                    alpha: fade(rect.depth, icon.max_range),
+                });
+            }
+            x += icon.size + ICON_GAP;
+        }
+        bottom -= height + ICON_GAP;
+    }
+}
+
+fn on_screen(x: f32, y: f32, size: f32, camera: &OverlayCamera) -> bool {
+    let (vw, vh) = camera.viewport;
+    x + size >= 0.0 && x <= vw && y + size >= 0.0 && y <= vh
+}
+
+/// Where an image of `texels` sits inside a square of side `size`: as large
+/// as fits, keeping its shape, centred. Offset from the square's corner,
+/// then width and height.
+#[must_use]
+pub fn fit_icon(size: f32, texels: (f32, f32)) -> (f32, f32, f32, f32) {
+    let (width, height) = texels;
+    let (mut w, mut h) = (size, size);
+    if width > height {
+        h = size * height / width;
+    } else if height > width {
+        w = size * width / height;
+    }
+    ((size - w) * 0.5, (size - h) * 0.5, w, h)
+}
+
+/// The one element drawing every icon: every border, then every image, so
+/// the borders are one run and icons sharing an image share another. A
+/// border can then sit under a nearer icon's neighbour; that is the price
+/// of not paying a run per bordered icon.
+#[derive(Debug, Default)]
+pub struct WorldIconLayer {
+    icons: Vec<WorldIcon>,
+    placements: Vec<IconPlacement>,
+}
+
+impl WorldIconLayer {
+    /// How many icons it draws.
+    #[must_use]
+    pub fn placement_count(&self) -> usize {
+        self.placements.len()
+    }
+
+    /// Its texture and where its image is drawn: whole pixels, so it does
+    /// not shimmer as its anchor drifts.
+    fn image_rect(&self, p: &IconPlacement) -> Option<(TextureRef, f32, f32, f32, f32)> {
+        let icon = &self.icons[p.icon];
+        let (texture, width, height) = icon.image.filter(|i| i.1 > 0.0 && i.2 > 0.0)?;
+        let (dx, dy, w, h) = fit_icon(icon.size, (width, height));
+        Some((texture, (p.x + dx).round(), (p.y + dy).round(), w, h))
+    }
+}
+
+impl Widget for WorldIconLayer {
+    fn draw(&mut self, _ui: &mut UiRoot, _me: ElementId, rc: &mut RenderContext<'_>) {
+        for p in &self.placements {
+            if let (Some(border), Some((_, x, y, w, h))) =
+                (self.icons[p.icon].border, self.image_rect(p))
+            {
+                rc.push_alpha(p.alpha);
+                rc.rect_outline(x - 1.0, y - 1.0, w + 2.0, h + 2.0, border, 1.0);
+                rc.pop_alpha();
+            }
+        }
+        for p in &self.placements {
+            if let Some((texture, x, y, w, h)) = self.image_rect(p) {
+                let tint = self.icons[p.icon].tint;
+                rc.push_alpha(p.alpha);
+                rc.sprite(texture, x, y, w, h, (0.0, 0.0, 1.0, 1.0), tint);
+                rc.pop_alpha();
+            }
+        }
+    }
+
+    fn hit_test(&self, _element: &Element, _x: f32, _y: f32) -> bool {
+        false
+    }
+}
+
+/// Hangs icons in the world on the overlay band, on a layer of its own
+/// mounted before the labels' so their text reads over icons.
+#[derive(Debug)]
+pub struct WorldIconOverlay {
+    layer: ElementId,
+    element: ElementId,
+    line_height: f32,
+    scratch: Vec<IconPlacement>,
+}
+
+impl WorldIconOverlay {
+    /// Mount on `host`, the labels' lines being `line_height` pixels tall.
+    pub fn mount(ui: &mut UiRoot, host: &mut OverlayHost, line_height: f32) -> Self {
+        let layer = host.add_layer(ui, "PluginWorldIconOverlay");
+        let (w, h) = host.viewport();
+        let mut e = overlay_element(w, h);
+        e.name = Some("PluginWorldIcons".to_owned());
+        let element = ui.insert(e, WorldIconLayer::default());
+        OverlayHost::add_to_layer(ui, layer, element, false);
+        Self {
+            layer,
+            element,
+            line_height,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// The drawing element.
+    #[must_use]
+    pub fn element(&self) -> ElementId {
+        self.element
+    }
+
+    /// Place `icons` for this frame (none without a camera).
+    pub fn tick(
+        &mut self,
+        ui: &mut UiRoot,
+        icons: &[WorldIcon],
+        anchor: &dyn Fn(u32) -> Option<WorldLabelAnchor>,
+        labels: &[WorldLabel],
+        camera: Option<&OverlayCamera>,
+    ) {
+        self.scratch.clear();
+        if let Some(camera) = camera.filter(|c| c.viewport.0 > 0.0 && c.viewport.1 > 0.0)
+            && !icons.is_empty()
+        {
+            if let Some(e) = ui.element_mut(self.element) {
+                e.width = camera.viewport.0;
+                e.height = camera.viewport.1;
+            }
+            place_icons(
+                icons,
+                anchor,
+                labels,
+                self.line_height,
+                camera,
+                &mut self.scratch,
+            );
+        }
+        let shown = !self.scratch.is_empty();
+        if let Some(w) = ui.widget_mut::<WorldIconLayer>(self.element) {
+            std::mem::swap(&mut w.placements, &mut self.scratch);
+            w.icons.clear();
+            w.icons.extend_from_slice(icons);
         }
         ui.set_visible(self.layer, shown);
     }

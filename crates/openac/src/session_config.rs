@@ -136,6 +136,10 @@ pub fn run(
             return exit(HostExit::Configuration);
         }
     };
+    // A launcher session's folder (none for a document written by hand),
+    // held for the whole run so the launcher's cleanup leaves it alone.
+    let session_folder =
+        ac_host::layout::LauncherSessionFolder::claim(&paths, std::path::Path::new(path));
     // The window reader guarantees exactly one session, never a probe.
     let Some(descriptor) = config.sessions.first().cloned() else {
         errln!("Configuration invalid: the document names no session.");
@@ -261,11 +265,7 @@ pub fn run(
     let (to_window, from_session) = mpsc::channel();
     tracker.attaching(&descriptor.id);
     if window
-        .attach_to_session(
-            prefs.window_spec("openAC".to_owned()),
-            from_session,
-            commands.clone(),
-        )
+        .attach_to_session(prefs.window_spec(), from_session, commands.clone())
         .is_err()
         || commands.send(SessionCommand::Attach(to_window)).is_err()
     {
@@ -298,6 +298,9 @@ pub fn run(
         multi::spawn_console(sessions, Some(window.clone()), prefs, tracker);
     }
 
+    let plugin_logs = session_folder
+        .as_ref()
+        .map(ac_host::layout::LauncherSessionFolder::plugin_logs_directory);
     let code: Arc<Mutex<HostExit>> = Arc::new(Mutex::new(HostExit::Runtime));
     let monitor = {
         let code = Arc::clone(&code);
@@ -312,9 +315,11 @@ pub fn run(
                 let printer = ChatPrinter {
                     stream: console.then_some(ConsoleStream::Stderr),
                     session: None,
+                    plugin_logs,
                 };
                 // A window ignores the document's bot policy.
-                let result = multi::monitor(&id, handle, status, &printer, None, notes);
+                let liveness = multi::Liveness::requested(Some(window.clone()));
+                let result = multi::monitor(&id, handle, status, &printer, None, notes, liveness);
                 if let Ok(mut code) = code.lock() {
                     *code = result;
                 }

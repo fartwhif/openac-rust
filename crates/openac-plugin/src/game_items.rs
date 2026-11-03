@@ -14,7 +14,12 @@ use crate::Host;
 
 /// G. Items, equipment, loot.
 impl Host<'_> {
-    /// Everything the character owns, by name then id.
+    /// Everything the character owns, by name then id. Each item's
+    /// `container_slot` is its place in its own container (the main pack
+    /// or a side pack) among its kind, loose items and packs counted
+    /// apart; -1 for one in no container, such as a worn or wielded item,
+    /// or one its container's list does not hold; 0 when that container
+    /// has no list at all.
     pub fn owned_items(&mut self) -> Vec<InventoryItem> {
         self.call::<calls::ItemsOwned>(&())
     }
@@ -187,7 +192,10 @@ impl Host<'_> {
         self.call::<calls::LootCorpses>(&maximum_metres)
     }
 
-    /// What the open container holds.
+    /// What the open container holds, packs inside included. Each item's
+    /// `container_slot` is its place in the container that holds it (the
+    /// open one or a pack inside it) among its kind, loose items and packs
+    /// counted apart.
     pub fn loot_contents(&mut self) -> Vec<InventoryItem> {
         self.call::<calls::LootContents>(&())
     }
@@ -217,6 +225,49 @@ impl Host<'_> {
         self.call::<calls::LootPickup>(&PickupRequest {
             object_id,
             main_pack,
+        })
+    }
+
+    /// Put an item into the open container at `placement` (API 1.5), as a
+    /// drop on that container's window does, with that window's checks:
+    /// the whole stack (`amount` 0, or the stack's size) or that many split
+    /// off. `container_id` must be the open container
+    /// ([`LootState::current_container_id`]). The item is one the
+    /// character owns, or one of the open container's own loose items (a
+    /// reorder): an item directly in it that is not a pack. A pack inside
+    /// the container, or anything inside such a pack, is not one.
+    ///
+    /// `placement` is the slot sent to the server: an index among the open
+    /// container's loose items, in their order there (in
+    /// [`Host::loot_contents`], the items whose `container_id` is the open
+    /// container and that are not packs; packs are not counted). The item
+    /// lands at that index, and the ones from there on move one slot
+    /// later; past the end appends. A reorder counts as if the item were
+    /// taken out first: to move the item at index 1 so it sits at index 3
+    /// of the list it ends in, send 3, and the items that were at 2 and 3
+    /// move one slot earlier. A split leaves its stack where it is and
+    /// counts it.
+    ///
+    /// `Completed`, with nothing sent, when the whole of a loose item is
+    /// put where it already is (its own index, or past the end for the
+    /// last one). `InvalidTarget` when the container is not the open one,
+    /// `InvalidItem` for any other item. `Refused` with the client's own
+    /// notice for a pack, a container with no free slot (a reorder of its
+    /// own items still fits), an item in a trade, or an amount over the
+    /// stack, and for a put that did not go out. `Busy` while another item
+    /// request, an item waiting at a slot or a wield is in flight.
+    pub fn put_in_open_container(
+        &mut self,
+        object_id: u32,
+        container_id: u32,
+        amount: u32,
+        placement: i32,
+    ) -> ItemResult {
+        self.call::<calls::LootPut>(&MoveRequest {
+            object_id,
+            container_id,
+            amount,
+            placement,
         })
     }
 

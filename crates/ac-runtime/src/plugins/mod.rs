@@ -530,6 +530,7 @@ impl SessionApi for PluginBinding<'_> {
             LootClose => |id| self.loot_close(id),
             LootIdentify => |id| self.loot_identify(id),
             LootPickup => |request| self.loot_pickup(request),
+            LootPut => |request| self.loot_put(request),
             // H. Trade and vendor.
             TradeState => |()| self.trade_state(),
             TradeAdd => |item| self.trade_add(item),
@@ -619,6 +620,7 @@ impl SessionApi for PluginBinding<'_> {
             NavigationStopGoTo => |()| self.navigation_stop_go_to(caller.plugin_id),
             NavigationGoToReport => |()| self.navigation_go_to_report(),
             NavigationPreviewPath => |request| self.navigation_preview_path(caller.plugin_id, &request),
+            NavigationReachableCells => |request| self.navigation_reachable_cells(caller.plugin_id, &request),
             NavigationPause => |reason| self.navigation_pause(caller.plugin_id, reason),
             NavigationPauseSet => |change| self.navigation_pause_set(caller.plugin_id, change),
             NavigationPauseRelease => |handle| self.navigation_pause_release(caller.plugin_id, handle),

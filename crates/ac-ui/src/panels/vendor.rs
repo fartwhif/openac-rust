@@ -344,10 +344,8 @@ fn sell_check(
     let player = items.player;
     evaluate_sell(
         &VendorSellCandidate {
-            owned_by_player: player != 0
-                && guid != player
-                && items.objects.is_owned_by_object(guid, player),
-            contained_item_count: i32::try_from(items.objects.get_contents(guid).len())
+            owned_by_player: items.objects.is_owned_by_object(guid, player),
+            contained_item_count: i32::try_from(items.objects.get_contained_items(guid).len())
                 .unwrap_or(i32::MAX),
             item_type: item.item_type.bits(),
             per_unit_value: per_unit_value(item.value, Some(item.stack_size)),
@@ -560,11 +558,19 @@ impl VendorController {
             VendorViewReason::Opened => {
                 self.pending_split = None;
                 self.selected_category = None;
+                // Another shop: its row starts at the beginning.
+                self.scroll_item_list_to(ui, 0);
                 self.show_tab(ui, VendorTab::Items);
                 self.rebuild_categories(ui, items, icons);
                 ui.show_window(&self.window);
             }
-            VendorViewReason::Refreshed | VendorViewReason::Asked => {
+            // The open shop sent again (after a purchase or a sale): the
+            // window stays on the page the player was on.
+            VendorViewReason::Refreshed => {
+                self.rebuild_categories(ui, items, icons);
+                ui.show_window(&self.window);
+            }
+            VendorViewReason::Asked => {
                 self.show_tab(ui, VendorTab::Items);
                 self.rebuild_categories(ui, items, icons);
                 ui.show_window(&self.window);
@@ -592,6 +598,7 @@ impl VendorController {
     fn clear_content(&mut self, ui: &mut UiRoot) {
         self.categories.clear();
         self.selected_category = None;
+        self.scroll_item_list_to(ui, 0);
         if let Some(m) = ui.widget_mut::<Menu>(self.type_menu) {
             m.items.clear();
             m.selected = None;
@@ -630,12 +637,26 @@ impl VendorController {
         }
     }
 
+    /// Scroll the listing row sideways to `x` pixels, clamped to the row.
+    fn scroll_item_list_to(&self, ui: &mut UiRoot, x: i32) {
+        if let Some(l) = ui.widget_mut::<ItemList>(self.item_list) {
+            l.scroll.set_scroll_y(x);
+        }
+    }
+
+    /// Refill the category menu and the listing row from the shop. The row
+    /// keeps how far it was scrolled sideways (clamped to the refilled row),
+    /// so a shop sent again after a purchase or a sale stays where the
+    /// player was; a newly opened shop is scrolled to the start first.
     fn rebuild_categories(
         &mut self,
         ui: &mut UiRoot,
         items: &ItemsView<'_>,
         icons: &mut dyn IconSource,
     ) {
+        let scroll_x = ui
+            .widget::<ItemList>(self.item_list)
+            .map_or(0, |l| l.scroll.scroll_y());
         let listing = self.view.as_ref().map_or(&[][..], |v| &v.items[..]);
         self.categories = CATEGORY_FILTERS
             .iter()
@@ -654,6 +675,7 @@ impl VendorController {
         self.selected_category = usize::try_from(selected).ok().filter(|i| *i < count);
         self.refresh_menu(ui);
         self.rebuild_item_list(ui, items, icons, true);
+        self.scroll_item_list_to(ui, scroll_x);
     }
 
     fn refresh_menu(&self, ui: &mut UiRoot) {
@@ -860,7 +882,7 @@ impl VendorController {
             let mut slot = ItemSlot {
                 slot_index: i32::try_from(index).unwrap_or(i32::MAX),
                 allow_drag_source: true,
-                source_kind: ItemDragSource::Inventory,
+                source_kind: ItemDragSource::Vendor,
                 show_sell_overlay: true,
                 sell_overlay_sprite: SELL_OVERLAY_SPRITE,
                 tooltip: items.tooltip(guid),
@@ -1225,6 +1247,7 @@ impl VendorController {
 
     fn can_sell(&self, p: &ItemDragPayload, items: &ItemsView<'_>) -> bool {
         p.obj_id != 0
+            && !p.source_kind.is_alias()
             && self
                 .view
                 .as_ref()
@@ -1238,7 +1261,7 @@ impl VendorController {
         let Some(view) = self.view.clone() else {
             return;
         };
-        if p.obj_id == 0 {
+        if p.obj_id == 0 || p.source_kind.is_alias() {
             return;
         }
         if let Err(r) = sell_check(items, &view.profile, p.obj_id) {
