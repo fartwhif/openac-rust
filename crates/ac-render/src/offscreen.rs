@@ -239,6 +239,30 @@ impl Offscreen {
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+
+    /// The server object (id and local id) the last frame drew at offscreen
+    /// pixel (`x`, `y`), kept only while the scene still holds that
+    /// incarnation of it (a stale frame never picks a newer object reusing the
+    /// id): the window's `WorldSelectionQuery.PickAt`, for the terminal's
+    /// click.
+    #[must_use]
+    pub fn pick(&mut self, x: f32, y: f32) -> Option<(u32, u32)> {
+        let hit = self.world.pick(x, y, 0)?;
+        self.scene()
+            .and_then(|scene| scene.object_by_guid(hit.guid))
+            .filter(|o| o.key.local_id == hit.local_id)
+            .map(|_| (hit.guid, hit.local_id))
+    }
+
+    /// The world's camera, to orbit the chase view from the terminal's mouse.
+    pub fn cameras_mut(&mut self) -> &mut crate::camera::CameraController {
+        self.world.cameras_mut()
+    }
+
+    /// Flash an object the terminal's click picked, like the window's.
+    pub fn begin_selection_flash(&mut self, guid: u32, local_id: u32) {
+        self.world.begin_selection_flash(guid, local_id);
+    }
     /// The adapter's name, drawing on it (the startup line).
     #[must_use]
     pub fn adapter_name(&self) -> &str {
