@@ -11,7 +11,8 @@ use std::collections::VecDeque;
 use ac_render::scene::Scene;
 use ac_runtime::communication::ChatLine;
 use ac_runtime::session::interface::InterfaceEvent;
-use ac_runtime::world::PlayerView;
+use ac_runtime::world::{PlayerView, VitalReading};
+use ac_ui::radar::{BlipShape, CompassPoint, RadarSnapshot};
 
 // -- The cell ---------------------------------------------------------------
 
@@ -36,6 +37,12 @@ const HP: Rgb = [206, 66, 58];
 const STAMINA: Rgb = [92, 176, 100];
 const MANA: Rgb = [96, 130, 220];
 const TARGET: Rgb = [232, 120, 120];
+/// The player's marker at the radar's centre (bright green, as the retail's).
+const PLAYER: Rgb = [64, 224, 96];
+/// The radar disc's body, darker than the world so the blips read.
+const RADAR_BODY: Rgb = [15, 19, 27];
+/// The radar disc's dim edge.
+const RADAR_EDGE: Rgb = [62, 70, 84];
 
 // -- Geometry ---------------------------------------------------------------
 
@@ -57,6 +64,9 @@ pub struct Layout {
     /// The chat feed, over the viewport's bottom (its foot row is the entry
     /// box).
     pub chat: Rect,
+    /// The radar disc, over the viewport's top-right (its foot row holds the
+    /// coordinates line).
+    pub radar: Rect,
 }
 
 /// Compute the frame's regions: the world fills the whole grid, the vitals
@@ -64,7 +74,7 @@ pub struct Layout {
 pub fn layout(cols: usize, rows: usize) -> Layout {
     let cols = cols.max(30);
     let rows = rows.max(12);
-    let vitals_w = 26.min(cols);
+    let vitals_w = 34.min(cols);
     // The chat area is the transcript rows, the status line and the entry
     // box's row at its foot.
     let chat_h = 5.min(rows);
@@ -79,7 +89,7 @@ pub fn layout(cols: usize, rows: usize) -> Layout {
         x: 1,
         y: 1,
         w: vitals_w,
-        h: 5,
+        h: 7,
     };
     let chat = Rect {
         x: 1,
@@ -87,11 +97,25 @@ pub fn layout(cols: usize, rows: usize) -> Layout {
         w: cols - 2,
         h: chat_h,
     };
+    // The radar disc, over the viewport's top-right: an ellipse twice as
+    // wide as tall (a cell is twice as tall as it is wide, so it reads as a
+    // circle). Its foot row, below the disc, holds the coordinates line.
+    let radar_rx = (cols / 2 - 1).clamp(4, 12);
+    let radar_ry = (radar_rx / 2).max(2);
+    let radar_w = 2 * radar_rx + 1;
+    let radar_h = 2 * radar_ry + 1;
+    let radar = Rect {
+        x: cols.saturating_sub(radar_w + 1),
+        y: 1.min(rows.saturating_sub(radar_h)),
+        w: radar_w,
+        h: radar_h,
+    };
 
     Layout {
         viewport,
         vitals,
         chat,
+        radar,
     }
 }
 
@@ -165,17 +189,22 @@ impl Grid {
         }
     }
 
-    /// A labelled meter: a short label, a filled bar, and a percent, all on
-    /// one row `w` wide.
-    fn bar(&mut self, x: usize, y: usize, w: usize, label: &str, frac: f32, full: Rgb) {
-        let frac = frac.clamp(0.0, 1.0);
-        let lw = 3usize;
-        let pw = 4usize;
-        if w < lw + pw + 2 {
+    /// A labelled meter: a label, a filled bar, and a right-aligned readout
+    /// (e.g. `1500/2500`), all on the row `r` spans. A non-finite `frac`
+    /// reads as empty.
+    fn bar(&mut self, r: Rect, label: &str, frac: f32, full: Rgb, readout: &str) {
+        let (x, y, w) = (r.x, r.y, r.w);
+        let mut frac = frac.clamp(0.0, 1.0);
+        if !frac.is_finite() {
+            frac = 0.0;
+        }
+        let lw = label.chars().count().max(2);
+        let rw = readout.chars().count().max(3);
+        if w < lw + 1 + 2 + 1 + rw {
             return;
         }
-        let bar_w = w - lw - pw - 1;
-        self.put_str(x, y, &format!("{label:<lw$}"), TEXT, BG);
+        let bar_w = w - lw - 1 - 1 - rw;
+        self.put_str(x, y, label, TEXT, BG);
         let bx = x + lw + 1;
         let filled = (frac * bar_w as f32).round() as usize;
         for i in 0..bar_w {
@@ -185,7 +214,7 @@ impl Grid {
                 self.put(bx + i, y, '░', DIM, BG);
             }
         }
-        self.put_str(x + w - pw, y, &format!("{:.0}%", frac * 100.0), TEXT, BG);
+        self.put_str(x + w - rw, y, readout, TEXT, BG);
     }
 }
 
@@ -274,6 +303,9 @@ pub struct Model {
     /// by the terminal's keys, not the scene).
     pub chat_box: ChatBox,
     player_guid: u32,
+    /// The circular radar: the player's bearing, the nearby blips, and the
+    /// coordinates line, folded from the scene each frame.
+    radar: RadarSnapshot,
 }
 
 impl Model {
@@ -286,6 +318,12 @@ impl Model {
     /// selection).
     pub fn update(&mut self, scene: &mut Scene) {
         self.player_guid = scene.player_guid().unwrap_or(0);
+        // The radar: the player's bearing and every placed object, projected
+        // to the disc (the scene's range test leaves out the far ones).
+        let view = scene.player_view();
+        self.radar = ac_ui::panels::radar::build_snapshot(&ac_render::ui::window::radar_scene(
+            scene, view, None,
+        ));
         self.char_name = scene.player().and_then(|p| p.name.clone());
         if let Some(pv) = scene.player_view() {
             self.vitals = Some(*pv);
@@ -357,35 +395,51 @@ impl Model {
 
 /// The vitals block and the chat over the world.
 pub fn draw(g: &mut Grid, m: &Model, l: &Layout) {
-    // The vitals + target, top-left.
+    // The vitals + target, top-left: plain text over the world — no panel or
+    // frame. Each line's background is only as wide as the line: the name
+    // spans just the name, each meter spans its own label-and-readout width.
     let r = l.vitals;
+    let cx = r.x + 1;
+    let cw = r.w.saturating_sub(2);
     if let Some(name) = &m.char_name {
-        g.put_str(r.x, r.y, &truncate(name, r.w), TITLE, BG);
+        g.put_str(cx, r.y + 1, &truncate(name, cw), TITLE, BG);
     }
     if let Some(pv) = &m.vitals {
         g.bar(
-            r.x,
-            r.y + 1,
-            r.w,
+            Rect {
+                x: cx,
+                y: r.y + 2,
+                w: cw,
+                h: 1,
+            },
             "HP",
             pv.health.percent.unwrap_or(0.0),
             HP,
+            &vital_readout(&pv.health),
         );
         g.bar(
-            r.x,
-            r.y + 2,
-            r.w,
+            Rect {
+                x: cx,
+                y: r.y + 3,
+                w: cw,
+                h: 1,
+            },
             "SP",
             pv.stamina.percent.unwrap_or(0.0),
             STAMINA,
+            &vital_readout(&pv.stamina),
         );
         g.bar(
-            r.x,
-            r.y + 3,
-            r.w,
+            Rect {
+                x: cx,
+                y: r.y + 4,
+                w: cw,
+                h: 1,
+            },
             "MP",
             pv.mana.percent.unwrap_or(0.0),
             MANA,
+            &vital_readout(&pv.mana),
         );
         if let Some(guid) = m.target_guid {
             let name = m
@@ -397,17 +451,140 @@ pub fn draw(g: &mut Grid, m: &Model, l: &Layout) {
                 .map(|p| format!(" {:.0}%", p * 100.0))
                 .unwrap_or_default();
             g.put_str(
-                r.x,
-                r.y + 4,
-                &truncate(&format!("→ {name}{hp}"), r.w),
+                cx,
+                r.y + 5,
+                &truncate(&format!("→ {name}{hp}"), cw),
                 TARGET,
                 BG,
             );
         }
     }
 
+    // The radar disc, top-right.
+    draw_radar(g, &m.radar, l.radar);
     // The chat feed, bottom.
     draw_chat(g, m, l.chat);
+}
+
+/// A vital's readout: `current/max`, or blank until both are known.
+fn vital_readout(v: &VitalReading) -> String {
+    match (v.current, v.max) {
+        (Some(c), Some(m)) => format!("{c}/{m}"),
+        _ => String::new(),
+    }
+}
+
+/// The radar disc and its blips, over the viewport's top-right. The player is
+/// at the centre, facing up; the disc turns with the player's heading, the
+/// compass letters mark the world directions, and the coordinates line sits
+/// under the disc. The blips come pre-projected on the retail's 120-pixel disc
+/// (centre 60, radius 50); each axis is rescaled to the cell disc, the vertical
+/// halved for the cell's 2:1 aspect so the ellipse reads as a circle.
+fn draw_radar(g: &mut Grid, radar: &RadarSnapshot, d: Rect) {
+    let (cx, cy) = (d.x as f32 + d.w as f32 / 2.0, d.y as f32 + d.h as f32 / 2.0);
+    let (rx, ry) = (d.w as f32 / 2.0, d.h as f32 / 2.0);
+
+    // The disc's body: a dark ellipse so the blips read over the world.
+    for y in d.y..(d.y + d.h) {
+        let dy = (y as f32 - cy) / ry;
+        let dy2 = dy * dy;
+        if dy2 >= 1.0 {
+            continue;
+        }
+        let half = rx * (1.0 - dy2).sqrt();
+        let x0 = (cx - half).ceil() as isize;
+        let x1 = (cx + half).floor() as isize;
+        for x in x0..=x1 {
+            if x >= 0 {
+                g.put(x as usize, y, ' ', RADAR_BODY, RADAR_BODY);
+            }
+        }
+    }
+    // The disc's dim edge.
+    for i in 0..=256 {
+        let t = i as f32 * (std::f32::consts::TAU / 256.0);
+        g.put(
+            (cx + t.cos() * rx).round() as usize,
+            (cy + t.sin() * ry).round() as usize,
+            ' ',
+            RADAR_EDGE,
+            RADAR_EDGE,
+        );
+    }
+    // The compass letters, turned with the player's heading (N ahead when the
+    // player faces north).
+    for (point, letter) in [
+        (CompassPoint::North, 'N'),
+        (CompassPoint::East, 'E'),
+        (CompassPoint::South, 'S'),
+        (CompassPoint::West, 'W'),
+    ] {
+        let t = radar.player_heading_degrees.to_radians() + compass_angle(point);
+        g.put(
+            (cx + t.sin() * rx * 0.8).round() as usize,
+            (cy + t.cos() * ry * 0.8).round() as usize,
+            letter,
+            DIM,
+            RADAR_BODY,
+        );
+    }
+    // The blips, rescaled from the retail disc (centre 60, radius 50).
+    if !radar.blank_blips {
+        for b in &radar.blips {
+            let x = (cx + (b.pixel_x - 60.0) * (rx / 50.0)).round() as usize;
+            let y = (cy + (b.pixel_y - 60.0) * (ry / 50.0)).round() as usize;
+            g.put(x, y, blip_char(b.shape), blip_rgb(b.color), RADAR_BODY);
+        }
+    }
+    // The player, at the centre.
+    g.put(
+        cx.round() as usize,
+        cy.round() as usize,
+        '●',
+        PLAYER,
+        RADAR_BODY,
+    );
+    // The coordinates, under the disc.
+    if let Some(coords) = &radar.coordinates_text {
+        let w = coords.chars().count();
+        let x = (d.x + d.w / 2 + 1).saturating_sub(w / 2);
+        g.put_str(x, d.y + d.h, coords, DIM, BG);
+    }
+}
+
+/// A compass point's bearing offset from the player's heading (radians).
+fn compass_angle(point: CompassPoint) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    match point {
+        CompassPoint::North => PI,
+        CompassPoint::East => FRAC_PI_2,
+        CompassPoint::South => 0.0,
+        CompassPoint::West => 3.0 * FRAC_PI_2,
+    }
+}
+
+/// A blip's terminal glyph: the shape reads at a glance, the colour carries
+/// the relationship (the retail's shape and colour, one cell each).
+fn blip_char(shape: BlipShape) -> char {
+    match shape {
+        BlipShape::Circle => '·',
+        BlipShape::Box => '□',
+        BlipShape::X => 'x',
+        BlipShape::Plus => '+',
+        BlipShape::Triangle => '▲',
+        BlipShape::InvertedTriangle => '▼',
+        BlipShape::XBox => '⊠',
+        BlipShape::Undef => '·',
+    }
+}
+
+/// A radar colour as terminal RGB.
+fn blip_rgb(c: ac_ui::draw::Color) -> [u8; 3] {
+    [
+        (c.r * 255.0) as u8,
+        (c.g * 255.0) as u8,
+        (c.b * 255.0) as u8,
+    ]
 }
 
 fn draw_chat(g: &mut Grid, m: &Model, r: Rect) {
@@ -636,5 +813,124 @@ mod tests {
         );
         assert!(line(8).starts_with("  status"), "the status: {}", line(8));
         assert!(line(9).starts_with("  > draft"), "the box: {}", line(9));
+    }
+    /// The vitals: plain text over the world — no panel or frame. The name's
+    /// background spans only the name (the world shows just past it), and the
+    /// meters keep their labels and current/max readouts.
+    #[test]
+    fn the_vitals_sit_as_plain_text_over_the_world() {
+        let l = layout(80, 24);
+        let r = l.vitals;
+        let mut g = Grid::new(80, 24);
+        // A distinctive world behind the vitals.
+        g.fill(l.viewport, '⣿', [255, 0, 0], [0, 0, 0]);
+        let mut m = Model::new();
+        let name = "+TermTest2";
+        m.char_name = Some(name.into());
+        m.vitals = Some(PlayerView {
+            health: VitalReading {
+                current: Some(1500),
+                max: Some(2500),
+                percent: Some(0.6),
+            },
+            stamina: VitalReading {
+                current: Some(800),
+                max: Some(1000),
+                percent: Some(0.8),
+            },
+            mana: VitalReading {
+                current: Some(400),
+                max: Some(1000),
+                percent: Some(0.4),
+            },
+            ..PlayerView::default()
+        });
+        draw(&mut g, &m, &l);
+
+        let row_text = |y: usize| -> String { g.rows()[y].iter().map(|c| c.ch).collect() };
+
+        // No frame: the vitals' top row is world, not a border.
+        assert_eq!(g.rows()[r.y][r.x].ch, '⣿', "no top frame");
+
+        // The name, with its background only as wide as the name: the cell
+        // just past it is still world.
+        assert!(
+            row_text(r.y + 1).contains(name),
+            "the name: {:?}",
+            row_text(r.y + 1)
+        );
+        let past = g.rows()[r.y + 1][r.x + 1 + name.chars().count()].ch;
+        assert_eq!(past, '⣿', "the name's background runs past the name");
+
+        // The meters keep their labels and current/max readouts.
+        assert!(
+            row_text(r.y + 2).contains("HP"),
+            "HP label: {:?}",
+            row_text(r.y + 2)
+        );
+        assert!(
+            row_text(r.y + 2).contains("1500/2500"),
+            "HP: {:?}",
+            row_text(r.y + 2)
+        );
+        assert!(
+            row_text(r.y + 3).contains("800/1000"),
+            "SP: {:?}",
+            row_text(r.y + 3)
+        );
+        assert!(
+            row_text(r.y + 4).contains("400/1000"),
+            "MP: {:?}",
+            row_text(r.y + 4)
+        );
+    }
+
+    /// The radar: the player marks the disc's centre, a blip rescales from the
+    /// retail 120-pixel disc (centre 60, radius 50) into the cell disc, the
+    /// compass sits at the top when facing north, and the coordinates line sits
+    /// under the disc.
+    #[test]
+    fn the_radar_marks_the_player_and_projects_blips() {
+        use ac_ui::draw::Color;
+        use ac_ui::radar::RadarBlip;
+        let d = Rect {
+            x: 100,
+            y: 2,
+            w: 24,
+            h: 12,
+        };
+        let mut g = Grid::new(140, 30);
+        let snapshot = RadarSnapshot {
+            player_heading_degrees: 0.0,
+            blips: vec![RadarBlip {
+                object_id: 1,
+                name: "east".into(),
+                pixel_x: 90.0, // 30 east of the retail centre (0.6 of the radius)
+                pixel_y: 60.0,
+                color: Color::rgba(1.0, 0.5, 0.0, 1.0),
+                shape: BlipShape::Plus,
+                selected: false,
+            }],
+            coordinates_text: Some("42.1N,33.9E".into()),
+            blank_blips: false,
+            ui_locked: false,
+        };
+        draw_radar(&mut g, &snapshot, d);
+        // The player, at the disc's centre.
+        assert_eq!(g.rows()[8][112].ch, '●', "player marker");
+        assert_eq!(g.rows()[8][112].fg, PLAYER);
+        // The blip: 30 retail pixels east lands in the disc, east of centre.
+        let b = &g.rows()[8][119];
+        assert_eq!(b.ch, '+', "blip glyph");
+        assert_eq!(b.fg, [255, 127, 0], "blip colour");
+        // Facing north, the compass's N is at the top, off the centre.
+        assert_eq!(
+            g.rows()[3].iter().position(|c| c.ch == 'N'),
+            Some(112),
+            "N at the top"
+        );
+        // The coordinates line, under the disc.
+        let coords = g.rows()[14].iter().map(|c| c.ch).collect::<String>();
+        assert!(coords.contains("42.1N,33.9E"), "coordinates: {coords:?}");
     }
 }
