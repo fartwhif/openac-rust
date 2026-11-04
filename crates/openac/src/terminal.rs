@@ -29,6 +29,7 @@ use ac_render::gameplay_input::{DeviceState, GameplayInput, GameplayOutput};
 use ac_render::scene::SceneSource;
 use ac_render::world_click::{ClickFacts, WorldClick, WorldClicks};
 use ac_render::{GraphicsOptions, Offscreen, WorldSettings};
+use ac_runtime::inventory::ItemCommand;
 use ac_runtime::session::{
     LifecycleCommand, ObjectSummary, PresentationEvent, SessionCommand, SessionEvent,
     SessionHandle, SessionSummary,
@@ -684,40 +685,47 @@ struct TerminalInput {
 }
 
 /// Where one terminal key goes: into the entry box (with the line the box
-/// submitted, when an Enter sent one) or to the game.
+/// submitted, when an Enter sent one), to the open widget (with the item
+/// requests it wants sent), or to the game.
 enum KeyRoute {
     /// The entry box took the key; `send` is the line to send to the
     /// session (an Enter on a non-empty line).
     Box { send: Option<String> },
+    /// The open widget took the key; `commands` is what it wants sent to
+    /// the session.
+    Widget { commands: Vec<ItemCommand> },
     /// The key is the game's, as before.
     Game,
 }
 
-/// Route one terminal key between the entry box and the game. In text input
-/// mode every key is the box's — a release included, so a key let go while
-/// typing never reaches the game — and a Ctrl combo types nothing. Out of
-/// the mode, an Enter or Tab press hands the keys to the box (the key that
-/// did it types nothing anywhere), and every other key is the game's.
+/// Route one terminal key between the entry box, the open widget and the
+/// game. In text input mode every key is the box's — a release included, so
+/// a key let go while typing never reaches the game — and a Ctrl combo types
+/// nothing. Out of the mode, the inventory's key opens and closes the
+/// widget; with a widget open its keys are its (the game never sees them);
+/// an Enter or Tab press hands the keys to the box (the key that did it
+/// types nothing anywhere); and every other key is the game's.
 fn route_key(
     code: KeyCode,
     pressed: bool,
     modifiers: KeyModifiers,
-    entry: &mut termui::ChatBox,
+    size: (usize, usize),
+    model: &mut termui::Model,
 ) -> KeyRoute {
-    if entry.active {
+    if model.chat_box.active {
         let send = if pressed {
             match code {
                 KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
-                    entry.push_char(c);
+                    model.chat_box.push_char(c);
                     None
                 }
                 KeyCode::Backspace => {
-                    entry.backspace();
+                    model.chat_box.backspace();
                     None
                 }
-                KeyCode::Enter => entry.enter(),
+                KeyCode::Enter => model.chat_box.enter(),
                 KeyCode::Tab => {
-                    entry.deactivate();
+                    model.chat_box.deactivate();
                     None
                 }
                 _ => None,
@@ -727,11 +735,59 @@ fn route_key(
         };
         return KeyRoute::Box { send };
     }
+    if pressed && !modifiers.contains(KeyModifiers::CONTROL) {
+        // The inventory's key, with no widget open: it opens (or, with the
+        // inventory already open, closes) it.
+        if code == KeyCode::Char('i') && !model.widget_open() {
+            model.widget_toggle_inventory();
+            return KeyRoute::Widget {
+                commands: Vec::new(),
+            };
+        }
+        // The open widget's keys (the game's keys stay live under it).
+        if model.widget_open()
+            && let Some(key) = widget_key(code, modifiers)
+        {
+            let commands = model.widget_key(key, size.0, size.1);
+            return KeyRoute::Widget { commands };
+        }
+    }
     if pressed && matches!(code, KeyCode::Enter | KeyCode::Tab) {
-        entry.activate();
+        model.chat_box.activate();
         return KeyRoute::Box { send: None };
     }
     KeyRoute::Game
+}
+
+/// A terminal key as the open widget names it (`None` for keys the widget
+/// does not take: the game's keys stay live under it).
+fn widget_key(code: KeyCode, modifiers: KeyModifiers) -> Option<termui::WidgetKey> {
+    if modifiers.contains(KeyModifiers::ALT) {
+        return None;
+    }
+    use termui::WidgetKey as W;
+    match code {
+        KeyCode::Up => Some(W::Up),
+        KeyCode::Down => Some(W::Down),
+        KeyCode::PageUp => Some(W::PageUp),
+        KeyCode::PageDown => Some(W::PageDown),
+        KeyCode::Home => Some(W::Home),
+        KeyCode::End => Some(W::End),
+        KeyCode::Enter => Some(W::Enter),
+        KeyCode::Backspace => Some(W::Back),
+        KeyCode::Char(c) => match c {
+            'e' => Some(W::Appraise),
+            'a' => Some(W::Add),
+            'b' => Some(W::BuyAll),
+            's' => Some(W::SellAll),
+            'r' => Some(W::Reset),
+            'y' => Some(W::Accept),
+            'n' => Some(W::Decline),
+            'd' => Some(W::Drop),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Handle one terminal event, routing it to the entry box or the gameplay
@@ -746,22 +802,42 @@ fn handle_event(
 ) -> bool {
     match evt {
         Event::Key(k) => {
-            if k.code == KeyCode::Esc {
-                return true;
-            }
             input.modifiers = modifiers_from_crossterm(k.modifiers);
             let pressed = match k.kind {
                 KeyEventKind::Press => true,
                 KeyEventKind::Release => false,
                 _ => return false,
             };
+            // Esc closes the open widget (an appraise returns to the widget
+            // it opened over); with none open it quits.
+            if k.code == KeyCode::Esc && pressed {
+                let closed = model.widget_open();
+                for command in model.widget_close() {
+                    let _ = commands.send(SessionCommand::Item(command));
+                }
+                return !closed;
+            }
             // The entry box takes the keys in text input mode (and an
-            // Enter or Tab press outside it); the game never sees a key
-            // the box takes.
-            match route_key(k.code, pressed, k.modifiers, &mut model.chat_box) {
+            // Enter or Tab press outside it); the open widget takes its own;
+            // the game never sees a key they take.
+            match route_key(
+                k.code,
+                pressed,
+                k.modifiers,
+                (input.size.0 as usize, input.size.1 as usize),
+                model,
+            ) {
                 KeyRoute::Box { send } => {
                     if let Some(line) = send {
                         let _ = commands.send(SessionCommand::Chat(line));
+                    }
+                    return false;
+                }
+                KeyRoute::Widget {
+                    commands: item_commands,
+                } => {
+                    for command in item_commands {
+                        let _ = commands.send(SessionCommand::Item(command));
                     }
                     return false;
                 }
@@ -798,9 +874,37 @@ fn handle_mouse(
     now_ms: u64,
     input: &mut TerminalInput,
     offscreen: &mut Offscreen,
-    model: &termui::Model,
+    model: &mut termui::Model,
 ) {
     let (column, row) = (m.column, m.row);
+    // The pointer in the open widget's region: the widget's, in place of
+    // the world's pick and the camera's zoom.
+    if model.widget_open() {
+        let (cols, rows) = (input.size.0 as usize, input.size.1 as usize);
+        let r = termui::layout(cols, rows).widget;
+        let cx = column as usize;
+        let cy = row as usize;
+        let in_widget = cx >= r.x && cx < r.x + r.w && cy >= r.y && cy < r.y + r.h;
+        if in_widget {
+            input.cursor = (column, row);
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(command) = model.widget_click(cols, rows, row, true) {
+                        let _ = commands.send(SessionCommand::Item(command));
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Right) => {
+                    if let Some(command) = model.widget_click(cols, rows, row, false) {
+                        let _ = commands.send(SessionCommand::Item(command));
+                    }
+                }
+                MouseEventKind::ScrollUp => model.widget_wheel(-1, cols, rows),
+                MouseEventKind::ScrollDown => model.widget_wheel(1, cols, rows),
+                _ => {}
+            }
+            return;
+        }
+    }
     match m.kind {
         MouseEventKind::Down(button) | MouseEventKind::Up(button) => {
             let pressed = matches!(m.kind, MouseEventKind::Down(_));
@@ -1193,7 +1297,6 @@ fn draw_grid(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::termui::ChatBox;
 
     /// A solid RGBA frame (one colour, `cols` x `rows` cells worth).
     fn solid_rgba(cols: usize, rows: usize, color: [u8; 3]) -> (Vec<u8>, usize) {
@@ -1402,36 +1505,91 @@ mod tests {
         );
     }
 
+    /// Esc quits with no widget open; with one open it closes the widget
+    /// (sending the widget's close requests) and stays in the session.
+    #[test]
+    fn esc_closes_the_open_widget_before_it_quits() {
+        use ac_runtime::inventory::{ItemCommand, TradeView};
+        use ac_runtime::session::interface::InterfaceEvent;
+        use crossterm::event::KeyEvent;
+
+        let mut gameplay = GameplayInput::new(KeyBindings::retail_defaults());
+        let (tx, rx) = mpsc::channel();
+        let mut input = TerminalInput {
+            modifiers: Modifiers::NONE,
+            size: (80, 24),
+            taps: KeyTaps::new(),
+            cursor: (0, 0),
+            mouse_buttons: 0,
+            world_clicks: WorldClicks::default(),
+        };
+        let esc = || Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        // Nothing open: Esc quits.
+        let mut model = termui::Model::new();
+        assert!(
+            handle_event(esc(), &mut gameplay, &tx, 0.0, &mut input, &mut model),
+            "with no widget open, Esc quits"
+        );
+
+        // The trade open: Esc closes it (its CloseTrade goes out) and stays.
+        let mut model = termui::Model::new();
+        model.apply(InterfaceEvent::Trade(Box::new(TradeView {
+            open: true,
+            partner_guid: 77,
+            ..TradeView::default()
+        })));
+        assert!(model.widget_open(), "the trade opens");
+        assert!(
+            !handle_event(esc(), &mut gameplay, &tx, 0.0, &mut input, &mut model),
+            "with a widget open, Esc does not quit"
+        );
+        assert!(!model.widget_open(), "Esc closed the widget");
+        assert!(
+            matches!(
+                rx.try_recv().ok(),
+                Some(SessionCommand::Item(ItemCommand::CloseTrade))
+            ),
+            "the close request goes out"
+        );
+    }
+
     /// Out of text input mode, an Enter or Tab press hands the keys to the
     /// entry box (and types nothing); every other key — and a release — is
     /// the game's.
     #[test]
     fn enter_or_tab_takes_the_keys_over_to_the_entry_box() {
-        let mut entry = ChatBox::default();
+        let mut model = termui::Model::default();
         for code in [KeyCode::Enter, KeyCode::Tab] {
             assert!(
                 matches!(
-                    route_key(code, true, KeyModifiers::NONE, &mut entry),
+                    route_key(code, true, KeyModifiers::NONE, (80, 24), &mut model),
                     KeyRoute::Box { send: None }
                 ),
                 "{code:?} must open text input mode"
             );
-            assert!(entry.active, "{code:?} must open text input mode");
-            entry.deactivate();
+            assert!(model.chat_box.active, "{code:?} must open text input mode");
+            model.chat_box.deactivate();
         }
         for code in [KeyCode::Char('a'), KeyCode::Backspace, KeyCode::Left] {
             assert!(
                 matches!(
-                    route_key(code, true, KeyModifiers::NONE, &mut entry),
+                    route_key(code, true, KeyModifiers::NONE, (80, 24), &mut model),
                     KeyRoute::Game
                 ),
                 "{code:?} is the game's out of the mode"
             );
-            assert!(!entry.active);
+            assert!(!model.chat_box.active);
         }
         assert!(
             matches!(
-                route_key(KeyCode::Enter, false, KeyModifiers::NONE, &mut entry),
+                route_key(
+                    KeyCode::Enter,
+                    false,
+                    KeyModifiers::NONE,
+                    (80, 24),
+                    &mut model
+                ),
                 KeyRoute::Game
             ),
             "a release does not open the box"
@@ -1444,85 +1602,133 @@ mod tests {
     /// leaves the mode, a Ctrl combo types nothing.
     #[test]
     fn the_entry_box_takes_every_key_in_text_input_mode() {
-        let mut entry = ChatBox::default();
-        entry.activate();
+        let mut model = termui::Model::default();
+        model.chat_box.activate();
 
         for c in ['h', 'i'] {
             assert!(
                 matches!(
-                    route_key(KeyCode::Char(c), true, KeyModifiers::NONE, &mut entry),
+                    route_key(
+                        KeyCode::Char(c),
+                        true,
+                        KeyModifiers::NONE,
+                        (80, 24),
+                        &mut model
+                    ),
                     KeyRoute::Box { send: None }
                 ),
                 "a typed character is the box's"
             );
         }
-        assert_eq!(entry.text, "hi");
+        assert_eq!(model.chat_box.text, "hi");
 
         assert!(
             matches!(
-                route_key(KeyCode::Char('c'), true, KeyModifiers::CONTROL, &mut entry),
+                route_key(
+                    KeyCode::Char('c'),
+                    true,
+                    KeyModifiers::CONTROL,
+                    (80, 24),
+                    &mut model
+                ),
                 KeyRoute::Box { send: None }
             ),
             "a Ctrl combo is the box's"
         );
-        assert_eq!(entry.text, "hi", "a Ctrl combo types nothing");
+        assert_eq!(model.chat_box.text, "hi", "a Ctrl combo types nothing");
 
         assert!(matches!(
-            route_key(KeyCode::Backspace, true, KeyModifiers::NONE, &mut entry),
+            route_key(
+                KeyCode::Backspace,
+                true,
+                KeyModifiers::NONE,
+                (80, 24),
+                &mut model
+            ),
             KeyRoute::Box { send: None }
         ));
-        assert_eq!(entry.text, "h");
+        assert_eq!(model.chat_box.text, "h");
 
         assert!(
             matches!(
-                route_key(KeyCode::Enter, true, KeyModifiers::NONE, &mut entry),
+                route_key(KeyCode::Enter, true, KeyModifiers::NONE, (80, 24), &mut model),
                 KeyRoute::Box {
                     send: Some(line)
                 } if line == "h"
             ),
             "Enter sends the line"
         );
-        assert!(!entry.active, "sending leaves text input mode");
-        assert!(entry.text.is_empty(), "the sent line leaves the box");
+        assert!(!model.chat_box.active, "sending leaves text input mode");
+        assert!(
+            model.chat_box.text.is_empty(),
+            "the sent line leaves the box"
+        );
 
         // An empty Enter sends nothing and keeps the mode; a release in the
         // mode is the box's and changes nothing; a Tab keeps the line and
         // leaves the mode, after which the keys are the game's again.
-        entry.activate();
+        model.chat_box.activate();
         assert!(
             matches!(
-                route_key(KeyCode::Enter, true, KeyModifiers::NONE, &mut entry),
+                route_key(
+                    KeyCode::Enter,
+                    true,
+                    KeyModifiers::NONE,
+                    (80, 24),
+                    &mut model
+                ),
                 KeyRoute::Box { send: None }
             ),
             "an empty Enter sends nothing"
         );
-        assert!(entry.active, "an empty Enter keeps the mode");
+        assert!(model.chat_box.active, "an empty Enter keeps the mode");
 
         for c in ['k', 'e', 'e', 'p'] {
-            let _ = route_key(KeyCode::Char(c), true, KeyModifiers::NONE, &mut entry);
+            let _ = route_key(
+                KeyCode::Char(c),
+                true,
+                KeyModifiers::NONE,
+                (80, 24),
+                &mut model,
+            );
         }
         assert!(matches!(
-            route_key(KeyCode::Char('z'), false, KeyModifiers::NONE, &mut entry),
+            route_key(
+                KeyCode::Char('z'),
+                false,
+                KeyModifiers::NONE,
+                (80, 24),
+                &mut model
+            ),
             KeyRoute::Box { send: None }
         ));
-        assert!(entry.active, "a release keeps the mode");
-        assert_eq!(entry.text, "keep", "a release in the mode changes nothing");
+        assert!(model.chat_box.active, "a release keeps the mode");
+        assert_eq!(
+            model.chat_box.text, "keep",
+            "a release in the mode changes nothing"
+        );
 
         assert!(matches!(
-            route_key(KeyCode::Tab, true, KeyModifiers::NONE, &mut entry),
+            route_key(KeyCode::Tab, true, KeyModifiers::NONE, (80, 24), &mut model),
             KeyRoute::Box { send: None }
         ));
-        assert!(!entry.active, "Tab leaves text input mode");
-        assert_eq!(entry.text, "keep", "Tab keeps the line in the box");
+        assert!(!model.chat_box.active, "Tab leaves text input mode");
+        assert_eq!(model.chat_box.text, "keep", "Tab keeps the line in the box");
 
         assert!(
             matches!(
-                route_key(KeyCode::Char('z'), false, KeyModifiers::NONE, &mut entry),
+                route_key(
+                    KeyCode::Char('z'),
+                    false,
+                    KeyModifiers::NONE,
+                    (80, 24),
+                    &mut model
+                ),
                 KeyRoute::Game
             ),
             "after Tab the keys are the game's again"
         );
-        assert_eq!(entry.text, "keep");
+        assert_eq!(model.chat_box.text, "keep");
     }
 
     /// Pressing W and polling fires forward movement; releasing it and

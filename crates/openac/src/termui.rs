@@ -8,9 +8,13 @@
 
 use std::collections::VecDeque;
 
+use ac_core::items::{ClientObject, ClientObjectTable};
 use ac_render::scene::Scene;
 use ac_runtime::communication::ChatLine;
-use ac_runtime::session::interface::InterfaceEvent;
+use ac_runtime::inventory::{
+    AppraisalView, ItemCommand, ObjectRef, TradeView, VendorCommand, VendorView,
+};
+use ac_runtime::session::interface::{InterfaceEvent, apply_items_update};
 use ac_runtime::world::{PlayerView, VitalReading};
 use ac_ui::radar::{BlipShape, CompassPoint, RadarSnapshot};
 
@@ -67,6 +71,10 @@ pub struct Layout {
     /// The radar disc, over the viewport's top-right (its foot row holds the
     /// coordinates line).
     pub radar: Rect,
+    /// The item widget (the inventory, a container, the trade, the vendor
+    /// or an appraisal), over the world: a quarter of the width and three
+    /// quarters of the height, just past the vitals.
+    pub widget: Rect,
 }
 
 /// Compute the frame's regions: the world fills the whole grid, the vitals
@@ -117,12 +125,30 @@ pub fn layout(cols: usize, rows: usize) -> Layout {
         w: radar_w,
         h: radar_h,
     };
+    // The item widget: a quarter of the width and three quarters of the
+    // height (the floor keeps its rows legible on a small terminal), just
+    // past the vitals (which stay readable) when the terminal is wide
+    // enough for both.
+    let widget_w = (cols / 4).max(14).min(cols - 2);
+    let widget_h = (3 * rows / 4).max(10).min(rows - 2);
+    let widget_x = if 1 + vitals_w + 1 + widget_w <= cols {
+        vitals_w + 2
+    } else {
+        1
+    };
+    let widget = Rect {
+        x: widget_x.min(cols - widget_w),
+        y: 1,
+        w: widget_w,
+        h: widget_h,
+    };
 
     Layout {
         viewport,
         vitals,
         chat,
         radar,
+        widget,
     }
 }
 
@@ -327,6 +353,115 @@ impl ChatBox {
     }
 }
 
+// -- The item widgets ------------------------------------------------------
+
+/// The widget open over the world (at most one at a time): the player's own
+/// packs, the contents of an open container, the open secure trade, the open
+/// vendor's shop, or an appraisal answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Widget {
+    #[default]
+    None,
+    /// The player's pack, its side packs and what is worn.
+    Inventory,
+    /// The contents of an open container (a ground container or a pack).
+    Container(u32),
+    /// The open secure trade.
+    Trade,
+    /// The open vendor's shop.
+    Vendor,
+    /// An appraisal answer.
+    Appraise,
+}
+
+/// One key that can act on the open widget (the terminal maps its keys to
+/// these; the navigation keys are consumed, the rest may send a request).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WidgetKey {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    /// The primary action on the selected row (an inventory's use, a
+    /// container's take, a vendor's buy of the listing).
+    Enter,
+    /// Appraise the selected row's item.
+    Appraise,
+    /// Drop the selected row's item on the ground.
+    Drop,
+    /// Add: the container's take-all, the trade's offer, the vendor's +1.
+    Add,
+    /// Buy everything staged (a vendor).
+    BuyAll,
+    /// Sell everything staged (a vendor).
+    SellAll,
+    /// Accept, decline or reset (a trade).
+    Accept,
+    Decline,
+    Reset,
+    /// Take the selected staged row off its list (a vendor).
+    Back,
+}
+
+/// What a widget row is: the widget's keys act on it by its kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    /// An item the player carries (a pack, an equipment, a container, a
+    /// trade or a vendor row).
+    Item,
+    /// A side pack (its use opens it).
+    Pack,
+    /// A listed item at the open vendor.
+    Shop,
+    /// A row on the vendor's buy or sell list.
+    Buy,
+    Sell,
+    /// A plain line (a section header, a count, the purse, a property).
+    Plain,
+}
+
+/// One row of the open widget: its text and what its keys act on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WidgetRow {
+    /// The row's text.
+    pub text: String,
+    /// The item its keys act on (`None` on a plain line).
+    pub guid: Option<u32>,
+    /// What the widget's keys do to it.
+    pub kind: RowKind,
+}
+
+/// A plain row (a section header, a count, the purse, a property).
+fn plain(text: impl Into<String>) -> WidgetRow {
+    WidgetRow {
+        text: text.into(),
+        guid: None,
+        kind: RowKind::Plain,
+    }
+}
+
+/// One item's row text: its name (plural for a stack) and the stack's count.
+fn item_text(item: &ClientObject) -> String {
+    let name = item.appropriate_name().into_owned();
+    if item.stack_size > 1 {
+        format!("{name} x{}", item.stack_size)
+    } else {
+        name
+    }
+}
+
+/// A vendor list row's text: its name, count and price.
+fn staged_text(name: &str, quantity: i32, price: i32) -> String {
+    format!("{name} x{quantity}  {price}p")
+}
+
+/// A yes/no word (the trade's acceptances).
+fn word(yes: bool) -> &'static str {
+    if yes { "yes" } else { "no" }
+}
+
 /// The 2-D interface's copy of the scene's facts, kept in step each frame.
 #[derive(Default)]
 pub struct Model {
@@ -344,6 +479,26 @@ pub struct Model {
     /// The circular radar: the player's bearing, the nearby blips, and the
     /// coordinates line, folded from the scene each frame.
     radar: RadarSnapshot,
+    /// The item table (the session's copy; the widgets read it).
+    items: ClientObjectTable,
+    /// The widget open, if any (at most one at a time).
+    widget: Widget,
+    /// The widget's selected row (into [`Self::widget_rows`]).
+    widget_sel: usize,
+    /// The widget's first visible row (the wheel's scroll).
+    widget_scroll: usize,
+    /// The widget the appraise opened over (its close returns to it).
+    appraise_under: Option<Widget>,
+    /// The open secure trade, as the session shows it.
+    trade: TradeView,
+    /// The open vendor's shop, if any.
+    vendor: Option<VendorView>,
+    /// The latest appraisal answer (the appraise widget's content).
+    appraisal: Option<AppraisalView>,
+    /// The outside container the player is looking into (0: none).
+    external_container: u32,
+    /// The pack the inventory window shows open (0: none).
+    open_pack: u32,
 }
 
 impl Model {
@@ -407,15 +562,75 @@ impl Model {
         }
     }
 
-    fn apply(&mut self, ev: InterfaceEvent) {
+    pub(crate) fn apply(&mut self, ev: InterfaceEvent) {
         use InterfaceEvent as E;
         match ev {
-            // The selected object's health (its `State` events).
+            // The item table's copy: the widgets' data. A cleared table
+            // (a teleport) empties an open container's contents.
+            E::Items(update) => {
+                if update.reset {
+                    self.open_pack = 0;
+                    if matches!(self.widget, Widget::Container(_)) {
+                        self.widget = Widget::None;
+                    }
+                }
+                apply_items_update(&mut self.items, &update);
+            }
             E::State(s) => {
+                // The selected object's health (its `State` events).
                 self.target_hp = s
                     .selected_health
                     .filter(|h| self.target_guid.is_some_and(|g| g == h.object_id))
                     .and_then(|h| h.percent);
+                // The outside container the player is looking into.
+                if s.external_container != self.external_container {
+                    self.external_container = s.external_container;
+                    if s.external_container != 0 {
+                        self.open_widget(Widget::Container(s.external_container));
+                    } else if let Widget::Container(g) = self.widget
+                        && g != self.open_pack
+                    {
+                        self.widget = Widget::None;
+                    }
+                }
+            }
+            // A pack the player carries was used: the widget opens on it.
+            E::OpenContainedContainer(g) => {
+                self.open_pack = g;
+                self.open_widget(Widget::Container(g));
+            }
+            E::Trade(t) => {
+                let open = t.open;
+                self.trade = *t;
+                if open {
+                    self.open_widget(Widget::Trade);
+                } else if self.widget == Widget::Trade {
+                    self.widget = Widget::None;
+                }
+            }
+            E::Vendor(v) => match v {
+                Some(v) => {
+                    self.vendor = Some(*v);
+                    self.open_widget(Widget::Vendor);
+                }
+                None => {
+                    self.vendor = None;
+                    if self.widget == Widget::Vendor {
+                        self.widget = Widget::None;
+                    }
+                }
+            },
+            E::Appraisal(a) => {
+                let opens = a.opens_window;
+                self.appraisal = Some(*a);
+                if opens {
+                    if self.widget != Widget::Appraise {
+                        self.appraise_under = Some(self.widget);
+                    }
+                    self.widget = Widget::Appraise;
+                    self.widget_sel = 0;
+                    self.widget_scroll = 0;
+                }
             }
             E::Selection(sel) => {
                 if let Some(g) = sel {
@@ -433,6 +648,490 @@ impl Model {
             }
             _ => {}
         }
+    }
+
+    /// Open `w` (its selection and scroll start at the top).
+    fn open_widget(&mut self, w: Widget) {
+        if self.widget != w {
+            self.widget = w;
+            self.widget_sel = 0;
+            self.widget_scroll = 0;
+        }
+    }
+
+    // -- The item widgets ----------------------------------------------
+
+    /// A widget is open.
+    #[must_use]
+    pub fn widget_open(&self) -> bool {
+        self.widget != Widget::None
+    }
+
+    /// The open widget's title line.
+    #[must_use]
+    pub fn widget_title(&self) -> String {
+        match self.widget {
+            Widget::None => String::new(),
+            Widget::Inventory => "backpack".into(),
+            Widget::Container(g) => self
+                .items
+                .get(g)
+                .map(|o| o.appropriate_name().into_owned())
+                .unwrap_or_else(|| "container".into()),
+            Widget::Trade => match &self.trade.partner_name {
+                Some(name) => format!("trade: {name}"),
+                None => format!("trade: 0x{:08X}", self.trade.partner_guid),
+            },
+            Widget::Vendor => match self.vendor.as_ref().and_then(|v| v.name.clone()) {
+                Some(name) => format!("vendor: {name}"),
+                None => "vendor".into(),
+            },
+            Widget::Appraise => self
+                .appraisal
+                .as_ref()
+                .and_then(|a| a.name.clone())
+                .unwrap_or_else(|| "appraise".into()),
+        }
+    }
+
+    /// The open widget's keys' line.
+    #[must_use]
+    pub fn widget_footer(&self) -> &'static str {
+        match self.widget {
+            Widget::None => "",
+            Widget::Inventory => "enter use · e appraise",
+            Widget::Container(_) => "enter take · a take all",
+            Widget::Trade => "a offer · y accept · esc",
+            Widget::Vendor => "a add · b buy · s sell",
+            Widget::Appraise => "esc close",
+        }
+    }
+
+    /// The open widget's rows, whole (the draw and the keys window them).
+    #[must_use]
+    pub fn widget_rows(&self, width: usize) -> Vec<WidgetRow> {
+        match self.widget {
+            Widget::None => Vec::new(),
+            Widget::Inventory => self.inventory_rows(),
+            Widget::Container(g) => self.container_rows(g),
+            Widget::Trade => self.trade_rows(),
+            Widget::Vendor => self.vendor_rows(),
+            Widget::Appraise => self.appraise_rows(width.saturating_sub(2).max(8)),
+        }
+    }
+
+    fn inventory_rows(&self) -> Vec<WidgetRow> {
+        let mut rows = Vec::new();
+        let pack: Vec<u32> = self.items.get_contents(self.player_guid).to_vec();
+        if pack.is_empty() {
+            rows.push(plain("(empty)"));
+        }
+        for &g in &pack {
+            let Some(item) = self.items.get(g) else {
+                continue;
+            };
+            if item.container_type_hint == 1 || item.items_capacity > 0 {
+                let n = self.items.get_contents(g).len();
+                rows.push(WidgetRow {
+                    text: format!("{} ({n} items)", item.appropriate_name()),
+                    guid: Some(g),
+                    kind: RowKind::Pack,
+                });
+            } else {
+                rows.push(WidgetRow {
+                    text: item_text(item),
+                    guid: Some(g),
+                    kind: RowKind::Item,
+                });
+            }
+        }
+        let equipped = self.items.get_equipped_by(self.player_guid);
+        if !equipped.is_empty() {
+            rows.push(plain("equipped:"));
+            for o in equipped {
+                rows.push(WidgetRow {
+                    text: item_text(o),
+                    guid: Some(o.object_id()),
+                    kind: RowKind::Item,
+                });
+            }
+        }
+        rows
+    }
+
+    fn container_rows(&self, guid: u32) -> Vec<WidgetRow> {
+        let mut rows = Vec::new();
+        for &g in self.items.get_contents(guid) {
+            if let Some(item) = self.items.get(g) {
+                rows.push(WidgetRow {
+                    text: item_text(item),
+                    guid: Some(g),
+                    kind: RowKind::Item,
+                });
+            }
+        }
+        if rows.is_empty() {
+            rows.push(plain("(empty)"));
+        }
+        rows
+    }
+
+    fn trade_rows(&self) -> Vec<WidgetRow> {
+        let t = &self.trade;
+        let name = |m: &Model, g: u32| {
+            t.item_names
+                .get(&g)
+                .cloned()
+                .or_else(|| m.items.get(g).map(item_text))
+                .unwrap_or_else(|| format!("item 0x{g:08X}"))
+        };
+        let mut rows = vec![plain("you:")];
+        for &g in &t.self_items {
+            rows.push(WidgetRow {
+                text: name(self, g),
+                guid: Some(g),
+                kind: RowKind::Item,
+            });
+        }
+        rows.push(plain("them:"));
+        for &g in &t.partner_items {
+            rows.push(WidgetRow {
+                text: name(self, g),
+                guid: None,
+                kind: RowKind::Plain,
+            });
+        }
+        // The player's not-yet-offered items (an offer's source).
+        let offered: std::collections::HashSet<u32> = t.self_items.iter().copied().collect();
+        let pack = self
+            .items
+            .get_contents(self.player_guid)
+            .iter()
+            .copied()
+            .filter(|g| !offered.contains(g))
+            .collect::<Vec<_>>();
+        if !pack.is_empty() {
+            rows.push(plain("pack:"));
+            for g in pack {
+                if let Some(item) = self.items.get(g) {
+                    rows.push(WidgetRow {
+                        text: item_text(item),
+                        guid: Some(g),
+                        kind: RowKind::Item,
+                    });
+                }
+            }
+        }
+        if t.self_accepted || t.partner_accepted {
+            rows.push(plain(format!(
+                "accepted: you {}, them {}",
+                word(t.self_accepted),
+                word(t.partner_accepted)
+            )));
+        }
+        rows
+    }
+
+    fn vendor_rows(&self) -> Vec<WidgetRow> {
+        let Some(v) = self.vendor.as_ref() else {
+            return vec![plain("(no shop)")];
+        };
+        let mut rows = vec![plain("shop:")];
+        for item in &v.items {
+            let mut text = item
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("item 0x{:08X}", item.item_guid));
+            if item.stack_size > 0 {
+                text.push_str(&format!(" x{}", item.stack_size));
+            }
+            if let Some(price) = v.price(item.item_guid, 1) {
+                text.push_str(&format!("  {price}p"));
+            }
+            rows.push(WidgetRow {
+                text,
+                guid: Some(item.item_guid),
+                kind: RowKind::Shop,
+            });
+        }
+        if !v.lists.buying.is_empty() {
+            rows.push(plain("buy:"));
+            for r in &v.lists.buying {
+                rows.push(WidgetRow {
+                    text: staged_text(&r.name, r.quantity, r.price),
+                    guid: Some(r.item_guid),
+                    kind: RowKind::Buy,
+                });
+            }
+        }
+        if !v.lists.selling.is_empty() {
+            rows.push(plain("sell:"));
+            for r in &v.lists.selling {
+                rows.push(WidgetRow {
+                    text: staged_text(&r.name, r.quantity, r.price),
+                    guid: Some(r.item_guid),
+                    kind: RowKind::Sell,
+                });
+            }
+        }
+        // The player's items (the sell list's source).
+        let mut own: Vec<u32> = self.items.get_contents(self.player_guid).to_vec();
+        for o in self.items.get_equipped_by(self.player_guid) {
+            own.push(o.object_id());
+        }
+        if !own.is_empty() {
+            rows.push(plain("you:"));
+            for g in own {
+                if let Some(item) = self.items.get(g) {
+                    rows.push(WidgetRow {
+                        text: item_text(item),
+                        guid: Some(g),
+                        kind: RowKind::Item,
+                    });
+                }
+            }
+        }
+        rows.push(WidgetRow {
+            text: v.lists.purse_text.clone(),
+            guid: None,
+            kind: RowKind::Plain,
+        });
+        rows
+    }
+
+    fn appraise_rows(&self, width: usize) -> Vec<WidgetRow> {
+        let Some(a) = self.appraisal.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        if let Some(name) = &a.name {
+            rows.push(plain(name.clone()));
+        }
+        for (name, value) in a.property_lines() {
+            // A long line wraps over the widget's width.
+            for line in wrap(&format!("{name}: {value}"), width) {
+                rows.push(plain(line));
+            }
+        }
+        rows
+    }
+
+    /// A click in the widget's region at cell `(col, row)` of a terminal
+    /// this `cols` × `rows`: the left button selects the row under the
+    /// pointer, the right appraises its item. `None` on the title and keys'
+    /// lines and on rows with no item.
+    #[must_use]
+    pub fn widget_click(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        row: u16,
+        left: bool,
+    ) -> Option<ItemCommand> {
+        let r = layout(cols, rows).widget;
+        let visible = r.h.saturating_sub(2);
+        let y = row as usize;
+        if y < r.y + 1 || y >= r.y + 1 + visible {
+            return None;
+        }
+        let index = (y - r.y - 1) + self.widget_scroll;
+        let all = self.widget_rows(r.w);
+        let target = all.get(index)?;
+        let guid = target.guid?;
+        self.widget_sel = index;
+        if left {
+            None
+        } else {
+            Some(ItemCommand::Appraise(ObjectRef::Guid(guid)))
+        }
+    }
+
+    /// A wheel notch (±1) over the widget: it scrolls its rows, clamped.
+    pub fn widget_wheel(&mut self, delta: i32, cols: usize, rows: usize) {
+        let r = layout(cols, rows).widget;
+        let visible = r.h.saturating_sub(2);
+        let len = self.widget_rows(r.w).len();
+        let max = len.saturating_sub(visible);
+        let mut scroll = self.widget_scroll;
+        if delta > 0 {
+            scroll = scroll.saturating_add(delta as usize).min(max);
+        } else {
+            scroll = scroll.saturating_sub(delta.unsigned_abs() as usize);
+        }
+        self.widget_scroll = scroll;
+    }
+
+    /// A key on the open widget: the navigation keys move the selection
+    /// (kept in view); the others return the requests they send (empty when
+    /// the key applies to nothing the selection stands on).
+    #[must_use]
+    pub fn widget_key(&mut self, key: WidgetKey, cols: usize, rows: usize) -> Vec<ItemCommand> {
+        let r = layout(cols, rows).widget;
+        let visible = r.h.saturating_sub(2).max(1);
+        let all = self.widget_rows(r.w);
+        let len = all.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        self.widget_sel = self.widget_sel.min(len - 1);
+        match key {
+            WidgetKey::Up => {
+                self.widget_sel = self.widget_sel.saturating_sub(1);
+            }
+            WidgetKey::Down => {
+                self.widget_sel = (self.widget_sel + 1).min(len - 1);
+            }
+            WidgetKey::PageUp => {
+                self.widget_sel = self.widget_sel.saturating_sub(visible);
+            }
+            WidgetKey::PageDown => {
+                self.widget_sel = (self.widget_sel + visible).min(len - 1);
+            }
+            WidgetKey::Home => {
+                self.widget_sel = 0;
+            }
+            WidgetKey::End => {
+                self.widget_sel = len - 1;
+            }
+            _ => {}
+        }
+        // Keep the selection in view.
+        if self.widget_sel < self.widget_scroll {
+            self.widget_scroll = self.widget_sel;
+        } else if self.widget_sel >= self.widget_scroll + visible {
+            self.widget_scroll = self.widget_sel + 1 - visible;
+        }
+        let selected = all[self.widget_sel].clone();
+        self.widget_command(key, selected.kind, selected.guid)
+    }
+
+    /// What `key` does to the selected row (the widget's action table).
+    fn widget_command(&self, key: WidgetKey, kind: RowKind, guid: Option<u32>) -> Vec<ItemCommand> {
+        use ItemCommand as C;
+        use RowKind as R;
+        match (self.widget, key) {
+            // The trade's and the vendor's whole-window keys.
+            (Widget::Trade, WidgetKey::Accept) => vec![C::AcceptTrade],
+            (Widget::Trade, WidgetKey::Decline) => vec![C::DeclineTrade],
+            (Widget::Trade, WidgetKey::Reset) => vec![C::ResetTrade],
+            (Widget::Vendor, WidgetKey::BuyAll) => vec![C::Vendor(VendorCommand::BuyAll)],
+            (Widget::Vendor, WidgetKey::SellAll) => vec![C::Vendor(VendorCommand::SellAll)],
+            (Widget::Container(c), WidgetKey::Add) => self
+                .items
+                .get_contents(c)
+                .iter()
+                .copied()
+                .map(|g| self.take_command(c, ObjectRef::Guid(g)))
+                .collect(),
+            // The keys that act on the selected row's item.
+            _ => {
+                let Some(guid) = guid else {
+                    return Vec::new();
+                };
+                let reference = ObjectRef::Guid(guid);
+                match (self.widget, key) {
+                    (Widget::Inventory, WidgetKey::Enter) => vec![C::Use(reference)],
+                    (Widget::Inventory, WidgetKey::Appraise) => vec![C::Appraise(reference)],
+                    (Widget::Inventory, WidgetKey::Drop) => {
+                        vec![C::Drop {
+                            item: reference,
+                            amount: 0,
+                        }]
+                    }
+                    (Widget::Container(c), WidgetKey::Enter) => {
+                        vec![self.take_command(c, reference)]
+                    }
+                    (Widget::Container(_), WidgetKey::Appraise) => vec![C::Appraise(reference)],
+                    (Widget::Trade, WidgetKey::Add) if kind == R::Item => {
+                        vec![C::AddToTrade(reference)]
+                    }
+                    (Widget::Vendor, WidgetKey::Enter) if kind == R::Shop => {
+                        vec![C::Buy(vec![(reference, 1)])]
+                    }
+                    (Widget::Vendor, WidgetKey::Add) if kind == R::Shop || kind == R::Buy => {
+                        vec![C::Vendor(VendorCommand::AddToBuyList {
+                            item: reference,
+                            amount: 1,
+                        })]
+                    }
+                    (Widget::Vendor, WidgetKey::Add) if kind == R::Item || kind == R::Sell => {
+                        vec![C::Vendor(VendorCommand::AddToSellList(reference))]
+                    }
+                    (Widget::Vendor, WidgetKey::Back) if kind == R::Buy => {
+                        vec![C::Vendor(VendorCommand::RemoveFromBuyList {
+                            item: reference,
+                            amount: -1,
+                        })]
+                    }
+                    (Widget::Vendor, WidgetKey::Back) if kind == R::Sell => {
+                        vec![C::Vendor(VendorCommand::RemoveFromSellList(reference))]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+        }
+    }
+
+    /// Take one item out of the open container `c`: its contents are
+    /// picked up, a pack's are moved to the main pack.
+    fn take_command(&self, c: u32, item: ObjectRef) -> ItemCommand {
+        if self.is_pack(c) {
+            ItemCommand::MoveToContainer {
+                item,
+                container: ObjectRef::Player,
+                slot: -1,
+                amount: 0,
+                join_stack: true,
+            }
+        } else {
+            ItemCommand::PickUp(item)
+        }
+    }
+
+    /// `c` is one of the player's packs (not a ground container).
+    fn is_pack(&self, c: u32) -> bool {
+        self.items
+            .get(c)
+            .is_some_and(|o| o.container_id == self.player_guid)
+    }
+
+    /// The open widget's close (its Esc): the requests closing it sends, if
+    /// any. An appraise returns to the widget it opened over.
+    #[must_use]
+    pub fn widget_close(&mut self) -> Vec<ItemCommand> {
+        use ItemCommand as C;
+        let commands = match self.widget {
+            Widget::None | Widget::Inventory | Widget::Appraise => Vec::new(),
+            Widget::Container(g) if self.is_pack(g) => {
+                self.open_pack = 0;
+                vec![C::SetOpenPack(0)]
+            }
+            Widget::Container(g) => vec![C::StopViewing(ObjectRef::Guid(g))],
+            Widget::Trade => vec![C::CloseTrade],
+            Widget::Vendor => vec![C::Vendor(VendorCommand::Close)],
+        };
+        let under = if self.widget == Widget::Appraise {
+            self.appraise_under.take()
+        } else {
+            None
+        };
+        self.appraise_under = None;
+        self.widget = under.unwrap_or(Widget::None);
+        self.widget_sel = 0;
+        self.widget_scroll = 0;
+        commands
+    }
+
+    /// The inventory's key: open the inventory widget, or close it when it
+    /// is the one open.
+    pub fn widget_toggle_inventory(&mut self) {
+        if self.widget == Widget::Inventory {
+            self.widget = Widget::None;
+        } else {
+            self.open_widget(Widget::Inventory);
+        }
+        self.widget_sel = 0;
+        self.widget_scroll = 0;
     }
 }
 
@@ -511,6 +1210,46 @@ pub fn draw(g: &mut Grid, m: &Model, l: &Layout) {
     draw_radar(g, &m.radar, l.radar);
     // The chat feed, bottom.
     draw_chat(g, m, l.chat);
+    // The item widget, over the world (it paints last: it is open over the
+    // rest).
+    if m.widget_open() {
+        draw_widget(g, m, l.widget);
+    }
+}
+
+/// The open widget over the world: its title, its rows (the selection
+/// marked, the wheel's window) and its keys' line — plain text, no frame.
+fn draw_widget(g: &mut Grid, m: &Model, r: Rect) {
+    let title = m.widget_title();
+    let rows = m.widget_rows(r.w);
+    let visible = r.h.saturating_sub(2);
+    let len = rows.len();
+    let scroll = m.widget_scroll.min(len.saturating_sub(visible));
+    g.put_str(r.x, r.y, &title, TITLE, BG);
+    // The wheel's window over a long list.
+    if len > visible && visible > 0 {
+        let last = (scroll + visible).min(len);
+        g.put_str(
+            r.x + title.chars().count(),
+            r.y,
+            &format!("  [{scroll}-{last} of {len}]"),
+            DIM,
+            BG,
+        );
+    }
+    for (i, row) in rows.iter().skip(scroll).take(visible).enumerate() {
+        let selected = i + scroll == m.widget_sel && row.kind != RowKind::Plain;
+        let fg = if selected {
+            GOLD
+        } else if row.kind == RowKind::Plain {
+            DIM
+        } else {
+            TEXT
+        };
+        let mark = if selected { ">" } else { " " };
+        g.put_str(r.x, r.y + 1 + i, &format!("{mark} {}", row.text), fg, BG);
+    }
+    g.put_str(r.x, r.y + r.h - 1, m.widget_footer(), DIM, BG);
 }
 
 /// A vital's readout: `current/max`, or blank until both are known.
@@ -1167,6 +1906,7 @@ mod tests {
             vitals: d,
             chat: d,
             radar: d,
+            widget: d,
         };
         let snapshot = RadarSnapshot {
             player_heading_degrees: 0.0,
@@ -1204,6 +1944,491 @@ mod tests {
             radar_blip_at(&layout, &hidden, 119, 8),
             None,
             "hidden blips"
+        );
+    }
+}
+// -- The item widgets --------------------------------------------------------
+
+#[cfg(test)]
+mod widget_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use ac_core::items::{VendorShopItem, VendorShopProfile};
+    use ac_proto::appraise::IdentifyObjectResponse;
+    use ac_runtime::inventory::{StagedRow, TradeView, VendorCommand, VendorListsView, VendorView};
+    use ac_runtime::session::interface::{InterfaceState, ItemsUpdate};
+
+    const PLAYER: u32 = 900;
+
+    /// One item in the player's main pack.
+    fn item(id: u32, name: &str) -> ClientObject {
+        let mut o = ClientObject::new(id);
+        o.name = name.into();
+        o.container_id = PLAYER;
+        o
+    }
+
+    /// The model: `ids` in the main pack, the widget open.
+    fn model(ids: &[u32], widget: Widget) -> Model {
+        let mut m = Model::new();
+        let objects: Vec<ClientObject> =
+            ids.iter().map(|i| item(*i, &format!("item {i}"))).collect();
+        m.apply(InterfaceEvent::Items(ItemsUpdate {
+            reset: true,
+            objects,
+            removed: Vec::new(),
+            contents: vec![(PLAYER, Some(ids.to_vec()))],
+        }));
+        m.player_guid = PLAYER;
+        m.widget = widget;
+        m
+    }
+
+    /// The widget's rows as (text, kind, guid).
+    fn rows_of(m: &Model) -> Vec<(String, RowKind, Option<u32>)> {
+        let r = layout(100, 30).widget;
+        m.widget_rows(r.w)
+            .into_iter()
+            .map(|row| (row.text, row.kind, row.guid))
+            .collect()
+    }
+
+    /// The widget is a quarter of the width and three quarters of the
+    /// height (with the floors) and sits just past the vitals when the
+    /// terminal is wide enough for both.
+    #[test]
+    fn the_widget_is_a_quarter_of_the_terminal() {
+        // (cols, rows): (widget width, widget height, x)
+        for (cols, rows, w, h, x) in [
+            (100, 30, 25, 22, 18),
+            (80, 24, 20, 18, 18),
+            (40, 12, 14, 10, 18),
+            (30, 12, 14, 10, 1),
+        ] {
+            let r = layout(cols, rows).widget;
+            assert_eq!((r.w, r.h, r.x), (w, h, x), "the widget at {cols} x {rows}");
+        }
+    }
+
+    /// The inventory's rows: the pack's items, a pack marked with its
+    /// contents' count, and the equipped's section.
+    #[test]
+    fn the_inventory_lists_the_pack_the_packs_and_the_equipped() {
+        let mut m = model(&[1, 2, 3, 4], Widget::Inventory);
+        let mut pack = item(3, "a pack");
+        pack.container_type_hint = 1;
+        let mut stacked = item(2, "potion");
+        stacked.plural_name = "potions".into();
+        stacked.stack_size = 5;
+        m.apply(InterfaceEvent::Items(ItemsUpdate {
+            reset: false,
+            objects: vec![pack, stacked],
+            removed: Vec::new(),
+            contents: vec![(PLAYER, Some(vec![1, 2, 3, 4])), (3, Some(vec![7]))],
+        }));
+        let rows = rows_of(&m);
+        assert_eq!(
+            rows.iter()
+                .map(|(t, k, _)| (t.as_str(), k))
+                .collect::<Vec<_>>(),
+            vec![
+                ("item 1", &RowKind::Item),
+                ("potions x5", &RowKind::Item),
+                ("a pack (1 items)", &RowKind::Pack),
+                ("item 4", &RowKind::Item),
+            ],
+            "the pack's rows"
+        );
+        // The equipped's section: a weapon in the main hand.
+        let mut sword = item(5, "a sword");
+        sword.wielder_id = PLAYER;
+        sword.currently_equipped_location = ac_core::items::EquipMask::TWO_HANDED;
+        m.apply(InterfaceEvent::Items(ItemsUpdate {
+            reset: false,
+            objects: vec![sword],
+            removed: Vec::new(),
+            contents: vec![],
+        }));
+        let rows = rows_of(&m);
+        assert_eq!(
+            rows.last().map(|r| (r.0.as_str(), r.1, r.2)),
+            Some(("a sword", RowKind::Item, Some(5))),
+            "the equipped's section: {rows:?}"
+        );
+    }
+
+    /// The wheel scrolls the rows, clamped at the top and the bottom.
+    #[test]
+    fn the_wheel_scrolls_the_widget_clamped() {
+        let ids: Vec<u32> = (1..=25).collect();
+        let mut m = model(&ids, Widget::Inventory);
+        // At 100 x 30 the widget shows 20 rows: the 25 rows scroll 0..=5.
+        m.widget_wheel(1, 100, 30);
+        assert_eq!(m.widget_scroll, 1, "one notch down");
+        m.widget_wheel(100, 100, 30);
+        assert_eq!(m.widget_scroll, 5, "clamped at the bottom");
+        m.widget_wheel(-100, 100, 30);
+        assert_eq!(m.widget_scroll, 0, "clamped at the top");
+    }
+
+    /// A click selects the row under the pointer (the left button) and a
+    /// right click appraises its item; the title's and keys' rows do
+    /// nothing.
+    #[test]
+    fn a_click_selects_and_appraises_the_row_under_the_pointer() {
+        let mut m = model(&[1, 2, 3], Widget::Inventory);
+        // The widget at 100 x 30: x 18, y 1, w 25, h 22 — the rows run
+        // from y 2.
+        assert!(
+            m.widget_click(100, 30, 1, true).is_none(),
+            "the title's row"
+        );
+        assert!(
+            m.widget_click(100, 30, 1, false).is_none(),
+            "a right click on the title's row"
+        );
+        assert!(m.widget_click(100, 30, 23, true).is_none(), "the keys' row");
+        assert!(m.widget_click(100, 30, 5, true).is_none(), "past the rows");
+        let _ = m.widget_click(100, 30, 4, true);
+        assert_eq!(m.widget_sel, 2, "a left click selects the row");
+        assert_eq!(
+            m.widget_click(100, 30, 4, false),
+            Some(ItemCommand::Appraise(ObjectRef::Guid(3))),
+            "a right click appraises"
+        );
+    }
+
+    /// The keys' table: what each key sends to the session, per widget.
+    #[test]
+    fn the_widget_keys_send_their_commands() {
+        use ItemCommand as C;
+        use WidgetKey as K;
+
+        // Inventory: Enter uses, e appraises, d drops.
+        let mut m = model(&[1, 2], Widget::Inventory);
+        assert_eq!(
+            m.widget_key(K::Enter, 100, 30),
+            vec![C::Use(ObjectRef::Guid(1))]
+        );
+        assert_eq!(
+            m.widget_key(K::Appraise, 100, 30),
+            vec![C::Appraise(ObjectRef::Guid(1))]
+        );
+        let _ = m.widget_key(K::Down, 100, 30);
+        assert_eq!(
+            m.widget_key(K::Drop, 100, 30),
+            vec![C::Drop {
+                item: ObjectRef::Guid(2),
+                amount: 0
+            }]
+        );
+
+        // A ground container: Enter picks its selected item up, a takes
+        // everything.
+        let mut m = model(&[], Widget::Container(500));
+        let mut a = ClientObject::new(501);
+        a.name = "a coin".into();
+        let mut b = ClientObject::new(502);
+        b.name = "a key".into();
+        m.apply(InterfaceEvent::Items(ItemsUpdate {
+            reset: false,
+            objects: vec![a, b],
+            removed: Vec::new(),
+            contents: vec![(500, Some(vec![501, 502]))],
+        }));
+        assert_eq!(
+            m.widget_key(K::Enter, 100, 30),
+            vec![C::PickUp(ObjectRef::Guid(501))]
+        );
+        assert_eq!(
+            m.widget_key(K::Add, 100, 30),
+            vec![
+                C::PickUp(ObjectRef::Guid(501)),
+                C::PickUp(ObjectRef::Guid(502))
+            ],
+            "a takes everything"
+        );
+
+        // A carried pack: Enter moves its item to the main pack.
+        let mut pack = ClientObject::new(600);
+        pack.name = "a pack".into();
+        pack.container_id = PLAYER;
+        let mut held = ClientObject::new(601);
+        held.name = "a bolt".into();
+        let mut m = Model::new();
+        m.apply(InterfaceEvent::Items(ItemsUpdate {
+            reset: true,
+            objects: vec![pack, held],
+            removed: Vec::new(),
+            contents: vec![(PLAYER, Some(vec![600])), (600, Some(vec![601]))],
+        }));
+        m.player_guid = PLAYER;
+        m.widget = Widget::Container(600);
+        assert_eq!(
+            m.widget_key(K::Enter, 100, 30),
+            vec![C::MoveToContainer {
+                item: ObjectRef::Guid(601),
+                container: ObjectRef::Player,
+                slot: -1,
+                amount: 0,
+                join_stack: true
+            }]
+        );
+
+        // Navigation: the selection moves and stays in view.
+        let mut m = model(&[1, 2, 3, 4, 5, 6, 7, 8, 9], Widget::Inventory);
+        let _ = m.widget_key(K::End, 100, 30);
+        assert_eq!(m.widget_sel, 8, "End");
+        let _ = m.widget_key(K::Home, 100, 30);
+        assert_eq!(m.widget_sel, 0, "Home");
+        let _ = m.widget_key(K::Down, 100, 30);
+        assert_eq!(m.widget_sel, 1, "Down");
+        let _ = m.widget_key(K::Up, 100, 30);
+        let _ = m.widget_key(K::Up, 100, 30);
+        assert_eq!(m.widget_sel, 0, "Up, clamped");
+
+        // A trade: a offers the selected item, y/n/r decide.
+        let mut m = model(&[1, 2, 3], Widget::Trade);
+        m.trade = TradeView {
+            open: true,
+            partner_guid: 77,
+            partner_name: Some("the partner".into()),
+            self_items: Vec::new(),
+            partner_items: vec![30],
+            ..TradeView::default()
+        };
+        let rows = rows_of(&m);
+        let pack = rows.iter().position(|(t, _, _)| t == "pack:").unwrap();
+        m.widget_sel = pack + 1; // 0x1, from the pack
+        assert_eq!(
+            m.widget_key(K::Add, 100, 30),
+            vec![C::AddToTrade(ObjectRef::Guid(1))]
+        );
+        assert_eq!(m.widget_key(K::Accept, 100, 30), vec![C::AcceptTrade]);
+        assert_eq!(m.widget_key(K::Decline, 100, 30), vec![C::DeclineTrade]);
+        assert_eq!(m.widget_key(K::Reset, 100, 30), vec![C::ResetTrade]);
+        // A partner's item takes no key: it has no guid.
+        let them = rows.iter().position(|(t, _, _)| t == "them:").unwrap();
+        m.widget_sel = them + 1;
+        assert!(
+            m.widget_key(K::Add, 100, 30).is_empty(),
+            "the partner's rows"
+        );
+
+        // A vendor: Enter buys one, a lists, b/s take the lot, Backspace
+        // unlists.
+        let mut m = model(&[1], Widget::Vendor);
+        m.vendor = Some(VendorView {
+            vendor_guid: 88,
+            name: Some("the shop".into()),
+            profile: VendorShopProfile {
+                sell_price: 2.0,
+                ..VendorShopProfile::default()
+            },
+            items: vec![VendorShopItem {
+                item_guid: 21,
+                name: Some("an apple".into()),
+                stack_size: 10,
+                value: Some(10),
+                desc_stack_size: Some(1),
+                ..VendorShopItem::default()
+            }],
+            lists: VendorListsView {
+                buying: vec![StagedRow {
+                    item_guid: 21,
+                    name: "an apple".into(),
+                    quantity: 3,
+                    price: 60,
+                }],
+                purse_text: "You have 500p".into(),
+                ..VendorListsView::default()
+            },
+            reason: ac_runtime::inventory::VendorViewReason::Opened,
+        });
+        let rows = rows_of(&m);
+        let shop_row = rows.iter().position(|r| r.1 == RowKind::Shop).unwrap();
+        assert_eq!(
+            rows[shop_row].0, "an apple x10  20p",
+            "the listing's stock and price"
+        );
+        m.widget_sel = shop_row;
+        assert_eq!(
+            m.widget_key(K::Enter, 100, 30),
+            vec![C::Buy(vec![(ObjectRef::Guid(21), 1)])]
+        );
+        assert_eq!(
+            m.widget_key(K::Add, 100, 30),
+            vec![C::Vendor(VendorCommand::AddToBuyList {
+                item: ObjectRef::Guid(21),
+                amount: 1
+            })]
+        );
+        assert_eq!(
+            m.widget_key(K::BuyAll, 100, 30),
+            vec![C::Vendor(VendorCommand::BuyAll)]
+        );
+        assert_eq!(
+            m.widget_key(K::SellAll, 100, 30),
+            vec![C::Vendor(VendorCommand::SellAll)]
+        );
+        let buy_row = rows.iter().position(|r| r.1 == RowKind::Buy).unwrap();
+        m.widget_sel = buy_row;
+        assert_eq!(
+            m.widget_key(K::Back, 100, 30),
+            vec![C::Vendor(VendorCommand::RemoveFromBuyList {
+                item: ObjectRef::Guid(21),
+                amount: -1
+            })]
+        );
+        // Selling: a on one's own item.
+        let you_row = rows.iter().position(|r| r.0 == "you:").unwrap() + 1;
+        m.widget_sel = you_row;
+        assert_eq!(
+            m.widget_key(K::Add, 100, 30),
+            vec![C::Vendor(VendorCommand::AddToSellList(ObjectRef::Guid(1)))]
+        );
+    }
+
+    /// The close (its Esc): what each widget sends on the way out.
+    #[test]
+    fn the_close_sends_its_widget_s_requests() {
+        use ItemCommand as C;
+
+        let mut m = model(&[1], Widget::Trade);
+        assert_eq!(m.widget_close(), vec![C::CloseTrade]);
+        assert!(!m.widget_open());
+
+        // A ground container asks to stop looking into it; a carried pack
+        // closes on its own (no request the table needs).
+        let mut m = model(&[], Widget::Container(500));
+        assert_eq!(m.widget_close(), vec![C::StopViewing(ObjectRef::Guid(500))]);
+        let mut m = model(&[600], Widget::Container(600));
+        assert_eq!(m.widget_close(), vec![C::SetOpenPack(0)], "a pack's close");
+
+        let mut m = model(&[1], Widget::Vendor);
+        assert_eq!(m.widget_close(), vec![C::Vendor(VendorCommand::Close)]);
+
+        // An appraise returns to the widget it opened over, with no
+        // request.
+        let mut m = model(&[1], Widget::Inventory);
+        m.appraise_under = Some(Widget::Inventory);
+        m.widget = Widget::Appraise;
+        assert!(m.widget_close().is_empty(), "an appraise sends nothing");
+        assert_eq!(m.widget, Widget::Inventory, "it returns to the inventory");
+
+        // The inventory and nothing open send nothing.
+        let mut m = model(&[1], Widget::Inventory);
+        assert!(m.widget_close().is_empty());
+        let mut m = Model::new();
+        assert!(m.widget_close().is_empty(), "nothing open");
+    }
+
+    /// The server's events open and close the widgets: the vendor, the
+    /// trade, the containers, the state's outside container, and the
+    /// appraisal.
+    #[test]
+    fn the_servers_events_open_and_close_the_widgets() {
+        use InterfaceEvent as E;
+        let mut m = model(&[1], Widget::None);
+
+        // The vendor: Some opens it, None closes it.
+        let view = || {
+            Box::new(VendorView {
+                vendor_guid: 88,
+                name: Some("the shop".into()),
+                profile: VendorShopProfile::default(),
+                items: Vec::new(),
+                lists: VendorListsView::default(),
+                reason: ac_runtime::inventory::VendorViewReason::Opened,
+            })
+        };
+        m.apply(E::Vendor(Some(view())));
+        assert!(matches!(m.widget, Widget::Vendor), "the vendor opens");
+        m.apply(E::Vendor(None));
+        assert!(!m.widget_open(), "the vendor closes");
+
+        // The trade: open opens, closed closes (and only the trade's).
+        let trade = |open: bool| {
+            Box::new(TradeView {
+                open,
+                partner_guid: 77,
+                ..TradeView::default()
+            })
+        };
+        m.apply(E::Trade(trade(true)));
+        assert!(matches!(m.widget, Widget::Trade), "the trade opens");
+        m.apply(E::Trade(trade(false)));
+        assert!(!m.widget_open(), "the trade closes");
+
+        // A carried pack opens its container; an item reset empties it.
+        m.apply(E::OpenContainedContainer(300));
+        assert!(matches!(m.widget, Widget::Container(300)), "the pack opens");
+        m.apply(E::Items(ItemsUpdate {
+            reset: true,
+            objects: Vec::new(),
+            removed: Vec::new(),
+            contents: Vec::new(),
+        }));
+        assert!(!m.widget_open(), "a reset closes the container");
+
+        // The state's outside container: non-zero opens, zero closes (a
+        // pack's container stays).
+        let state = |external: u32| {
+            Box::new(InterfaceState {
+                external_container: external,
+                ..InterfaceState::default()
+            })
+        };
+        m.apply(E::State(state(400)));
+        assert!(
+            matches!(m.widget, Widget::Container(400)),
+            "the container opens"
+        );
+        m.apply(E::OpenContainedContainer(300));
+        m.apply(E::State(state(0)));
+        assert!(
+            matches!(m.widget, Widget::Container(300)),
+            "a pack's container is not the outside one"
+        );
+        m.apply(E::State(state(500)));
+        assert!(
+            matches!(m.widget, Widget::Container(500)),
+            "the pack's closes"
+        );
+
+        // The appraisal: opens over the current widget; the close returns.
+        m.apply(E::Items(ItemsUpdate {
+            reset: true,
+            objects: vec![item(1, "an item")],
+            removed: Vec::new(),
+            contents: vec![(PLAYER, Some(vec![1]))],
+        }));
+        m.player_guid = PLAYER;
+        m.widget = Widget::Inventory;
+        let appraisal = Box::new(AppraisalView {
+            name: Some("an item".into()),
+            response: IdentifyObjectResponse {
+                properties: ac_proto::PropertyTables {
+                    ints: BTreeMap::from([(1, 5)]),
+                    ..ac_proto::PropertyTables::default()
+                },
+                ..IdentifyObjectResponse::default()
+            },
+            present_in_ui: true,
+            opens_window: true,
+        });
+        m.apply(E::Appraisal(appraisal));
+        assert!(matches!(m.widget, Widget::Appraise), "the appraise opens");
+        let rows = rows_of(&m);
+        assert!(
+            rows.iter().any(|(t, _, _)| t == "an item"),
+            "the appraise's name: {rows:?}"
+        );
+        let _ = m.widget_close();
+        assert!(
+            matches!(m.widget, Widget::Inventory),
+            "it returns to the inventory"
         );
     }
 }
