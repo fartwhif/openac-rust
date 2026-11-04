@@ -70,11 +70,16 @@ pub struct Layout {
 }
 
 /// Compute the frame's regions: the world fills the whole grid, the vitals
-/// sit over its top-left, and the chat over its bottom.
+/// sit over its top-left, and the chat over its bottom. The vitals and the
+/// radar take the retail windows' share of the screen (the retail's 1280 x
+/// 720 window: the vitals are 160 pixels wide, the radar disc 120).
 pub fn layout(cols: usize, rows: usize) -> Layout {
     let cols = cols.max(30);
     let rows = rows.max(12);
-    let vitals_w = 34.min(cols);
+    // The vitals window (160 pixels wide in the game data) spans one eighth
+    // of the width; the floor keeps the meters' readouts legible on small
+    // terminals.
+    let vitals_w = (cols / 8).max(16).min(cols);
     // The chat area is the transcript rows, the status line and the entry
     // box's row at its foot.
     let chat_h = 5.min(rows);
@@ -97,13 +102,13 @@ pub fn layout(cols: usize, rows: usize) -> Layout {
         w: cols - 2,
         h: chat_h,
     };
-    // The radar disc, over the viewport's top-right: an ellipse twice as
-    // wide as tall (a cell is twice as tall as it is wide, so it reads as a
-    // circle). Its foot row, below the disc, holds the coordinates line.
-    let radar_rx = (cols / 2 - 1).clamp(4, 12);
-    let radar_ry = (radar_rx / 2).max(2);
-    let radar_w = 2 * radar_rx + 1;
-    let radar_h = 2 * radar_ry + 1;
+    // The radar disc, over the viewport's top-right: three thirty-seconds of
+    // the width and a sixth of the height (120 pixels on the retail's
+    // window; a sub-pixel is square, so it reads as a circle at the
+    // retail's window aspect). Its foot row, below the disc, holds the
+    // coordinates line.
+    let radar_w = (3 * cols / 32).max(7).min(cols - 2);
+    let radar_h = (rows / 6).max(4);
     let radar = Rect {
         x: cols.saturating_sub(radar_w + 1),
         y: 1.min(rows.saturating_sub(radar_h)),
@@ -189,9 +194,9 @@ impl Grid {
         }
     }
 
-    /// A labelled meter: a label, a filled bar, and a right-aligned readout
-    /// (e.g. `1500/2500`), all on the row `r` spans. A non-finite `frac`
-    /// reads as empty.
+    /// A labelled meter: a label, a filled bar, and a readout (e.g.
+    /// `1500/2500`) over the bar's right end, as the retail's meter draws
+    /// its numbers. A non-finite `frac` reads as empty.
     fn bar(&mut self, r: Rect, label: &str, frac: f32, full: Rgb, readout: &str) {
         let (x, y, w) = (r.x, r.y, r.w);
         let mut frac = frac.clamp(0.0, 1.0);
@@ -199,22 +204,28 @@ impl Grid {
             frac = 0.0;
         }
         let lw = label.chars().count().max(2);
-        let rw = readout.chars().count().max(3);
-        if w < lw + 1 + 2 + 1 + rw {
+        let bar_w = w.saturating_sub(lw + 1);
+        if bar_w == 0 {
             return;
         }
-        let bar_w = w - lw - 1 - 1 - rw;
         self.put_str(x, y, label, TEXT, BG);
         let bx = x + lw + 1;
         let filled = (frac * bar_w as f32).round() as usize;
+        let readout: Vec<char> = readout.chars().collect();
+        let rw = readout.len();
         for i in 0..bar_w {
-            if i < filled {
+            if rw > 0 && i + rw >= bar_w {
+                // The readout over the bar's end: the number over the fill.
+                // A readout wider than the bar keeps its rightmost part.
+                let ch = readout[i + rw - bar_w];
+                let bg = if i < filled { full } else { BG };
+                self.put(bx + i, y, ch, TEXT, bg);
+            } else if i < filled {
                 self.put(bx + i, y, '█', full, BG);
             } else {
                 self.put(bx + i, y, '░', DIM, BG);
             }
         }
-        self.put_str(x + w - rw, y, readout, TEXT, BG);
     }
 }
 
@@ -855,12 +866,15 @@ mod tests {
         assert!(line(9).starts_with("  > draft"), "the box: {}", line(9));
     }
     /// The vitals: plain text over the world — no panel or frame. The name's
-    /// background spans only the name (the world shows just past it), and the
-    /// meters keep their labels and current/max readouts.
+    /// background spans only the name (the world shows just past it), the
+    /// meters keep their labels, and the current/max readout sits over the
+    /// bar's right end (the retail's meter) instead of beside it.
     #[test]
     fn the_vitals_sit_as_plain_text_over_the_world() {
         let l = layout(80, 24);
         let r = l.vitals;
+        let cx = r.x + 1;
+        let cw = r.w - 2;
         let mut g = Grid::new(80, 24);
         // A distinctive world behind the vitals.
         g.fill(l.viewport, '⣿', [255, 0, 0], [0, 0, 0]);
@@ -902,17 +916,27 @@ mod tests {
         let past = g.rows()[r.y + 1][r.x + 1 + name.chars().count()].ch;
         assert_eq!(past, '⣿', "the name's background runs past the name");
 
-        // The meters keep their labels and current/max readouts.
-        assert!(
-            row_text(r.y + 2).contains("HP"),
-            "HP label: {:?}",
-            row_text(r.y + 2)
+        // The meters keep their labels, and the readout over the bar's
+        // right end: `HP`, the gap, the fill the readout does not cover,
+        // the number. On this 80-column terminal the vitals are 16 cells:
+        // the bar spans 11 and the 9-character readout covers its right 9.
+        let hp: String = row_text(r.y + 2).chars().skip(cx).take(cw).collect();
+        assert_eq!(hp, "HP⣿██1500/2500", "the HP row");
+        // The readout over the fill keeps the fill as its background, and
+        // past the fill the panel's.
+        assert_eq!(
+            g.rows()[r.y + 2][cx + 3 + 4].bg,
+            HP,
+            "the number over the fill"
         );
-        assert!(
-            row_text(r.y + 2).contains("1500/2500"),
-            "HP: {:?}",
-            row_text(r.y + 2)
+        assert_eq!(
+            g.rows()[r.y + 2][cx + 3 + 8].bg,
+            BG,
+            "the number past the fill"
         );
+        // The row spans the vitals' width and no further: just past it is
+        // still world.
+        assert_eq!(g.rows()[r.y + 2][cx + cw].ch, '⣿', "the row's width");
         assert!(
             row_text(r.y + 3).contains("800/1000"),
             "SP: {:?}",
@@ -922,6 +946,37 @@ mod tests {
             row_text(r.y + 4).contains("400/1000"),
             "MP: {:?}",
             row_text(r.y + 4)
+        );
+    }
+
+    /// The HUD takes the retail windows' share of the screen (the retail's
+    /// 1280 x 720 window: the vitals are 160 pixels wide, the radar disc
+    /// 120), with floors so a small terminal keeps a legible meter and a
+    /// disc with its compass.
+    #[test]
+    fn the_hud_takes_the_retail_share_of_the_screen() {
+        // The shares (no floor in play): one eighth, three thirty-seconds,
+        // a sixth.
+        let l = layout(128, 32);
+        assert_eq!(l.vitals.w, 16, "the vitals are an eighth of the width");
+        assert_eq!(l.radar.w, 12, "the disc is 120 pixels of 1280");
+        assert_eq!(l.radar.h, 5, "the disc is 120 pixels of 720");
+
+        // The floors on a small terminal.
+        let l = layout(80, 24);
+        assert_eq!(l.vitals.w, 16, "the vitals' floor");
+        assert_eq!(l.radar.w, 7, "the disc's floor width");
+        assert_eq!(l.radar.h, 4, "the disc's floor height");
+
+        // A wide terminal keeps the shares.
+        let l = layout(200, 50);
+        assert_eq!(l.vitals.w, 25, "the vitals keep their eighth");
+        assert_eq!(l.radar.w, 18, "the disc keeps its share");
+        assert_eq!(l.radar.h, 8, "the disc keeps its share");
+        // The radar never reaches the vitals.
+        assert!(
+            l.radar.x > l.vitals.x + l.vitals.w,
+            "the radar is clear of the vitals"
         );
     }
 
