@@ -244,6 +244,31 @@ fn tail(s: &str, n: usize) -> String {
     s.chars().skip(count.saturating_sub(n)).collect()
 }
 
+/// `s` as its visual rows at most `n` characters wide (its terminal
+/// wrapping): a row breaks at the last space within the width when one
+/// exists, else hard at the width, and a break's spaces never carry onto
+/// the next row.
+fn wrap(s: &str, n: usize) -> Vec<String> {
+    let n = n.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        if rest.chars().count() <= n {
+            rows.push(rest.to_string());
+            break;
+        }
+        let break_at = rest.char_indices().nth(n).map(|(b, _)| b).unwrap_or(rest.len());
+        let cut = rest[..break_at]
+            .rfind(' ')
+            .filter(|p| *p > 0)
+            .unwrap_or(break_at);
+        rows.push(rest[..cut].to_string());
+        let next = &rest[cut..];
+        rest = next.trim_start_matches(' ');
+    }
+    rows
+}
+
 // -- The semantic model ----------------------------------------------------
 
 /// The chat entry box at the foot of the chat area: the line the player is
@@ -651,15 +676,24 @@ fn draw_chat(g: &mut Grid, m: &Model, r: Rect) {
     // rest the transcript.
     let line_rows = r.h - 2;
     // A chat line may carry embedded newlines (a server multi-line
-    // message); expand each into its visual rows so the last `line_rows`
-    // *rows* are shown and a newline never lands in a cell.
-    let mut rows: Vec<&str> = Vec::new();
+    // message), and a line wider than the area wraps over its visual
+    // rows — the terminal's size sets the wrap, and a line never loses
+    // its tail. The last `line_rows` *rows* are shown, and a newline
+    // never lands in a cell.
+    let mut rows: Vec<String> = Vec::new();
     for line in m.chat.iter() {
-        rows.extend(line.split('\n'));
+        for segment in line.split('\n') {
+            let mut visual = wrap(segment, inner_w);
+            if visual.is_empty() {
+                // An empty segment is still a blank row.
+                visual.push(String::new());
+            }
+            rows.extend(visual);
+        }
     }
     let start = rows.len().saturating_sub(line_rows);
     for (i, row) in rows.iter().skip(start).enumerate() {
-        g.put_str(r.x + 1, r.y + i, &truncate(row, inner_w), TEXT, BG);
+        g.put_str(r.x + 1, r.y + i, row, TEXT, BG);
     }
     if let Some(status) = m.status.back() {
         g.put_str(r.x + 1, r.y + r.h - 2, &truncate(status, inner_w), DIM, BG);
@@ -732,6 +766,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A chat line wider than the area wraps over its visual rows instead
+    /// of losing its tail: it breaks at the last space within the width
+    /// when one exists, hard at the width otherwise, and the transcript
+    /// still shows its newest `line_rows` rows.
+    #[test]
+    fn a_long_chat_line_wraps_to_the_area_width() {
+        let mut m = Model::new();
+        // 43 characters, with spaces; 26 without.
+        m.chat.push_back("the quick brown fox jumps over the lazy dog".into());
+        m.chat.push_back("abcdefghijklmnopqrstuvwxyz".into());
+        let mut g = Grid::new(20, 10);
+        // inner width 14, six transcript rows — all six visual rows show.
+        draw_chat(
+            &mut g,
+            &m,
+            Rect {
+                x: 1,
+                y: 1,
+                w: 16,
+                h: 8,
+            },
+        );
+        let row = |y: usize| -> String { g.rows()[y].iter().map(|c| c.ch).collect() };
+        // The spaced line breaks at the last space within 14.
+        assert_eq!(&row(1)[2..11], "the quick", "first row breaks at a space");
+        assert_eq!(&row(2)[2..11], "brown fox", "second row breaks at a space");
+        assert_eq!(&row(3)[2..12], "jumps over", "third row breaks at a space");
+        // The tail survives: the last words are whole.
+        assert_eq!(&row(4)[2..14], "the lazy dog", "the line's tail is whole");
+        // The spaceless token breaks hard at the width.
+        assert_eq!(&row(5)[2..16], "abcdefghijklmn", "hard break at the width");
+        assert_eq!(&row(6)[2..14], "opqrstuvwxyz", "the token's tail is whole");
     }
 
     /// The encoder's choke point: any text source (chat, status, a player
