@@ -106,11 +106,13 @@ pub fn layout(cols: usize, rows: usize) -> Layout {
     // the width and a sixth of the height (120 pixels on the retail's
     // window; a sub-pixel is square, so it reads as a circle at the
     // retail's window aspect). Its foot row, below the disc, holds the
-    // coordinates line.
+    // coordinates line. Three columns off the screen's right edge: the
+    // coordinates line runs past the disc's right side and must clear the
+    // edge.
     let radar_w = (3 * cols / 32).max(7).min(cols - 2);
     let radar_h = (rows / 6).max(4);
     let radar = Rect {
-        x: cols.saturating_sub(radar_w + 1),
+        x: cols.saturating_sub(radar_w + 3),
         y: 1.min(rows.saturating_sub(radar_h)),
         w: radar_w,
         h: radar_h,
@@ -416,11 +418,13 @@ pub fn draw(g: &mut Grid, m: &Model, l: &Layout) {
     // The vitals + target, top-left: plain text over the world — no panel or
     // frame. Each line's background is only as wide as the line: the name
     // spans just the name, each meter spans its own label-and-readout width.
+    // The names are never truncated to the block's width: they take the
+    // cells they need and run over the world.
     let r = l.vitals;
     let cx = r.x + 1;
     let cw = r.w.saturating_sub(2);
     if let Some(name) = &m.char_name {
-        g.put_str(cx, r.y + 1, &truncate(name, cw), TITLE, BG);
+        g.put_str(cx, r.y + 1, name, TITLE, BG);
     }
     if let Some(pv) = &m.vitals {
         g.bar(
@@ -471,7 +475,7 @@ pub fn draw(g: &mut Grid, m: &Model, l: &Layout) {
             g.put_str(
                 cx,
                 r.y + 5,
-                &truncate(&format!("→ {name}{hp}"), cw),
+                &format!("→ {name}{hp}"),
                 TARGET,
                 BG,
             );
@@ -562,10 +566,10 @@ fn draw_radar(g: &mut Grid, radar: &RadarSnapshot, d: Rect) {
         PLAYER,
         RADAR_BODY,
     );
-    // The coordinates, under the disc.
+    // The coordinates, under the disc, centred on it like the blips.
     if let Some(coords) = &radar.coordinates_text {
         let w = coords.chars().count();
-        let x = (d.x + d.w / 2 + 1).saturating_sub(w / 2);
+        let x = (d.x + d.w / 2).saturating_sub(w / 2);
         g.put_str(x, d.y + d.h, coords, DIM, BG);
     }
 }
@@ -977,6 +981,54 @@ mod tests {
         assert!(
             l.radar.x > l.vitals.x + l.vitals.w,
             "the radar is clear of the vitals"
+        );
+
+        // The radar keeps three columns from the screen's right edge, so
+        // the coordinates line under the disc clears the edge — at every
+        // size, floor and share alike.
+        for (cols, rows) in [(128, 32), (80, 24), (200, 50)] {
+            let l = layout(cols, rows);
+            assert_eq!(
+                l.radar.x + l.radar.w + 3,
+                cols,
+                "the radar's right margin ({cols} x {rows})"
+            );
+        }
+    }
+
+    /// The character's name and the target's line are never truncated to
+    /// the vitals' width: a name longer than the block runs over the world
+    /// whole (the grid's right edge is the only bound).
+    #[test]
+    fn the_names_run_over_the_world_untruncated() {
+        let l = layout(80, 24);
+        let r = l.vitals;
+        let mut g = Grid::new(80, 24);
+        // A distinctive world to run over.
+        g.fill(l.viewport, '⣿', [255, 0, 0], [0, 0, 0]);
+        let mut m = Model::new();
+        // Longer than the block's width (16 here) and past its right edge.
+        let name = "a-very-long-character-name";
+        m.char_name = Some(name.into());
+        m.vitals = Some(PlayerView::default());
+        m.target_guid = Some(0x1234);
+        m.target_name = Some("an-equally-long-target-name".into());
+        draw(&mut g, &m, &l);
+
+        let row_text = |y: usize| -> String { g.rows()[y].iter().map(|c| c.ch).collect() };
+        // The name, whole, starting in the block and ending past it.
+        let name_row = row_text(r.y + 1);
+        assert!(name_row.contains(name), "the name is whole: {name_row:?}");
+        let end = name_row.find(name).unwrap() + name.chars().count();
+        assert!(
+            end > r.x + r.w,
+            "the name runs past the block's right edge: {name_row:?}"
+        );
+        // The target's line, whole, name and all.
+        let target_row = row_text(r.y + 5);
+        assert!(
+            target_row.contains("→ an-equally-long-target-name"),
+            "the target's line is whole: {target_row:?}"
         );
     }
 
